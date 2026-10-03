@@ -1,4 +1,4 @@
-# Swing Trading System — Project Record
+# BATS Brightrise Algorithmic Trading Systemt — Project Record
 
 **Owner:** Jay Tamez  
 **Last updated:** 2026-10-02  
