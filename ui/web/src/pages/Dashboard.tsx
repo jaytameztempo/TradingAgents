@@ -6,6 +6,7 @@ import {
   Card, Column, DataTable, Delta, Dialog, ErrorBox, isMissingKeys, JobLog, RegimeBadge, Stat, Tabs,
 } from "../components/ui";
 import { dateTime, money, num, qty, signedMoney, signedPct } from "../format";
+import { TradingViewChart } from "../components/TradingViewChart";
 
 const REFRESH_MS = 15_000;
 const RANGES: HistoryRange[] = ["1D", "1W", "1M", "1Y"];
@@ -132,11 +133,15 @@ const DISABLED_REASON = "Order placement is disabled in this build";
 function PositionsOrders() {
   const [tab, setTab] = useState<"positions" | "orders">("positions");
   const [closeAllOpen, setCloseAllOpen] = useState(false);
+  const [chartSymbol, setChartSymbol] = useState<string | null>(null);
+  const symbolLink = (symbol: string) => (
+    <button className="symbol-link" onClick={() => setChartSymbol(symbol)} title={`Open ${symbol} chart`}>{symbol}</button>
+  );
   const positions = useQuery({ queryKey: ["positions"], queryFn: api.positions, refetchInterval: REFRESH_MS });
   const orders = useQuery({ queryKey: ["orders"], queryFn: api.orders, refetchInterval: REFRESH_MS });
 
   const positionCols: Column<Position>[] = [
-    { key: "symbol", label: "Symbol", render: (p) => <strong>{p.symbol}</strong>, sortValue: (p) => p.symbol },
+    { key: "symbol", label: "Symbol", render: (p) => symbolLink(p.symbol), sortValue: (p) => p.symbol },
     { key: "side", label: "Long/Short", render: (p) => p.side, sortValue: (p) => p.side },
     { key: "qty", label: "Qty", align: "right", render: (p) => qty(p.qty), sortValue: (p) => p.qty },
     { key: "avg", label: "Avg Entry", align: "right", render: (p) => money(p.avg_entry_price), sortValue: (p) => p.avg_entry_price },
@@ -156,7 +161,7 @@ function PositionsOrders() {
   ];
 
   const orderCols: Column<Order>[] = [
-    { key: "symbol", label: "Symbol", render: (o) => <strong>{o.symbol}</strong>, sortValue: (o) => o.symbol },
+    { key: "symbol", label: "Symbol", render: (o) => symbolLink(o.symbol), sortValue: (o) => o.symbol },
     { key: "ls", label: "Long/Short", render: (o) => o.position_side ?? "—", sortValue: (o) => o.position_side },
     { key: "side", label: "Buy/Sell", render: (o) => o.side ?? "—", sortValue: (o) => o.side },
     { key: "qty", label: "Qty", align: "right", render: (o) => qty(o.qty), sortValue: (o) => o.qty },
@@ -209,6 +214,10 @@ function PositionsOrders() {
                      initialSort={{ key: "sub", dir: "desc" }} />
         </>
       )}
+      <Dialog open={chartSymbol != null} onClose={() => setChartSymbol(null)} wide closeLabel="Close"
+              title={<>{chartSymbol} <span className="muted">· chart by TradingView</span></>}>
+        {chartSymbol && <TradingViewChart symbol={chartSymbol} />}
+      </Dialog>
       <Dialog
         open={closeAllOpen}
         onClose={() => setCloseAllOpen(false)}

@@ -218,6 +218,13 @@ label.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; 
 .dialog { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--text); max-width: 460px; width: calc(100% - 32px); padding: 20px; }
 .dialog::backdrop { background: rgb(0 0 0 / .45); }
 .dialog-danger { border-color: var(--critical); }
+.dialog-wide { max-width: 1200px; width: calc(100% - 48px); }
+.tv-chart { width: 100%; min-height: 360px; }
+.symbol-link {
+  font: inherit; font-weight: 700; color: var(--accent); background: none; border: 0; padding: 0;
+  cursor: pointer; text-decoration: underline; text-decoration-color: transparent; text-underline-offset: 3px;
+}
+.symbol-link:hover, .symbol-link:focus-visible { text-decoration-color: currentColor; }
 .dialog-body { color: var(--text-2); display: flex; flex-direction: column; gap: 8px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 

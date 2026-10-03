@@ -164,13 +164,15 @@ export function DataTable<R>({ columns, rows, rowKey, empty, initialSort }: {
 
 // --- dialog --------------------------------------------------------------------------
 
-export function Dialog({ open, title, children, onClose, actions, tone }: {
+export function Dialog({ open, title, children, onClose, actions, tone, wide, closeLabel = "Cancel" }: {
   open: boolean;
   title: ReactNode;
   children: ReactNode;
   onClose: () => void;
   actions?: ReactNode;
   tone?: "danger";
+  wide?: boolean;
+  closeLabel?: string;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
@@ -180,11 +182,13 @@ export function Dialog({ open, title, children, onClose, actions, tone }: {
     if (!open && el.open) el.close();
   }, [open]);
   return (
-    <dialog ref={ref} className={`dialog ${tone === "danger" ? "dialog-danger" : ""}`} onClose={onClose}>
+    <dialog ref={ref} className={`dialog ${tone === "danger" ? "dialog-danger" : ""} ${wide ? "dialog-wide" : ""}`}
+            onClose={onClose}
+            onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <h3>{title}</h3>
-      <div className="dialog-body">{children}</div>
+      <div className="dialog-body">{open && children}</div>
       <div className="dialog-actions">
-        <button className="btn" onClick={onClose}>Cancel</button>
+        <button className="btn" onClick={onClose}>{closeLabel}</button>
         {actions}
       </div>
     </dialog>
