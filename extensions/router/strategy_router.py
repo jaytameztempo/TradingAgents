@@ -1,32 +1,42 @@
-"""Route the upward-trend basket by the SPY regime label for the same date.
+"""Route both scan baskets by the SPY regime label for the same date.
 
-- UP: UP playbooks are allowed for the basket's passed tickers.
-- SIDE or DOWN: UP playbooks are blocked; the passed tickers are not tradeable under UP.
+- UP: UPBot is allowed for the upward-scan passers; DOWNBot is blocked.
+- DOWN: DOWNBot is allowed for the breakdown-scan passers; UPBot is blocked.
+- SIDE: both trend bots are blocked; passers from either scan are routed to SIDEBot.
 
-The router reads the latest basket and the latest SPY label for the date, by the
-``created_at`` recorded inside each file. If either is missing, or a candidate
-file cannot be read, it raises and no decision is made. It fetches no bars and
-places no orders.
+The playbooks read ``tradeable`` and ``blocked``: under UP or DOWN only the
+allowed bot's names are listed, in ``tradeable``; under SIDE every passer is
+listed in ``blocked``. Each scan's passers are also kept in ``up_passed`` and
+``down_passed`` so the file explains a blocked side as well as the allowed one.
+
+The router reads the latest SPY label and the latest basket of each scan for
+the date, by the ``created_at`` recorded inside each file. The basket for the
+allowed side is required; under SIDE neither is. A missing label, a missing
+required basket, or an unreadable candidate file raises and no decision is
+made. It fetches no bars and places no orders.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 from extensions.regime.regime_bot import DOWN, SIDE, UP, RegimeLabel, default_regime_dir, load_label
 from extensions.scans.basket import TickerBasket, default_basket_dir, load_basket
-from extensions.scans.upward_trend_momentum import SCAN_NAME
+from extensions.scans.breakdown_short_candidates import SCAN_NAME as DOWN_SCAN_NAME
+from extensions.scans.upward_trend_momentum import SCAN_NAME as UP_SCAN_NAME
 
-SERIES = UP
+SERIES = "ALL"
 REGIME_SYMBOL = "SPY"
+# Fields added since version 1 are optional with defaults, so routes written
+# before them still load and every version-1 reader still reads new routes.
 SCHEMA_VERSION = 1
 
 
 class MissingInput(RuntimeError):
-    """The basket or regime label for the date is missing or unreadable."""
+    """The regime label or a required basket for the date is missing or unreadable."""
 
 
 @dataclass(frozen=True)
@@ -40,9 +50,13 @@ class RouteDecision:
     tradeable: list[str]
     blocked: list[str]
     reason: str
-    basket_file: str
+    basket_file: str | None  # the upward-scan basket
     regime_file: str
     schema_version: int = SCHEMA_VERSION
+    down_allowed: bool = False
+    up_passed: list[str] = field(default_factory=list)
+    down_passed: list[str] = field(default_factory=list)
+    down_basket_file: str | None = None
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -60,17 +74,15 @@ class RouteDecision:
         return cls(**fields)
 
 
-def latest_basket(as_of: date, basket_dir: str | Path | None = None) -> tuple[Path, TickerBasket]:
-    """The newest SCAN-Upward Trend Momentum basket for as_of."""
+def latest_basket(
+    as_of: date, basket_dir: str | Path | None = None, scan_name: str = UP_SCAN_NAME
+) -> tuple[Path, TickerBasket]:
+    """The newest basket from scan_name for as_of."""
     folder = Path(basket_dir) if basket_dir is not None else default_basket_dir()
-    found = [
-        (path, basket)
-        for path, basket in _load_all(folder, as_of, load_basket, "basket")
-        if basket.scan_name == SCAN_NAME and basket.as_of == as_of
-    ]
-    if not found:
-        raise MissingInput(f"no {SCAN_NAME} basket for {as_of} in {folder}")
-    return max(found, key=lambda item: item[1].created_at)
+    found = _newest_basket(as_of, folder, scan_name)
+    if found is None:
+        raise MissingInput(f"no {scan_name} basket for {as_of} in {folder}")
+    return found
 
 
 def latest_regime(
@@ -89,37 +101,57 @@ def latest_regime(
 
 
 def route(
-    basket: TickerBasket,
     regime: RegimeLabel,
-    basket_file: str | Path,
     regime_file: str | Path,
+    up: tuple[str | Path, TickerBasket] | None = None,
+    down: tuple[str | Path, TickerBasket] | None = None,
     created_at: datetime | None = None,
 ) -> RouteDecision:
-    """Decide whether UP playbooks may run on the basket's passed tickers."""
-    if basket.as_of != regime.as_of:
-        raise ValueError(f"basket is for {basket.as_of} but the regime label is for {regime.as_of}")
-    passed = basket.tickers
-    up_allowed = regime.label == UP
-    if up_allowed:
-        reason = f"{regime.symbol} regime is UP: UP playbooks are allowed for the passed tickers"
-    elif regime.label == SIDE:
-        reason = f"{regime.symbol} regime is SIDE: UP playbooks are blocked; passed tickers are not tradeable under UP"
+    """Decide which trend bot, if any, may run, and on which names.
+
+    ``up`` and ``down`` are (file, basket) for the upward and breakdown scans,
+    or None when that scan has no basket for the date.
+    """
+    for scan_name, found in ((UP_SCAN_NAME, up), (DOWN_SCAN_NAME, down)):
+        if found is not None and found[1].as_of != regime.as_of:
+            raise ValueError(
+                f"{scan_name} basket is for {found[1].as_of} but the regime label is for {regime.as_of}"
+            )
+    up_passed = up[1].tickers if up is not None else []
+    down_passed = down[1].tickers if down is not None else []
+
+    if regime.label == UP:
+        _require(up, UP_SCAN_NAME, regime)
+        tradeable, blocked = up_passed, []
+        reason = f"{regime.symbol} regime is UP: UPBot is allowed for the upward-scan passers; DOWNBot is blocked"
     elif regime.label == DOWN:
-        reason = f"{regime.symbol} regime is DOWN: UP playbooks are blocked; passed tickers are not tradeable under UP"
+        _require(down, DOWN_SCAN_NAME, regime)
+        tradeable, blocked = down_passed, []
+        reason = f"{regime.symbol} regime is DOWN: DOWNBot is allowed for the breakdown-scan passers; UPBot is blocked"
+    elif regime.label == SIDE:
+        tradeable, blocked = [], list(dict.fromkeys(up_passed + down_passed))
+        reason = (
+            f"{regime.symbol} regime is SIDE: UPBot and DOWNBot are blocked; "
+            "passed names are routed to SIDEBot only"
+        )
     else:
         raise ValueError(f"unknown regime label: {regime.label!r}")
 
     return RouteDecision(
-        as_of=basket.as_of,
+        as_of=regime.as_of,
         created_at=created_at or datetime.now(UTC),
         series=SERIES,
         regime_symbol=regime.symbol,
         regime_label=regime.label,
-        up_allowed=up_allowed,
-        tradeable=passed if up_allowed else [],
-        blocked=[] if up_allowed else passed,
+        up_allowed=regime.label == UP,
+        down_allowed=regime.label == DOWN,
+        tradeable=tradeable,
+        blocked=blocked,
+        up_passed=up_passed,
+        down_passed=down_passed,
         reason=reason,
-        basket_file=str(basket_file),
+        basket_file=str(up[0]) if up is not None else None,
+        down_basket_file=str(down[0]) if down is not None else None,
         regime_file=str(regime_file),
     )
 
@@ -127,10 +159,12 @@ def route(
 def route_for_date(
     as_of: date, basket_dir: str | Path | None = None, regime_dir: str | Path | None = None
 ) -> RouteDecision:
-    """Load the latest basket and SPY label for as_of and route them."""
-    basket_path, basket = latest_basket(as_of, basket_dir)
+    """Load the latest SPY label and each scan's latest basket for as_of, and route them."""
     regime_path, regime = latest_regime(as_of, regime_dir)
-    return route(basket, regime, basket_path, regime_path)
+    folder = Path(basket_dir) if basket_dir is not None else default_basket_dir()
+    up = _newest_basket(as_of, folder, UP_SCAN_NAME)
+    down = _newest_basket(as_of, folder, DOWN_SCAN_NAME)
+    return route(regime, regime_path, up, down)
 
 
 def default_route_dir() -> Path:
@@ -151,6 +185,24 @@ def save_decision(decision: RouteDecision, out_dir: str | Path | None = None) ->
 
 def load_decision(path: str | Path) -> RouteDecision:
     return RouteDecision.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def _require(found, scan_name: str, regime: RegimeLabel) -> None:
+    if found is None:
+        raise MissingInput(
+            f"no {scan_name} basket for {regime.as_of}; it is required when the "
+            f"{regime.symbol} regime is {regime.label}"
+        )
+
+
+def _newest_basket(as_of: date, folder: Path, scan_name: str) -> tuple[Path, TickerBasket] | None:
+    """The newest basket from scan_name for as_of, or None if that scan wrote none."""
+    found = [
+        (path, basket)
+        for path, basket in _load_all(folder, as_of, load_basket, "basket")
+        if basket.scan_name == scan_name and basket.as_of == as_of
+    ]
+    return max(found, key=lambda item: item[1].created_at) if found else None
 
 
 def _load_all(folder: Path, as_of: date, loader, kind: str):
