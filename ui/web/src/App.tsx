@@ -18,8 +18,11 @@ export default function App() {
     <div className="shell">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark">TA</span>
-          <span>TradingAgents <span className="muted">local</span></span>
+          <span className="brand-mark">B</span>
+          <span className="brand-name">
+            BATS
+            <span className="brand-sub">Brightrise Algorithmic Trading System</span>
+          </span>
         </div>
         <nav>
           {PAGES.map((p) => (
