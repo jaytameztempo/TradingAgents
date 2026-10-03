@@ -39,6 +39,11 @@ dev = [
 bedrock = [
     "langchain-aws>=1.7.9",
 ]
+# Local web UI (ui/): pip install "tradingagents[ui]", then python -m ui.server.
+ui = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"
