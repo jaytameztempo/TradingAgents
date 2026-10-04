@@ -1,4 +1,4 @@
-"""Decide which trend bot may run on which names, from the SPY regime label and both scan baskets.
+"""Decide which trend bot may run on which names, from the SPY and QQQ regime labels and both scan baskets.
 
 It reads saved files only. It fetches no bars and places no orders.
 
@@ -23,7 +23,7 @@ EXIT_OK, EXIT_FAILED, EXIT_BAD_INPUT = 0, 1, 2
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Route the upward and breakdown baskets by the SPY regime (read-only)."
+        description="Route the upward and breakdown baskets by the SPY+QQQ market regime (read-only)."
     )
     parser.add_argument("--as-of", required=True, help="date of the baskets and regime label, YYYY-MM-DD")
     parser.add_argument("--basket-dir", help="folder of basket JSON files (default: ~/.tradingagents/baskets)")
@@ -52,7 +52,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}; no decision written", file=sys.stderr)
         return EXIT_FAILED
 
-    print(f"{decision.regime_symbol} regime as of {decision.as_of}: {decision.regime_label}")
+    for symbol, label in decision.regime_labels.items():
+        print(f"{symbol} regime as of {decision.as_of}: {label or 'missing'}")
+    print(f"market regime ({decision.regime_symbol}): {decision.regime_label}")
+    print(f"  reason: {decision.reason}")
     print(f"UPBot: {'ALLOWED' if decision.up_allowed else 'BLOCKED'}"
           f"  (upward scan passed: {_names(decision.up_passed, decision.basket_file)})")
     print(f"DOWNBot: {'ALLOWED' if decision.down_allowed else 'BLOCKED'}"
