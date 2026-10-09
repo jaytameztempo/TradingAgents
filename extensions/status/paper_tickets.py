@@ -14,10 +14,17 @@ there are no tickets. Each ticket:
 - entry: the channel line, support for a long and resistance for a short,
 - stop: ``STOP_ATR`` (0.25) ATR beyond that line, below support or above resistance,
 - target: the channel midline,
-- quantity: the smaller of whole shares risking ``RISK_PCT`` (1%) of the
-  placeholder account between entry and stop, and whole shares costing at most
-  ``NOTIONAL_PCT`` (10%) of it at entry. Both limits and the one that bound the
-  size are recorded.
+- quantity: the smaller of whole shares risking ``RISK_PCT`` (2%) of the
+  $5,000 equity between entry and stop, and whole shares costing at most
+  ``NAME_NOTIONAL_PCT`` (25%) of the $20,000 buying power at entry. Both limits
+  and the one that bound the size are recorded.
+
+The allowed names are walked in rank order, long and short interleaved (long #1,
+short #1, long #2, ...). A name is ticketed only while adding it keeps total
+notional at or under ``BOOK_NOTIONAL_LIMIT`` ($20,000) and total stop-risk at or
+under ``BOOK_RISK_LIMIT`` ($400). The first name that would cross either one,
+and every name after it, is listed as not ticketed with the limit that stopped
+the walk.
 
 Every file is read with plain ``json``; no Alpaca module is loaded here, and
 ``refuse_trading_client`` makes any later import of ``alpaca.trading`` fail.
@@ -39,12 +46,16 @@ from extensions.status.earnings_blackout import BlackoutInputError, latest_daily
 
 TICKET_VERSION = 1
 BLACKOUT_REPORT_VERSION = 1
-ACCOUNT_EQUITY = 100_000.0  # placeholder, not a broker balance
-RISK_PCT = 0.01
-NOTIONAL_PCT = 0.10
+ACCOUNT_EQUITY = 5_000.0  # set by hand, not read from a broker
+BUYING_POWER = 20_000.0  # set by hand, not read from a broker
+RISK_PCT = 0.02  # of equity, at the stop, per name
+NAME_NOTIONAL_PCT = 0.25  # of buying power, per name
+BOOK_NOTIONAL_LIMIT = BUYING_POWER
+BOOK_RISK_LIMIT = 400.0
 STOP_ATR = 0.25
 LINE = {LONG: "support", SHORT: "resistance"}
 RISK, NOTIONAL = "risk", "notional"
+BOOK_NOTIONAL, BOOK_RISK = "book_notional", "book_risk"
 TRADING_MODULE = "alpaca.trading"
 
 
@@ -150,11 +161,13 @@ class Ticket:
     quantity_by_notional: int
     size_bound_by: str  # risk or notional
     earnings_result: str | None  # from the blackout: clear, flagged_kept, unknown_kept
+    rank: int | None = None  # the handoff's rank within its side
     paper: bool = True
 
 
 def build_ticket(symbol: str, side: str, levels: dict, earnings_result: str | None = None,
-                 account_equity: float = ACCOUNT_EQUITY) -> Ticket:
+                 account_equity: float = ACCOUNT_EQUITY, buying_power: float = BUYING_POWER,
+                 rank: int | None = None) -> Ticket:
     """One ticket from the handoff's recorded levels. Raises ValueError when they cannot make one."""
     line_word = LINE[side]
     line, atr, mid = levels.get(line_word), levels.get("atr_14"), levels.get("midline")
@@ -172,7 +185,7 @@ def build_ticket(symbol: str, side: str, levels: dict, earnings_result: str | No
         raise ValueError(f"midline {target} is not on the profit side of entry {entry}")
 
     risk_limit = round(account_equity * RISK_PCT, 2)
-    notional_limit = round(account_equity * NOTIONAL_PCT, 2)
+    notional_limit = round(buying_power * NAME_NOTIONAL_PCT, 2)
     by_risk = math.floor(risk_limit / risk_per_share)
     by_notional = math.floor(notional_limit / entry)
     quantity = min(by_risk, by_notional)
@@ -201,7 +214,19 @@ def build_ticket(symbol: str, side: str, levels: dict, earnings_result: str | No
         quantity_by_notional=by_notional,
         size_bound_by=RISK if by_risk <= by_notional else NOTIONAL,
         earnings_result=earnings_result,
+        rank=rank,
     )
+
+
+def _walk_order(allowed: dict[str, list[str]], names: dict) -> list[tuple[str, str]]:
+    """(symbol, side) by handoff rank, long before short on a tie; a name with no rank goes last on its side."""
+    order = []
+    for side_order, side in enumerate(SIDES):
+        for pos, symbol in enumerate(allowed[side]):
+            rank = (names.get(symbol) or {}).get("rank")
+            key = (rank if isinstance(rank, int) else math.inf, side_order, pos)
+            order.append((key, symbol, side))
+    return [(symbol, side) for _, symbol, side in sorted(order)]
 
 
 @dataclass(frozen=True)
@@ -211,17 +236,24 @@ class PaperTickets:
     market_label: str
     channel_names_blocked: bool
     tickets: list[Ticket]
-    skipped: dict[str, str]  # symbol -> why no ticket
+    skipped: dict[str, str]  # symbol -> why its levels made no ticket
     no_ticket_reason: str | None  # set when the day has no tickets at all
     sources: dict[str, str | None]
+    not_ticketed: dict[str, dict] = field(default_factory=dict)  # symbol -> the book limit that stopped the walk
+    total_notional: float = 0.0
+    total_risk: float = 0.0
     rules: dict = field(default_factory=lambda: {
-        "account_equity_placeholder": ACCOUNT_EQUITY,
+        "account_equity": ACCOUNT_EQUITY,
+        "buying_power": BUYING_POWER,
         "entry": "the channel line: support for long, resistance for short",
         "stop_atr_beyond_line": STOP_ATR,
         "target": "the channel midline",
-        "risk_pct": RISK_PCT,
-        "notional_pct": NOTIONAL_PCT,
+        "risk_pct_of_equity": RISK_PCT,
+        "name_notional_pct_of_buying_power": NAME_NOTIONAL_PCT,
         "quantity": "min(floor(risk limit / risk per share), floor(notional limit / entry))",
+        "book_notional_limit": BOOK_NOTIONAL_LIMIT,
+        "book_risk_limit": BOOK_RISK_LIMIT,
+        "walk": "rank order, long before short on a tie; stop at the first name that would cross a book limit",
         "names": "the earnings blackout's allowed long and short names",
     })
     warnings: list[str] = field(default_factory=list)
@@ -276,16 +308,32 @@ def build_tickets(
     names = h.get("names", {})
     tickets: list[Ticket] = []
     skipped: dict[str, str] = {}
-    for side in SIDES:
-        for symbol in b["allowed"][side]:
-            entry = names.get(symbol)
-            if entry is None or entry.get("side") != side:
-                skipped[symbol] = f"not a {side} name in the ranked side handoff"
+    not_ticketed: dict[str, dict] = {}
+    total_notional = total_risk = 0.0
+    stopped_by: str | None = None
+    for symbol, side in _walk_order(b["allowed"], names):
+        entry = names.get(symbol)
+        if entry is None or entry.get("side") != side:
+            skipped[symbol] = f"not a {side} name in the ranked side handoff"
+            continue
+        try:
+            t = build_ticket(symbol, side, entry.get("levels") or {}, results.get(symbol), rank=entry.get("rank"))
+        except ValueError as exc:
+            skipped[symbol] = str(exc)
+            continue
+        if stopped_by is None:
+            next_notional = round(total_notional + t.notional, 2)
+            next_risk = round(total_risk + t.risk_dollars, 2)
+            if next_notional > BOOK_NOTIONAL_LIMIT:
+                stopped_by = BOOK_NOTIONAL
+            elif next_risk > BOOK_RISK_LIMIT:
+                stopped_by = BOOK_RISK
+            else:
+                tickets.append(t)
+                total_notional, total_risk = next_notional, next_risk
                 continue
-            try:
-                tickets.append(build_ticket(symbol, side, entry.get("levels") or {}, results.get(symbol)))
-            except ValueError as exc:
-                skipped[symbol] = str(exc)
+        not_ticketed[symbol] = {"side": side, "rank": t.rank, "stopped_by": stopped_by,
+                                "quantity": t.quantity, "notional": t.notional, "risk_dollars": t.risk_dollars}
 
     warnings = [f"{sym}: no ticket, {why}" for sym, why in skipped.items()]
     warnings += [f"{t.symbol}: earnings result {t.earnings_result}" for t in tickets
@@ -300,6 +348,9 @@ def build_tickets(
         skipped=skipped,
         no_ticket_reason=None if tickets else "no allowed name made a ticket",
         sources=sources,
+        not_ticketed=not_ticketed,
+        total_notional=total_notional,
+        total_risk=total_risk,
         warnings=list(dict.fromkeys(warnings)),
     )
 

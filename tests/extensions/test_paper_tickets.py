@@ -1,7 +1,8 @@
 """Paper tickets read the newest daily status, the earnings blackout built from it and the ranked side handoff
 it names. Only the blackout's allowed names are ticketed: entry at the channel line, stop 0.25 ATR beyond it,
-target at the midline, size the smaller of 1% risk and 10% notional of a $100,000 placeholder. No label but
-SIDE writes anything. Alpaca's trading client is refused. No network, no orders.
+target at the midline, size the smaller of $100 risk (2% of $5,000 equity) and $5,000 notional (25% of $20,000
+buying power). Names are walked in rank order while the book stays at or under $20,000 notional and $400 risk.
+No label but SIDE writes anything. Alpaca's trading client is refused. No network, no orders.
 """
 
 import json
@@ -15,6 +16,8 @@ import pytest
 
 from extensions.scripts import run_paper_tickets as cli
 from extensions.status.paper_tickets import (
+    BOOK_NOTIONAL,
+    BOOK_RISK,
     NOTIONAL,
     RISK,
     TicketInputError,
@@ -33,7 +36,9 @@ BLACKOUT_NAME = "earnings_blackout_2026-09-30_20261008T232454Z.json"
 HANDOFF_NAME = "ranked_side_handoff_2026-09-30_20261008T110409Z.json"
 VST = {"support": 138.4525, "resistance": 156.99, "atr_14": 4.6929, "midline": 147.7212}
 WIDE = {"support": 10.0, "resistance": 20.0, "atr_14": 8.0, "midline": 15.0}
-SHORTY = {"support": 40.0, "resistance": 50.0, "atr_14": 4.0, "midline": 45.0}
+SHORTY = {"support": 40.0, "resistance": 50.0, "atr_14": 2.0, "midline": 45.0}
+FULL = {"support": 100.0, "resistance": 120.0, "atr_14": 0.4, "midline": 110.0}  # $5,000 notional, $5 risk
+RISKY = WIDE  # $500 notional, $100 risk
 
 
 def _status(label="SIDE", long=("VST", "WID", "OUT"), short=("SHO",), blocked=False):
@@ -52,13 +57,23 @@ def _blackout(allowed_long=("VST", "WID"), allowed_short=("SHO",), status_file=S
             "names": names, "warnings": ["estimated dates"], "orders_placed": False, "report_version": 1}
 
 
-def _handoff():
-    def name(side, levels):
-        return {"side": side, "setup": "LONG_FADE" if side == "long" else "SHORT_FADE", "status": "PLAN",
-                "levels": levels}
+def _name(side, levels, rank):
+    return {"side": side, "setup": "LONG_FADE" if side == "long" else "SHORT_FADE", "status": "PLAN",
+            "rank": rank, "levels": levels}
+
+
+def _handoff(names=None):
     return {"as_of": AS_OF.isoformat(), "created_at": "2026-10-08T11:04:09+00:00",
-            "names": {"VST": name("long", VST), "WID": name("long", WIDE), "OUT": name("long", WIDE),
-                      "SHO": name("short", SHORTY)}}
+            "names": names or {"VST": _name("long", VST, 1), "WID": _name("long", WIDE, 2),
+                               "OUT": _name("long", WIDE, 3), "SHO": _name("short", SHORTY, 1)}}
+
+
+def _build_longs(levels_by_symbol):
+    """A SIDE day whose allowed names are these longs, ranked in the order given."""
+    symbols = list(levels_by_symbol)
+    names = {s: _name("long", lv, i) for i, (s, lv) in enumerate(levels_by_symbol.items(), start=1)}
+    return _build(status=_status(long=symbols, short=()), blackout=_blackout(allowed_long=symbols, allowed_short=()),
+                  handoff=_handoff(names))
 
 
 def _build(status=None, blackout=None, handoff=None):
@@ -88,26 +103,26 @@ def test_long_ticket_is_bound_by_notional():
     t = build_ticket("VST", "long", VST, "clear")
     assert (t.order_side, t.entry, t.stop, t.target) == ("buy", 138.45, 137.28, 147.72)
     assert t.risk_per_share == 1.17 and t.reward_per_share == 9.27
-    assert t.quantity_by_risk == 854 and t.quantity_by_notional == 72
-    assert t.quantity == 72 and t.size_bound_by == NOTIONAL
-    assert t.risk_limit_dollars == 1000.0 and t.notional_limit_dollars == 10000.0
-    assert t.notional == 9968.4 and t.risk_dollars == 84.24 and t.paper is True
+    assert t.quantity_by_risk == 85 and t.quantity_by_notional == 36
+    assert t.quantity == 36 and t.size_bound_by == NOTIONAL
+    assert t.risk_limit_dollars == 100.0 and t.notional_limit_dollars == 5000.0
+    assert t.notional == 4984.2 and t.risk_dollars == 42.12 and t.paper is True
 
 
 @pytest.mark.unit
 def test_long_ticket_is_bound_by_risk():
     t = build_ticket("WID", "long", WIDE)
     assert (t.entry, t.stop, t.target) == (10.0, 8.0, 15.0)
-    assert t.quantity_by_risk == 500 and t.quantity_by_notional == 1000
-    assert t.quantity == 500 and t.size_bound_by == RISK and t.risk_dollars == 1000.0 and t.reward_risk == 2.5
+    assert t.quantity_by_risk == 50 and t.quantity_by_notional == 500
+    assert t.quantity == 50 and t.size_bound_by == RISK and t.risk_dollars == 100.0 and t.reward_risk == 2.5
 
 
 @pytest.mark.unit
 def test_short_ticket_stops_above_resistance_and_targets_midline():
     t = build_ticket("SHO", "short", SHORTY)
-    assert (t.order_side, t.line, t.entry, t.stop, t.target) == ("sell", "resistance", 50.0, 51.0, 45.0)
-    assert t.quantity_by_risk == 1000 and t.quantity_by_notional == 200
-    assert t.quantity == 200 and t.size_bound_by == NOTIONAL and t.reward_risk == 5.0
+    assert (t.order_side, t.line, t.entry, t.stop, t.target) == ("sell", "resistance", 50.0, 50.5, 45.0)
+    assert t.quantity_by_risk == 200 and t.quantity_by_notional == 100
+    assert t.quantity == 100 and t.size_bound_by == NOTIONAL and t.reward_risk == 10.0
 
 
 @pytest.mark.unit
@@ -125,8 +140,9 @@ def test_unusable_levels_make_no_ticket(levels, match):
 @pytest.mark.unit
 def test_only_allowed_names_are_ticketed_and_flags_carry_over():
     result = _build()
-    assert [(t.symbol, t.side) for t in result.tickets] == [("VST", "long"), ("WID", "long"), ("SHO", "short")]
+    assert [(t.symbol, t.side) for t in result.tickets] == [("VST", "long"), ("SHO", "short"), ("WID", "long")]
     assert "OUT" not in {t.symbol for t in result.tickets}  # removed by the blackout
+    assert result.total_notional == 10484.2 and result.total_risk == 192.12 and result.not_ticketed == {}
     assert {t.symbol: t.earnings_result for t in result.tickets} == {
         "VST": "clear", "WID": "unknown_kept", "SHO": "flagged_kept"}
     assert "WID: earnings result unknown_kept" in result.warnings and "estimated dates" in result.warnings
@@ -140,6 +156,35 @@ def test_a_name_with_bad_levels_is_skipped_not_ticketed():
     result = _build(handoff=handoff)
     assert [t.symbol for t in result.tickets] == ["VST", "SHO"]
     assert "no usable" in result.skipped["WID"]
+
+
+@pytest.mark.unit
+def test_walk_follows_rank_not_list_order():
+    result = _build(blackout=_blackout(allowed_long=("WID", "VST")))
+    assert [(t.symbol, t.rank) for t in result.tickets] == [("VST", 1), ("SHO", 1), ("WID", 2)]
+
+
+@pytest.mark.unit
+def test_walk_stops_at_book_notional_and_lists_the_rest():
+    result = _build_longs({"A": FULL, "B": FULL, "C": FULL, "D": FULL, "E": FULL, "F": RISKY})
+    assert [t.symbol for t in result.tickets] == ["A", "B", "C", "D"]
+    assert result.total_notional == 20000.0 and result.total_risk == 20.0  # at the limit is allowed
+    assert list(result.not_ticketed) == ["E", "F"]
+    assert {n["stopped_by"] for n in result.not_ticketed.values()} == {BOOK_NOTIONAL}
+    assert result.not_ticketed["E"] == {"side": "long", "rank": 5, "stopped_by": BOOK_NOTIONAL,
+                                        "quantity": 50, "notional": 5000.0, "risk_dollars": 5.0}
+    assert all(t.size_bound_by == NOTIONAL for t in result.tickets)
+
+
+@pytest.mark.unit
+def test_walk_stops_at_book_risk_and_does_not_skip_ahead():
+    result = _build_longs({"A": RISKY, "B": RISKY, "C": RISKY, "D": RISKY, "E": RISKY, "F": FULL})
+    assert [t.symbol for t in result.tickets] == ["A", "B", "C", "D"]
+    assert result.total_risk == 400.0 and result.total_notional == 2000.0
+    # F alone would fit the $400 risk book ($5), but the walk stopped at E
+    assert list(result.not_ticketed) == ["E", "F"]
+    assert {n["stopped_by"] for n in result.not_ticketed.values()} == {BOOK_RISK}
+    assert all(t.size_bound_by == RISK for t in result.tickets)
 
 
 @pytest.mark.unit
@@ -178,7 +223,10 @@ def test_save_writes_json_and_never_overwrites(tmp_path):
     assert path.name == "paper_tickets_2026-09-30_20261008T120000Z.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["orders_placed"] is False and data["paper"] is True and data["as_of"] == "2026-09-30"
-    assert data["tickets"][0]["size_bound_by"] == NOTIONAL and data["rules"]["notional_pct"] == 0.10
+    assert data["tickets"][0]["size_bound_by"] == NOTIONAL
+    assert data["rules"]["name_notional_pct_of_buying_power"] == 0.25 and data["rules"]["risk_pct_of_equity"] == 0.02
+    assert data["rules"]["book_notional_limit"] == 20000.0 and data["rules"]["book_risk_limit"] == 400.0
+    assert data["total_notional"] == 10484.2 and data["not_ticketed"] == {}
     with pytest.raises(FileExistsError):
         save_tickets(result, tmp_path)
 
@@ -196,7 +244,7 @@ def test_cli_prints_and_writes(tmp_path, capsys, restore_meta_path):
     assert "VST" in printed and "bound by notional" in printed and "no order placed" in printed
     written = list(out_dir.glob("paper_tickets_2026-09-30_*.json"))
     assert len(written) == 1
-    assert [t["symbol"] for t in json.loads(written[0].read_text(encoding="utf-8"))["tickets"]] == ["VST", "WID", "SHO"]
+    assert [t["symbol"] for t in json.loads(written[0].read_text(encoding="utf-8"))["tickets"]] == ["VST", "SHO", "WID"]
 
 
 @pytest.mark.unit
