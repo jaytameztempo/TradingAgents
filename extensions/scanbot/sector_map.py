@@ -2,7 +2,8 @@
 
 No saved SCANBot report carries a sector field, so the 30% sector cap reads
 its labels from this hand-entered table. It covers the 24 names in the
-2026-09-30 SCAN-LongSidewaysChannel and SCAN-ShortSidewaysChannel reports.
+2026-09-30 SCAN-LongSidewaysChannel and SCAN-ShortSidewaysChannel reports,
+plus 16 names from the 2026-10-09 channel reports (40 in all).
 It is not point in time and not fetched from any vendor. Edit it by hand.
 A symbol missing from it ranks under UNKNOWN_SECTOR and the rank report warns.
 """
@@ -40,6 +41,24 @@ GICS_SECTOR: dict[str, str] = {
     # SCAN-ShortSidewaysChannel 2026-09-30
     "IONQ": "Information Technology",
     "VIR": "Health Care",
+    # SCAN-LongSidewaysChannel 2026-10-09
+    "AKAM": "Information Technology",
+    "DLB": "Information Technology",
+    "DLR": "Real Estate",
+    "GMED": "Health Care",
+    "IDXX": "Health Care",
+    "LOGI": "Information Technology",
+    "NCNO": "Information Technology",
+    "PGY": "Financials",
+    "SPGI": "Financials",
+    "STX": "Information Technology",
+    "VRSK": "Industrials",
+    "XYZ": "Financials",
+    # SCAN-ShortSidewaysChannel 2026-10-09
+    "ADPT": "Health Care",
+    "CLF": "Materials",
+    "ECHO": "Industrials",
+    "NTLA": "Health Care",
 }
 
 
