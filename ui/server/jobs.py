@@ -25,6 +25,8 @@ SCRIPTS = frozenset({
     "fetch_bars",
     "run_upward_trend_scan",
     "run_breakdown_scan",
+    "run_scanbot_long_channel",
+    "run_scanbot_short_channel",
     "run_regime_bot",
     "run_router",
     "run_side_bot",

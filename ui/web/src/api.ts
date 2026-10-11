@@ -120,6 +120,34 @@ export interface Basket {
   rejected: { ticker: string; reason: string }[];
 }
 
+export interface ChannelCall {
+  passed: boolean;
+  reasons: string[];
+  detail: string[];
+  quality: Record<string, boolean>;
+  quality_passed: number;
+  metrics: Record<string, unknown>;
+}
+
+/** A sideways channel scan report (SCAN-LongSidewaysChannel / SCAN-ShortSidewaysChannel), members' calls only. */
+export interface ChannelReport {
+  scan_name: string;
+  mode: string;
+  as_of: string;
+  created_at: string;
+  financials_report?: string;
+  policy?: Record<string, unknown>;
+  stage_counts: Record<string, number>;
+  reason_counts: Record<string, number>;
+  quality_counts: Record<string, number>;
+  members: string[];
+  member_calls: Record<string, ChannelCall | null>;
+  scanned: number;
+  warnings?: string[];
+}
+
+export type ScanKind = "all" | "both" | "sideways" | "up" | "down" | "long_side" | "short_side";
+
 export interface Regime {
   symbol: string;
   as_of: string;
@@ -218,6 +246,7 @@ export const api = {
   dates: () => get<string[]>("/api/dates"),
   summary: (asOf?: string) => get<Summary>(`/api/summary${asOf ? `?as_of=${asOf}` : ""}`),
   baskets: (kind?: "up" | "down") => get<Artifact<Basket>[]>(`/api/baskets${kind ? `?kind=${kind}` : ""}`),
+  channelScans: (side: "long" | "short") => get<Artifact<ChannelReport>[]>(`/api/channel-scans?side=${side}`),
   regimes: () => get<Artifact<Regime>[]>("/api/regimes"),
   routes: () => get<Artifact<Route>[]>("/api/routes"),
   plans: () => get<Plan[]>("/api/plans"),
@@ -229,7 +258,7 @@ export const api = {
 
   jobs: () => get<Job[]>("/api/jobs"),
 
-  runScans: (body: { as_of: string; kind: "up" | "down" | "both"; tickers: string[] }) =>
+  runScans: (body: { as_of: string; kind: ScanKind; tickers: string[] }) =>
     post<Job>("/api/scans/run", body),
   runPipeline: (body: { as_of: string; tickers: string[]; regime_symbol: string }) =>
     post<Job>("/api/pipeline/run", body),

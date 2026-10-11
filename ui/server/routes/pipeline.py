@@ -11,6 +11,17 @@ from ui.server.routes import common
 router = APIRouter(prefix="/api", tags=["pipeline"])
 
 SCAN_PREFIXES = {"up": "scan-upward-trend-momentum", "down": "scan-breakdown-short-candidates"}
+CHANNEL_PREFIXES = {"long": "long_channel", "short": "short_channel"}
+# Scan picker on the Scans page -> (trend scans, sideways channel scans).
+SCAN_KINDS = {
+    "up": (("up",), ()),
+    "down": (("down",), ()),
+    "both": (("up", "down"), ()),
+    "long_side": ((), ("long_side",)),
+    "short_side": ((), ("short_side",)),
+    "sideways": ((), ("long_side", "short_side")),
+    "all": (("up", "down"), ("long_side", "short_side")),
+}
 BOT_SCRIPTS = {"up": "run_up_bot", "down": "run_down_bot", "side": "run_side_bot"}
 
 
@@ -57,6 +68,28 @@ def basket(name: str) -> dict:
     return _file(paths.baskets_dir(), name)
 
 
+def _channel_summary(entry: dict) -> dict:
+    """A channel report without its per-ticker calls (hundreds of names) except the members'."""
+    data = entry.get("data")
+    if not isinstance(data, dict):
+        return entry
+    calls = data.get("calls") or {}
+    members = data.get("members") or []
+    slim = {k: v for k, v in data.items() if k != "calls"}
+    slim["member_calls"] = {m: calls.get(m) for m in members}
+    slim["scanned"] = len(calls)
+    return {**entry, "data": slim}
+
+
+@router.get("/channel-scans")
+def channel_scans(side: str) -> list[dict]:
+    """Sideways channel reports (long or short), newest first, members' calls only."""
+    prefix = CHANNEL_PREFIXES.get(side)
+    if prefix is None:
+        raise common.bad_request("side must be long or short")
+    return [_channel_summary(e) for e in files.list_artifacts(paths.scanbot_dir(), prefix)]
+
+
 @router.get("/regimes")
 def regimes() -> list[dict]:
     return files.list_artifacts(paths.regimes_dir())
@@ -76,7 +109,7 @@ def plans() -> list[dict]:
 
 class ScanRun(BaseModel):
     as_of: str
-    kind: str = "both"  # up, down or both
+    kind: str = "both"  # a key of SCAN_KINDS
     tickers: list[str] = []
 
 
@@ -103,10 +136,13 @@ class BotRun(BaseModel):
 
 @router.post("/scans/run")
 def run_scans(body: ScanRun) -> dict:
-    which = {"up": ("up",), "down": ("down",), "both": ("up", "down")}.get(body.kind)
-    if which is None:
-        raise common.bad_request("kind must be up, down or both")
-    steps = common.scan_steps(common.iso_date(body.as_of), common.tickers(body.tickers), which)
+    kinds = SCAN_KINDS.get(body.kind)
+    if kinds is None:
+        raise common.bad_request(f"kind must be one of {', '.join(SCAN_KINDS)}")
+    trend, channel = kinds
+    as_of, universe = common.iso_date(body.as_of), common.tickers(body.tickers)
+    steps = [*(common.scan_steps(as_of, universe, trend) if trend else []),
+             *(common.channel_scan_steps(as_of, channel) if channel else [])]
     return common.start(f"scan:{body.kind}", steps)
 
 

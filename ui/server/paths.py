@@ -29,6 +29,11 @@ def routes_dir() -> Path:
     return data_home() / "routes"
 
 
+def scanbot_dir() -> Path:
+    """ScanBot reports: financials, long/short sideways channel scans and the rest of the funnel."""
+    return data_home() / "scanbot"
+
+
 def plans_dir() -> Path:
     return data_home() / "plans"
 

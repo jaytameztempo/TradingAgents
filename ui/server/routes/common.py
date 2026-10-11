@@ -65,6 +65,19 @@ def scan_steps(as_of: str, universe: list[str], which: tuple[str, ...] = ("up", 
     ]
 
 
+# Sideways channel scans read the newest financials report for the date (from
+# run_scanbot_financials) and scan its survivors, so they take no ticker list.
+CHANNEL_SCRIPTS = {"long_side": "run_scanbot_long_channel", "short_side": "run_scanbot_short_channel"}
+
+
+def channel_scan_steps(as_of: str, which: tuple[str, ...] = ("long_side", "short_side")) -> list[jobs.Step]:
+    folder = str(paths.scanbot_dir())
+    return [
+        jobs.Step(CHANNEL_SCRIPTS[w], ["--as-of", as_of, "--report-dir", folder, "--out-dir", folder])
+        for w in which
+    ]
+
+
 def regime_step(as_of: str, symbol: str) -> jobs.Step:
     return jobs.Step("run_regime_bot", ["--as-of", as_of, "--symbol", symbol,
                                         "--out-dir", str(paths.regimes_dir())])

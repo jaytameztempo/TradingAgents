@@ -169,3 +169,59 @@ def test_missing_keys_is_a_503_not_a_crash(monkeypatch, client):
     monkeypatch.setattr(broker, "get_broker", no_keys)
     resp = client.get("/api/broker/account")
     assert resp.status_code == 503 and resp.json()["detail"]["code"] == "missing_keys"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("kind", "scripts"), [
+    ("long_side", ["run_scanbot_long_channel"]),
+    ("short_side", ["run_scanbot_short_channel"]),
+    ("sideways", ["run_scanbot_long_channel", "run_scanbot_short_channel"]),
+    ("all", ["run_upward_trend_scan", "run_breakdown_scan", "run_scanbot_long_channel", "run_scanbot_short_channel"]),
+    ("both", ["run_upward_trend_scan", "run_breakdown_scan"]),
+])
+def test_scan_kinds_start_the_matching_scripts(home, client, monkeypatch, kind, scripts):
+    started = []
+
+    def fake_start(kind_name, steps, group=None):
+        started.extend(steps)
+        return jobs.Job(id="x", kind=kind_name, group=group, steps=steps)
+
+    monkeypatch.setattr(jobs.runner, "start", fake_start)
+    body = {"as_of": AS_OF, "kind": kind, "tickers": ["NVDA"]}
+    assert client.post("/api/scans/run", json=body).status_code == 200
+    assert [s.script for s in started] == scripts
+    scanbot = str(paths.scanbot_dir())
+    for step in started:
+        if step.script.startswith("run_scanbot_"):
+            # Channel scans scan the financials survivors: no ticker list, report dir and out dir = scanbot.
+            assert step.args == ["--as-of", AS_OF, "--report-dir", scanbot, "--out-dir", scanbot]
+        else:
+            assert "NVDA" in step.args
+
+
+@pytest.mark.unit
+def test_unknown_scan_kind_is_refused(home, client):
+    assert client.post("/api/scans/run", json={"as_of": AS_OF, "kind": "orders"}).status_code == 400
+
+
+@pytest.mark.unit
+def test_channel_reports_list_members_calls_only(home, client):
+    calls = {t: {"passed": t == "AKAM", "reasons": [], "detail": [], "quality": {}, "quality_passed": 0,
+                 "metrics": {"close": 1.0}} for t in ("AKAM", "AAP", "ABC")}
+    _write(paths.scanbot_dir() / f"long_channel_{AS_OF}_20261001T000000Z.json",
+           {"scan_name": "SCAN-LongSidewaysChannel", "as_of": AS_OF, "created_at": "2026-10-01T00:00:00+00:00",
+            "stage_counts": {"bars": 3}, "reason_counts": {}, "quality_counts": {}, "members": ["AKAM"],
+            "calls": calls, "report_version": 1})
+    body = client.get("/api/channel-scans?side=long").json()
+    assert len(body) == 1
+    data = body[0]["data"]
+    assert data["members"] == ["AKAM"] and list(data["member_calls"]) == ["AKAM"]
+    assert data["scanned"] == 3 and "calls" not in data
+    assert client.get("/api/channel-scans?side=short").json() == []
+    assert client.get("/api/channel-scans?side=orders").status_code == 400
+
+
+@pytest.mark.unit
+def test_no_whitelisted_script_sends_orders():
+    """The fork's order sender lives in paper_orders/; nothing the UI may start is an order or ticket step."""
+    assert not {s for s in jobs.SCRIPTS if any(w in s for w in ("order", "ticket", "send"))}
