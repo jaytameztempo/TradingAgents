@@ -4,6 +4,7 @@ import { api, ResearchRun, StateLog } from "../api";
 import { Card, Dialog, Empty, ErrorBox, JobLog, Markdown, Tabs } from "../components/ui";
 import { dateTime } from "../format";
 import { useJob } from "../useJob";
+import { Ticker } from "../components/Ticker";
 
 const ANALYSTS = ["market", "social", "news", "fundamentals"] as const;
 
@@ -106,7 +107,7 @@ function RunsBrowser() {
               <button key={`${r.ticker}-${r.date}`}
                       className={`list-item ${current && r.ticker === current.ticker && r.date === current.date ? "active" : ""}`}
                       onClick={() => setSelected(r)}>
-                <span>{r.ticker} · {r.date}</span>
+                <span><Ticker symbol={r.ticker} /> · {r.date}</span>
                 <span className="badge">{r.rating ?? "—"}</span>
               </button>
             ))}
@@ -128,7 +129,7 @@ function StateView({ state }: { state: StateLog }) {
   return (
     <>
       <div className="row" style={{ marginBottom: 8 }}>
-        <h2>{state.company_of_interest} · {state.trade_date}</h2>
+        <h2><Ticker symbol={state.company_of_interest} /> · {state.trade_date}</h2>
         <span className="badge">Rating: {state.final_rating ?? "—"}</span>
         {state.run_settings?.deep_think_llm != null && (
           <span className="muted">{String(state.run_settings.llm_provider)} · {String(state.run_settings.deep_think_llm)}</span>
@@ -187,7 +188,7 @@ function ReportsBrowser() {
           <div className="list">
             {reports.data.map((r) => (
               <button key={r.name} className={`list-item ${r.name === current ? "active" : ""}`} onClick={() => setName(r.name)}>
-                <span>{r.ticker}</span><span className="muted">{dateTime(r.created)}</span>
+                <span><Ticker symbol={r.ticker} /></span><span className="muted">{dateTime(r.created)}</span>
               </button>
             ))}
           </div>

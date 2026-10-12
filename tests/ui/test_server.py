@@ -225,3 +225,18 @@ def test_channel_reports_list_members_calls_only(home, client):
 def test_no_whitelisted_script_sends_orders():
     """The fork's order sender lives in paper_orders/; nothing the UI may start is an order or ticket step."""
     assert not {s for s in jobs.SCRIPTS if any(w in s for w in ("order", "ticket", "send"))}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("name", "bot", "symbol"), [
+    ("sidebot_NVDA_2026-09-30_20261003T003558Z.md", "sidebot", "NVDA"),
+    ("side_research_AFRM_2026-09-30_20261008T104134Z.md", "side_research", "AFRM"),
+    ("ranked_side_research_BRK.B_2026-10-09_20261011T010016Z.md", "ranked_side_research", "BRK.B"),
+])
+def test_plan_kind_and_symbol_come_from_the_file_name(tmp_path, name, bot, symbol):
+    from ui.server import files
+
+    path = tmp_path / name
+    path.write_text("# Research plan\n- Market regime: SIDE (SPY+QQQ)\n", encoding="utf-8")
+    plan = files.parse_plan(path)
+    assert (plan["bot"], plan["symbol"]) == (bot, symbol)

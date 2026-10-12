@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, Plan } from "../api";
 import { Card, Empty, ErrorBox, RegimeBadge } from "../components/ui";
+import { Ticker } from "../components/Ticker";
 
 // Read-only plan review. Nothing on this page talks to the broker.
 const CHECKLIST = [
@@ -45,7 +46,7 @@ export default function Trade() {
             <div className="list">
               {plans.data.map((p) => (
                 <button key={p.file} className={`list-item ${p === current ? "active" : ""}`} onClick={() => setFile(p.file)}>
-                  <span>{p.symbol} · {p.as_of}</span><span className="muted">{p.bot}</span>
+                  <span>{p.symbol ? <Ticker symbol={p.symbol} /> : "—"} · {p.as_of}</span><span className="muted">{p.bot}</span>
                 </button>
               ))}
             </div>
@@ -80,7 +81,7 @@ function PlanReview({ plan }: { plan: Plan }) {
         <div className="card">
           <div className="stat-label">Plan</div>
           <dl className="kv">
-            <dt>Symbol</dt><dd><strong>{plan.symbol}</strong></dd>
+            <dt>Symbol</dt><dd>{plan.symbol ? <Ticker symbol={plan.symbol} /> : "—"}</dd>
             <dt>Date</dt><dd>{plan.as_of}</dd>
             <dt>Regime</dt><dd>{plan.fields.regime ?? "—"}</dd>
             <dt>Entry / stop / target</dt><dd className="muted">not in this plan</dd>
@@ -91,7 +92,7 @@ function PlanReview({ plan }: { plan: Plan }) {
           {route ? (
             <dl className="kv">
               <dt>Regime</dt><dd><RegimeBadge label={route.regime_label} /></dd>
-              <dt>{plan.symbol}</dt><dd>{status}</dd>
+              <dt>{plan.symbol && <Ticker symbol={plan.symbol} />}</dt><dd>{status}</dd>
             </dl>
           ) : <span className="muted">No route for this date</span>}
           {route && <p className="muted" style={{ marginBottom: 0 }}>{route.reason}</p>}

@@ -4,6 +4,7 @@ import { api, Artifact, Basket, BasketMember, ChannelCall, ChannelReport, defaul
 import { Card, Column, DataTable, Empty, ErrorBox, JobLog, Tabs } from "../components/ui";
 import { dateTime, num } from "../format";
 import { useJob } from "../useJob";
+import { Ticker } from "../components/Ticker";
 
 type Kind = "up" | "down" | "long" | "short";
 const KIND_LABEL: Record<Kind, string> = {
@@ -150,7 +151,7 @@ function ChannelDetail({ report, side }: { report: Artifact<ChannelReport>; side
   const distanceKey = side === "long" ? "distance_to_support_atr" : "distance_to_resistance_atr";
   const qualityTotal = Object.keys(r.quality_counts).length;
   const memberCols: Column<MemberRow>[] = [
-    { key: "ticker", label: "Ticker", render: (m) => <strong>{m.ticker}</strong>, sortValue: (m) => m.ticker },
+    { key: "ticker", label: "Ticker", render: (m) => <Ticker symbol={m.ticker} />, sortValue: (m) => m.ticker },
     { key: "close", label: "Close", align: "right", render: (m) => price(metric(m, "close")), sortValue: (m) => metric(m, "close") },
     { key: "support", label: "Support", align: "right", render: (m) => price(metric(m, "support")), sortValue: (m) => metric(m, "support") },
     { key: "resistance", label: "Resistance", align: "right", render: (m) => price(metric(m, "resistance")), sortValue: (m) => metric(m, "resistance") },
@@ -211,7 +212,7 @@ function BasketDetail({ basket }: { basket: Artifact<Basket> }) {
   if (basket.error || !basket.data) return <ErrorBox error={basket.error ?? "unreadable basket"} />;
   const b = basket.data;
   const memberCols: Column<BasketMember>[] = [
-    { key: "ticker", label: "Ticker", render: (m) => <strong>{m.ticker}</strong>, sortValue: (m) => m.ticker },
+    { key: "ticker", label: "Ticker", render: (m) => <Ticker symbol={m.ticker} />, sortValue: (m) => m.ticker },
     { key: "score", label: "Score", align: "right", render: (m) => num(m.score, 3), sortValue: (m) => m.score },
     { key: "close", label: "Close", align: "right", render: (m) => num(m.metrics.close), sortValue: (m) => m.metrics.close as number },
     { key: "sma50", label: "SMA 50", align: "right", render: (m) => num(m.metrics.sma_50), sortValue: (m) => m.metrics.sma_50 as number },
@@ -228,7 +229,7 @@ function BasketDetail({ basket }: { basket: Artifact<Basket> }) {
       <h2>Rejected ({b.rejected.length})</h2>
       <DataTable
         columns={[
-          { key: "ticker", label: "Ticker", render: (r) => <strong>{r.ticker}</strong>, sortValue: (r) => r.ticker },
+          { key: "ticker", label: "Ticker", render: (r) => <Ticker symbol={r.ticker} />, sortValue: (r) => r.ticker },
           { key: "reason", label: "Reason", render: (r) => <span style={{ whiteSpace: "normal" }}>{r.reason}</span> },
         ]}
         rows={b.rejected} rowKey={(r) => r.ticker} empty="Nothing rejected."

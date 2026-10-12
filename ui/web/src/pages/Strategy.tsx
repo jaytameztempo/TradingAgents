@@ -4,6 +4,7 @@ import { api, Artifact, defaultAsOf, Regime, Route } from "../api";
 import { Card, Empty, ErrorBox, JobLog, RegimeBadge } from "../components/ui";
 import { dateTime, num } from "../format";
 import { useJob } from "../useJob";
+import { Ticker, TickerChips } from "../components/Ticker";
 
 type Bot = "up" | "down" | "side";
 const BOT_FOR_LABEL: Record<string, Bot> = { UP: "up", DOWN: "down", SIDE: "side" };
@@ -48,7 +49,7 @@ function RegimeCard() {
       {r ? (
         <>
           <div className="row" style={{ marginBottom: 8 }}>
-            <RegimeBadge label={r.label} /><strong>{r.symbol}</strong><span className="muted">{r.as_of} · {dateTime(r.created_at)}</span>
+            <RegimeBadge label={r.label} /><Ticker symbol={r.symbol} /><span className="muted">{r.as_of} · {dateTime(r.created_at)}</span>
           </div>
           <ul>{r.reasons.map((x) => <li key={x}>{x}</li>)}</ul>
           <dl className="kv">
@@ -79,7 +80,6 @@ function RouteCard() {
   const [asOf, setAsOf] = useState(defaultAsOf());
   const runner = useJob();
   const r: Route | undefined = current?.data;
-  const chips = (xs?: string[]) => xs?.length ? xs.map((t) => <span key={t} className="chip">{t}</span>) : <span className="muted">none</span>;
 
   return (
     <Card title="Route (strategy router)" actions={list.length > 0 && <Picker items={list} value={current} onChange={setFile} label="Route file" />}>
@@ -87,16 +87,16 @@ function RouteCard() {
       {r ? (
         <>
           <div className="row" style={{ marginBottom: 8 }}>
-            <RegimeBadge label={r.regime_label} /><span className="muted">{r.regime_symbol} · {r.as_of} · series {r.series}</span>
+            <RegimeBadge label={r.regime_label} /><span className="muted"><Ticker symbol={r.regime_symbol} /> · {r.as_of} · series {r.series}</span>
           </div>
           <p>{r.reason}</p>
           <dl className="kv">
             <dt>UPBot</dt><dd>{r.up_allowed ? "✓ allowed" : "✕ blocked"}</dd>
             <dt>DOWNBot</dt><dd>{r.down_allowed ? "✓ allowed" : "✕ blocked"}</dd>
-            <dt>Tradeable</dt><dd className="row">{chips(r.tradeable)}</dd>
-            <dt>Blocked</dt><dd className="row">{chips(r.blocked)}</dd>
-            <dt>Up scan passed</dt><dd className="row">{chips(r.up_passed)}</dd>
-            <dt>Down scan passed</dt><dd className="row">{chips(r.down_passed)}</dd>
+            <dt>Tradeable</dt><dd className="row"><TickerChips symbols={r.tradeable} /></dd>
+            <dt>Blocked</dt><dd className="row"><TickerChips symbols={r.blocked} /></dd>
+            <dt>Up scan passed</dt><dd className="row"><TickerChips symbols={r.up_passed} /></dd>
+            <dt>Down scan passed</dt><dd className="row"><TickerChips symbols={r.down_passed} /></dd>
           </dl>
         </>
       ) : <Empty>No route decisions yet.</Empty>}
@@ -163,7 +163,7 @@ function BotCard() {
       <JobLog job={runner.job} onDone={runner.onDone} />
       {latestPlan && (
         <div style={{ marginTop: 12 }}>
-          <h2>Latest {BOT_NAME[bot]} plan for {chosen}</h2>
+          <h2>Latest {BOT_NAME[bot]} plan for <Ticker symbol={chosen} /></h2>
           <pre className="plain">{latestPlan.text}</pre>
         </div>
       )}

@@ -108,7 +108,9 @@ def parse_plan(path: Path) -> dict[str, Any]:
         key, sep, value = line.partition(": ")
         if sep:
             fields[key.strip()] = value.strip()
-    bot, _, symbol = (match["prefix"] if match else "").partition("_")
+    # {kind}_{TICKER}: the kind may itself contain underscores (side_research,
+    # ranked_side_research), a ticker never does, so split on the last one.
+    bot, _, symbol = (match["prefix"] if match else "").rpartition("_")
     return {
         "file": path.name,
         "path": str(path),
