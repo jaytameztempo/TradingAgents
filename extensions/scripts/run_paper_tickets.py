@@ -7,8 +7,8 @@ Run from the TradingAgents folder:
 It refuses any import of Alpaca's trading client, then reads the newest daily
 status, the newest earnings blackout and the ranked side handoff for the date,
 and writes one JSON of tickets to ~/.tradingagents/tickets/ unless --out-dir is
-set. Entry is the channel line, the stop 0.25 ATR beyond it, the target the
-midline. Size is the smaller of 2% risk of $5,000 equity ($100) and 25% of
+set. Entry is the channel line, the stop 0.25 ATR beyond the fill (shown at
+the entry), the target the midline. Size is the smaller of 2% risk of $5,000 equity ($100) and 25% of
 $20,000 buying power ($5,000 notional). Names are ticketed in rank order while
 the book stays at or under $20,000 notional and $400 stop-risk; the rest are
 listed as not ticketed. If the market label is not SIDE, nothing is written. It
@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
           f"equity ${ACCOUNT_EQUITY:,.0f}, buying power ${BUYING_POWER:,.0f})")
     for t in result.tickets:
         print(f"  #{t.rank!s:<3}{t.symbol:<6}{t.side:<6}{t.order_side:<5}qty {t.quantity:>6}  entry {t.entry:>9.2f}  "
-              f"stop {t.stop:>9.2f}  target {t.target:>9.2f}  risk ${t.risk_dollars:>8,.2f}  "
+              f"stop {t.stop:>9.2f} (fill {'-' if t.side == 'long' else '+'}{t.stop_offset:.2f})  target {t.target:>9.2f}  risk ${t.risk_dollars:>8,.2f}  "
               f"notional ${t.notional:>10,.2f}  R:R {t.reward_risk:>5.2f}  bound by {t.size_bound_by}")
     if result.tickets:
         print(f"  book: notional ${result.total_notional:,.2f} of ${BOOK_NOTIONAL_LIMIT:,.0f}, "

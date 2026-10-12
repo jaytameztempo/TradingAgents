@@ -12,7 +12,11 @@ Under any label but SIDE, or when the daily status blocks the channel names,
 there are no tickets. Each ticket:
 
 - entry: the channel line, support for a long and resistance for a short,
-- stop: ``STOP_ATR`` (0.25) ATR beyond that line, below support or above resistance,
+- stop_offset: ``STOP_ATR`` (0.25) ATR, the stop's distance from the fill,
+- stop: ``stop_for_fill`` at the entry, below it for a long and above it for a
+  short. This is the stop sizing uses. The stop actually placed is
+  ``stop_for_fill`` at the real fill, so a better fill moves the stop with it
+  and never leaves it on the wrong side,
 - target: the channel midline,
 - quantity: the smaller of whole shares risking ``RISK_PCT`` (2%) of the
   $5,000 equity between entry and stop, and whole shares costing at most
@@ -44,7 +48,7 @@ from pathlib import Path
 from extensions.status.daily_status import LONG, SHORT, SIDE, SIDES, default_handoff_dir, default_status_dir
 from extensions.status.earnings_blackout import BlackoutInputError, latest_daily_status
 
-TICKET_VERSION = 1
+TICKET_VERSION = 2  # 2: the stop is stop_offset from the fill, not a fixed price
 BLACKOUT_REPORT_VERSION = 1
 ACCOUNT_EQUITY = 5_000.0  # set by hand, not read from a broker
 BUYING_POWER = 20_000.0  # set by hand, not read from a broker
@@ -137,13 +141,27 @@ def load_handoff(status: dict, handoff_dir: str | Path | None = None) -> tuple[P
 
 # --- tickets -----------------------------------------------------------------
 
+def stop_for_fill(side: str, stop_offset: float, fill: float) -> float:
+    """The stop for a fill: stop_offset below a long fill, above a short fill. Raises ValueError otherwise."""
+    if side not in (LONG, SHORT):
+        raise ValueError(f"side {side!r} is not {LONG} or {SHORT}")
+    if not stop_offset > 0 or not fill > 0:
+        raise ValueError(f"stop offset {stop_offset!r} and fill {fill!r} must both be above zero")
+    sign = 1 if side == LONG else -1
+    stop = round(fill - sign * stop_offset, 2)
+    if not stop > 0 or not sign * (fill - stop) > 0:
+        raise ValueError(f"{side} stop {stop} is not beyond fill {fill}")
+    return stop
+
+
 @dataclass(frozen=True)
 class Ticket:
     symbol: str
     side: str  # long or short
     order_side: str  # buy or sell
     entry: float
-    stop: float
+    stop: float  # stop_for_fill at the entry
+    stop_offset: float  # the stop's distance from the fill
     target: float
     quantity: int
     line: str  # support or resistance
@@ -175,12 +193,13 @@ def build_ticket(symbol: str, side: str, levels: dict, earnings_result: str | No
         raise ValueError(f"no usable {line_word}, atr_14 or midline (got {line!r}, {atr!r}, {mid!r})")
     sign = 1 if side == LONG else -1
     entry = round(line, 2)
-    stop = round(line - sign * STOP_ATR * atr, 2)
+    stop_offset = round(STOP_ATR * atr, 2)
+    if not stop_offset > 0:
+        raise ValueError(f"stop offset {STOP_ATR} x atr_14 {atr} rounds to zero")
+    stop = stop_for_fill(side, stop_offset, entry)
     target = round(mid, 2)
     risk_per_share = round(sign * (entry - stop), 2)
     reward_per_share = round(sign * (target - entry), 2)
-    if not risk_per_share > 0:
-        raise ValueError(f"stop {stop} is not beyond entry {entry}")
     if not reward_per_share > 0:
         raise ValueError(f"midline {target} is not on the profit side of entry {entry}")
 
@@ -197,6 +216,7 @@ def build_ticket(symbol: str, side: str, levels: dict, earnings_result: str | No
         order_side="buy" if side == LONG else "sell",
         entry=entry,
         stop=stop,
+        stop_offset=stop_offset,
         target=target,
         quantity=quantity,
         line=line_word,
@@ -247,6 +267,7 @@ class PaperTickets:
         "buying_power": BUYING_POWER,
         "entry": "the channel line: support for long, resistance for short",
         "stop_atr_beyond_line": STOP_ATR,
+        "stop": "stop_offset below a long fill, above a short fill; the ticket's stop is that at the entry",
         "target": "the channel midline",
         "risk_pct_of_equity": RISK_PCT,
         "name_notional_pct_of_buying_power": NAME_NOTIONAL_PCT,

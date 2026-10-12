@@ -1,6 +1,6 @@
 """Paper tickets read the newest daily status, the earnings blackout built from it and the ranked side handoff
-it names. Only the blackout's allowed names are ticketed: entry at the channel line, stop 0.25 ATR beyond it,
-target at the midline, size the smaller of $100 risk (2% of $5,000 equity) and $5,000 notional (25% of $20,000
+it names. Only the blackout's allowed names are ticketed: entry at the channel line, stop 0.25 ATR beyond the fill
+(so a better fill moves the stop with it), target at the midline, size the smaller of $100 risk (2% of $5,000 equity) and $5,000 notional (25% of $20,000
 buying power). Names are walked in rank order while the book stays at or under $20,000 notional and $400 risk.
 No label but SIDE writes anything. Alpaca's trading client is refused. No network, no orders.
 """
@@ -20,12 +20,14 @@ from extensions.status.paper_tickets import (
     BOOK_RISK,
     NOTIONAL,
     RISK,
+    TICKET_VERSION,
     TicketInputError,
     TradingClientLoaded,
     build_ticket,
     build_tickets,
     refuse_trading_client,
     save_tickets,
+    stop_for_fill,
 )
 
 AS_OF = date(2026, 9, 30)
@@ -102,7 +104,7 @@ def restore_meta_path(monkeypatch):
 def test_long_ticket_is_bound_by_notional():
     t = build_ticket("VST", "long", VST, "clear")
     assert (t.order_side, t.entry, t.stop, t.target) == ("buy", 138.45, 137.28, 147.72)
-    assert t.risk_per_share == 1.17 and t.reward_per_share == 9.27
+    assert t.stop_offset == 1.17 and t.risk_per_share == 1.17 and t.reward_per_share == 9.27
     assert t.quantity_by_risk == 85 and t.quantity_by_notional == 36
     assert t.quantity == 36 and t.size_bound_by == NOTIONAL
     assert t.risk_limit_dollars == 100.0 and t.notional_limit_dollars == 5000.0
@@ -121,12 +123,69 @@ def test_long_ticket_is_bound_by_risk():
 def test_short_ticket_stops_above_resistance_and_targets_midline():
     t = build_ticket("SHO", "short", SHORTY)
     assert (t.order_side, t.line, t.entry, t.stop, t.target) == ("sell", "resistance", 50.0, 50.5, 45.0)
+    assert t.stop_offset == 0.5
     assert t.quantity_by_risk == 200 and t.quantity_by_notional == 100
     assert t.quantity == 100 and t.size_bound_by == NOTIONAL and t.reward_risk == 10.0
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("side, levels", [("long", VST), ("long", WIDE), ("short", SHORTY), ("short", VST)])
+def test_the_ticket_stop_is_stop_for_fill_at_the_entry(side, levels):
+    t = build_ticket("X", side, levels)
+    assert t.stop == stop_for_fill(side, t.stop_offset, t.entry)
+    assert (t.stop < t.entry) if side == "long" else (t.stop > t.entry)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fill, stop", [
+    (138.45, 137.28),  # at the entry: the ticket's stop
+    (138.10, 136.93),  # a little better
+    (136.50, 135.33),  # gapped below the planned stop of 137.28
+    (139.00, 137.83),  # worse than the limit should allow; still below the fill
+])
+def test_a_long_stop_follows_the_fill_and_stays_below_it(fill, stop):
+    t = build_ticket("VST", "long", VST)
+    assert stop_for_fill("long", t.stop_offset, fill) == stop
+    assert stop < fill and round(fill - stop, 2) == t.risk_per_share
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fill, stop", [
+    (50.00, 50.50),  # at the entry: the ticket's stop
+    (50.20, 50.70),  # a little better
+    (51.25, 51.75),  # gapped above the planned stop of 50.50
+])
+def test_a_short_stop_follows_the_fill_and_stays_above_it(fill, stop):
+    t = build_ticket("SHO", "short", SHORTY)
+    assert stop_for_fill("short", t.stop_offset, fill) == stop
+    assert stop > fill and round(stop - fill, 2) == t.risk_per_share
+
+
+@pytest.mark.unit
+def test_a_better_fill_than_the_planned_stop_never_leaves_the_stop_on_the_wrong_side():
+    """The old fixed stop would sit above a long gap fill (and below a short one) and trigger at once."""
+    long_t, short_t = build_ticket("VST", "long", VST), build_ticket("SHO", "short", SHORTY)
+    long_fill, short_fill = long_t.stop - 0.50, short_t.stop + 0.50
+    assert long_t.stop > long_fill and short_t.stop < short_fill  # the fixed stop, on the wrong side
+    assert stop_for_fill("long", long_t.stop_offset, long_fill) < long_fill
+    assert stop_for_fill("short", short_t.stop_offset, short_fill) > short_fill
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side, offset, fill, match", [
+    ("long", 0, 10.0, "above zero"),
+    ("long", 0.5, 0, "above zero"),
+    ("long", 0.5, 0.5, "not beyond fill"),  # the stop would be at zero
+    ("flat", 0.5, 10.0, "not long or short"),
+])
+def test_stop_for_fill_refuses_what_cannot_be_a_stop(side, offset, fill, match):
+    with pytest.raises(ValueError, match=match):
+        stop_for_fill(side, offset, fill)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("levels, match", [
+    ({**VST, "atr_14": 0.01}, "rounds to zero"),
     ({**VST, "atr_14": 0}, "no usable"),
     ({k: v for k, v in VST.items() if k != "midline"}, "no usable"),
     ({**VST, "midline": 130.0}, "profit side"),
@@ -223,7 +282,8 @@ def test_save_writes_json_and_never_overwrites(tmp_path):
     assert path.name == "paper_tickets_2026-09-30_20261008T120000Z.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["orders_placed"] is False and data["paper"] is True and data["as_of"] == "2026-09-30"
-    assert data["tickets"][0]["size_bound_by"] == NOTIONAL
+    assert data["ticket_version"] == TICKET_VERSION == 2
+    assert data["tickets"][0]["size_bound_by"] == NOTIONAL and data["tickets"][0]["stop_offset"] == 1.17
     assert data["rules"]["name_notional_pct_of_buying_power"] == 0.25 and data["rules"]["risk_pct_of_equity"] == 0.02
     assert data["rules"]["book_notional_limit"] == 20000.0 and data["rules"]["book_risk_limit"] == 400.0
     assert data["total_notional"] == 10484.2 and data["not_ticketed"] == {}

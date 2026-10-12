@@ -1,5 +1,6 @@
 """The paper order sender loads the newest ticket file for a date, sends only its tickets, only to Alpaca paper,
-refuses any key ID not starting with PK, and never sends one client order ID twice.
+refuses any key ID not starting with PK, and never sends one client order ID twice. Each entry is a plain limit;
+once it is done filling, its OCO exit takes profit at the target and stops stop_offset beyond the actual fill.
 
 No test reaches Alpaca: a fake client stands in for the trading API.
 """
@@ -14,28 +15,33 @@ from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
 
 from paper_orders import sender
 from paper_orders.sender import (
+    Fill,
     NotPaperKey,
     TicketFileError,
     client_order_id,
+    entry_fill,
+    entry_request,
+    exit_order_id,
+    exit_request,
     load_latest_tickets,
-    order_request,
     paper_client,
     paper_keys,
+    place_exits,
     send_tickets,
 )
 
 AS_OF = date(2026, 9, 30)
 PAPER_ENV = {"ALPACA_API_KEY": "PKTESTKEY000", "ALPACA_SECRET_KEY": "secret-do-not-print"}
 VST = {"symbol": "VST", "side": "long", "order_side": "buy", "entry": 138.45, "stop": 137.28,
-       "target": 147.72, "quantity": 36, "paper": True}
+       "stop_offset": 1.17, "target": 147.72, "quantity": 36, "paper": True}
 VIR = {"symbol": "VIR", "side": "short", "order_side": "sell", "entry": 11.21, "stop": 11.34,
-       "target": 10.72, "quantity": 446, "paper": True}
+       "stop_offset": 0.13, "target": 10.72, "quantity": 446, "paper": True}
 
 
 def _file(tickets=None, created="2026-10-09T00:32:16+00:00", **over) -> dict:
     data = {"as_of": "2026-09-30", "created_at": created, "market_label": "SIDE",
             "tickets": [dict(t) for t in (tickets if tickets is not None else [VST, VIR])],
-            "paper": True, "orders_placed": False, "ticket_version": 1}
+            "paper": True, "orders_placed": False, "ticket_version": 2}
     data.update(over)
     return data
 
@@ -74,12 +80,20 @@ class FakeClient:
         self.submitted.append(req)
         if req.symbol in self.reject:
             raise _api_error(403, self.reject[req.symbol])
-        order = {"symbol": req.symbol, "qty": f"{req.qty:g}", "status": self.status, "filled_qty": "0",
-                 "client_order_id": req.client_order_id}
-        if self.status == "filled":
+        order_class = req.order_class.value
+        order = {"symbol": req.symbol, "qty": f"{req.qty:g}", "filled_qty": "0", "order_class": order_class,
+                 "client_order_id": req.client_order_id, "status": "new" if order_class == "oco" else self.status}
+        if order["status"] == "filled":
             order.update(filled_qty=f"{req.qty:g}", filled_avg_price=str(req.limit_price))
         self.orders[req.client_order_id] = order
         return order
+
+    def fill(self, coid, qty, price, status="filled"):
+        """The paper account fills an entry, at a price that can be better than its limit."""
+        self.orders[coid].update(status=status, filled_qty=f"{qty:g}", filled_avg_price=f"{price}")
+
+    def exits(self):
+        return [r for r in self.submitted if r.order_class == OrderClass.OCO]
 
 
 # --- the ticket file ---------------------------------------------------------
@@ -103,7 +117,10 @@ def test_no_file_for_the_date_is_refused(tmp_path):
     ({"paper": False}, "not marked paper"),
     ({"orders_placed": True}, "orders_placed"),
     ({"market_label": "UP"}, "market label"),
-    ({"ticket_version": 2}, "ticket_version"),
+    ({"ticket_version": 1}, "ticket_version"),
+    ({"tickets": [{k: v for k, v in VST.items() if k != "stop_offset"}]}, "stop_offset"),
+    ({"tickets": [dict(VST, stop_offset=0)]}, "stop_offset"),
+    ({"tickets": [dict(VST, stop_offset=1.5)]}, "is not stop_offset"),
     ({"tickets": []}, "no tickets"),
     ({"tickets": [dict(VST, paper=False)]}, "VST is not marked paper"),
     ({"tickets": [dict(VST, order_side="sell")]}, "order side"),
@@ -123,16 +140,62 @@ def test_a_bad_ticket_file_is_refused(tmp_path, over, match):
 # --- orders ------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_each_ticket_is_one_bracket_limit_day_order_as_written():
-    long_req, short_req = order_request(AS_OF, VST), order_request(AS_OF, VIR)
+def test_each_entry_is_one_plain_limit_day_order_with_nothing_attached():
+    long_req, short_req = entry_request(AS_OF, VST), entry_request(AS_OF, VIR)
     assert (long_req.symbol, long_req.qty, long_req.side, long_req.limit_price) == ("VST", 36, OrderSide.BUY, 138.45)
-    assert (long_req.take_profit.limit_price, long_req.stop_loss.stop_price) == (147.72, 137.28)
     assert (short_req.side, short_req.qty, short_req.limit_price) == (OrderSide.SELL, 446, 11.21)
-    assert (short_req.take_profit.limit_price, short_req.stop_loss.stop_price) == (10.72, 11.34)
     for req in (long_req, short_req):
-        assert req.order_class == OrderClass.BRACKET and req.time_in_force == TimeInForce.DAY
+        assert req.order_class == OrderClass.SIMPLE and req.time_in_force == TimeInForce.DAY
+        assert req.take_profit is None and req.stop_loss is None
     assert long_req.client_order_id == "pt-2026-09-30-VST-buy"
     assert short_req.client_order_id == "pt-2026-09-30-VIR-sell"
+
+
+@pytest.mark.unit
+def test_a_long_exit_stops_below_the_actual_fill():
+    req = exit_request(AS_OF, VST, Fill(36, 136.50))  # gapped below the planned stop of 137.28
+    assert (req.side, req.qty, req.order_class, req.time_in_force) == (OrderSide.SELL, 36, OrderClass.OCO,
+                                                                       TimeInForce.GTC)
+    assert (req.take_profit.limit_price, req.stop_loss.stop_price) == (147.72, 135.33)
+    assert req.stop_loss.stop_price < 136.50 and req.client_order_id == "pt-2026-09-30-VST-exit"
+
+
+@pytest.mark.unit
+def test_a_short_exit_stops_above_the_actual_fill():
+    req = exit_request(AS_OF, VIR, Fill(446, 11.40))  # gapped above the planned stop of 11.34
+    assert (req.side, req.qty, req.order_class) == (OrderSide.BUY, 446, OrderClass.OCO)
+    assert (req.take_profit.limit_price, req.stop_loss.stop_price) == (10.72, 11.53)
+    assert req.stop_loss.stop_price > 11.40
+
+
+@pytest.mark.unit
+def test_an_exit_at_the_entry_uses_the_ticket_stop():
+    assert exit_request(AS_OF, VST, Fill(36, 138.45)).stop_loss.stop_price == VST["stop"]
+    assert exit_request(AS_OF, VIR, Fill(446, 11.21)).stop_loss.stop_price == VIR["stop"]
+
+
+@pytest.mark.unit
+def test_an_exit_is_refused_when_the_fill_is_past_the_target():
+    with pytest.raises(ValueError, match="profit side"):
+        exit_request(AS_OF, VST, Fill(36, 148.00))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("order, result", [
+    ({"status": "filled", "filled_qty": "36", "filled_avg_price": "138.1"}, Fill(36, 138.1)),
+    ({"status": "expired", "filled_qty": "20", "filled_avg_price": "138.4"}, Fill(20, 138.4)),
+    ({"status": "new", "filled_qty": "0", "qty": "36"}, "exit_waiting"),
+    ({"status": "partially_filled", "filled_qty": "10", "qty": "36"}, "exit_waiting"),
+    ({"status": "expired", "filled_qty": "0"}, "no_fill"),
+    ({"status": "rejected", "filled_qty": "0"}, "no_fill"),
+    ({"status": "filled", "filled_qty": "40", "filled_avg_price": "138.1"}, "exit_refused"),
+    ({"status": "filled", "filled_qty": "36", "filled_avg_price": None}, "exit_refused"),
+    ({"status": "filled", "filled_qty": "36", "filled_avg_price": "138.1", "order_class": "bracket"},
+     "exit_refused"),
+])
+def test_exits_wait_for_the_entry_to_finish_filling(order, result):
+    got = entry_fill(VST, order)
+    assert got == result if isinstance(result, Fill) else got[0] == result
 
 
 # --- paper only --------------------------------------------------------------
@@ -194,7 +257,50 @@ def test_a_failed_lookup_sends_nothing_for_that_ticket():
 
 
 @pytest.mark.unit
-def test_the_cli_prints_fills_and_rejections(tmp_path, capsys):
+def test_exits_go_on_a_later_run_from_the_actual_fill_and_only_once():
+    client = FakeClient()
+    send_tickets(client, AS_OF, [VST, VIR], wait=0)
+    first = place_exits(client, AS_OF, [VST, VIR])
+    assert [o.action for o in first] == ["exit_waiting", "exit_waiting"] and client.exits() == []
+
+    client.fill(client_order_id(AS_OF, VST), 36, 136.50)  # gap below the planned stop
+    client.fill(client_order_id(AS_OF, VIR), 446, 11.25)  # a little better than the 11.21 limit
+    later = place_exits(client, AS_OF, [VST, VIR])
+    assert [o.action for o in later] == ["exit_sent", "exit_sent"]
+    assert [(o.fill, o.stop) for o in later] == [(Fill(36, 136.50), 135.33), (Fill(446, 11.25), 11.38)]
+    assert [(r.symbol, r.qty, r.stop_loss.stop_price, r.take_profit.limit_price) for r in client.exits()] == [
+        ("VST", 36, 135.33, 147.72), ("VIR", 446, 11.38, 10.72)]
+
+    again = place_exits(client, AS_OF, [VST, VIR])
+    assert [o.action for o in again] == ["exit_already_sent", "exit_already_sent"] and len(client.exits()) == 2
+
+
+@pytest.mark.unit
+def test_a_partial_fill_that_expired_gets_exits_for_the_filled_shares():
+    client = FakeClient()
+    send_tickets(client, AS_OF, [VST], wait=0)
+    client.fill(client_order_id(AS_OF, VST), 12, 138.40, status="expired")
+    (o,) = place_exits(client, AS_OF, [VST])
+    assert o.action == "exit_sent" and client.exits()[0].qty == 12 and o.stop == 137.23
+
+
+@pytest.mark.unit
+def test_no_exits_for_a_bracket_entry_already_on_the_account():
+    client = FakeClient()
+    client.orders[client_order_id(AS_OF, VST)] = {"status": "filled", "filled_qty": "36", "qty": "36",
+                                                  "filled_avg_price": "138.45", "order_class": "bracket"}
+    (o,) = place_exits(client, AS_OF, [VST])
+    assert o.action == "exit_refused" and "own exits" in o.error and client.submitted == []
+
+
+@pytest.mark.unit
+def test_an_entry_not_on_the_account_gets_no_exit():
+    (o,) = place_exits(FakeClient(), AS_OF, [VST])
+    assert o.action == "no_entry" and o.client_order_id == exit_order_id(AS_OF, VST)
+
+
+@pytest.mark.unit
+def test_the_cli_prints_fills_exits_and_rejections(tmp_path, capsys):
     _write(tmp_path, "20261009T003216Z", _file())
     client = FakeClient(reject={"VIR": "insufficient buying power"}, status="filled")
     code = sender.main(["--as-of", "2026-09-30", "--ticket-dir", str(tmp_path), "--send", "--wait", "0"],
@@ -203,6 +309,17 @@ def test_the_cli_prints_fills_and_rejections(tmp_path, capsys):
     assert code == sender.EXIT_ORDER_PROBLEM
     assert "VST   sent      pt-2026-09-30-VST-buy: status filled, filled 36 of 36 @ 138.45" in out
     assert "VIR   REJECTED  pt-2026-09-30-VIR-sell: HTTP 403: insufficient buying power" in out
+    assert "VST   exit sent pt-2026-09-30-VST-exit: filled 36 @ 138.45, stop 137.28" in out
+    assert "VIR   no exit   pt-2026-09-30-VIR-sell is not on the account" in out
+
+
+@pytest.mark.unit
+def test_the_cli_says_to_run_again_while_an_entry_is_open(tmp_path, capsys):
+    _write(tmp_path, "20261009T003216Z", _file([VST]))
+    code = sender.main(["--as-of", "2026-09-30", "--ticket-dir", str(tmp_path), "--send", "--wait", "0"],
+                       env=PAPER_ENV, make_client=lambda env: FakeClient())
+    out = capsys.readouterr().out
+    assert code == sender.EXIT_OK and "run --send again" in out
 
 
 @pytest.mark.unit
