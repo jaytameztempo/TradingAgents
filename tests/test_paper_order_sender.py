@@ -13,6 +13,7 @@ import pytest
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
 
+from extensions.status.paper_tickets import TICKET_VERSION
 from paper_orders import sender
 from paper_orders.sender import (
     Fill,
@@ -41,7 +42,7 @@ VIR = {"symbol": "VIR", "side": "short", "order_side": "sell", "entry": 11.21, "
 def _file(tickets=None, created="2026-10-09T00:32:16+00:00", **over) -> dict:
     data = {"as_of": "2026-09-30", "created_at": created, "market_label": "SIDE",
             "tickets": [dict(t) for t in (tickets if tickets is not None else [VST, VIR])],
-            "paper": True, "orders_placed": False, "ticket_version": 2}
+            "paper": True, "orders_placed": False, "ticket_version": TICKET_VERSION}
     data.update(over)
     return data
 

@@ -239,10 +239,11 @@ def test_rank_channels_rejects_mismatched_as_of():
         cr.rank_channels(*reports({"A": long_call()}, {}, as_of=date(2026, 9, 29)), now=CREATED)
 
 
-def test_sector_map_covers_the_40_names():
+def test_sector_map_covers_the_50_names():
     names = ("AFRM ALGM AMT CI DG EQPT HAS INCY LIVN LTH MO OPCH ORCL ORLY OTEX PPC TKO UAL VG VST WMT ZM IONQ VIR "
-             "AKAM DLB DLR GMED IDXX LOGI NCNO PGY SPGI STX VRSK XYZ ADPT CLF ECHO NTLA").split()
-    assert len(names) == 40
+             "AKAM DLB DLR GMED IDXX LOGI NCNO PGY SPGI STX VRSK XYZ ADPT CLF ECHO NTLA "
+             "ACIW DAN GLW GPRE INTU LUV POWL ROST SBH VRTX").split()
+    assert len(names) == 50
     assert sorted(GICS_SECTOR) == sorted(names)
 
 

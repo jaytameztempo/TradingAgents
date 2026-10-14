@@ -1,4 +1,5 @@
-"""The paper snapshot reads open positions and open orders and has no way to place, cancel or change an order.
+"""The paper snapshot reads open positions, open orders and the account, and has no way to place, cancel or
+change an order.
 
 Every test uses a fake reader or a fake opener; nothing here touches the network.
 """
@@ -16,6 +17,7 @@ import pytest
 
 from paper_orders import snapshot
 from paper_orders.snapshot import (
+    ACCOUNT_PATH,
     EXIT_BAD_KEYS,
     EXIT_OK,
     EXIT_READ_FAILED,
@@ -121,17 +123,20 @@ def test_live_or_missing_keys_are_refused_before_any_request(env, match, capsys)
     assert match in capsys.readouterr().err
 
 
-# --- the reader can only GET two paths on the paper URL ----------------------
+# --- the reader can only GET three paths on the paper URL --------------------
 
 @pytest.mark.unit
-def test_the_reader_sends_only_gets_to_the_two_paper_paths():
-    opener = FakeOpener({POSITIONS_PATH: [POSITION], OPEN_ORDERS_PATH: [ORDER]})
+def test_the_reader_sends_only_gets_to_the_three_paper_paths():
+    account = {"equity": "5000", "buying_power": "20000"}
+    opener = FakeOpener({POSITIONS_PATH: [POSITION], OPEN_ORDERS_PATH: [ORDER], ACCOUNT_PATH: account})
     reader = PaperReader("PKTEST123", "secret", opener=opener)
     assert reader.positions() == [POSITION]
     assert reader.open_orders() == [ORDER]
+    assert reader.account() == account
     assert [(r.get_method(), r.full_url, r.data) for r in opener.requests] == [
         ("GET", PAPER_URL + POSITIONS_PATH, None),
         ("GET", PAPER_URL + OPEN_ORDERS_PATH, None),
+        ("GET", PAPER_URL + ACCOUNT_PATH, None),
     ]
     assert opener.requests[0].get_header("Apca-api-key-id") == "PKTEST123"
     assert opener.requests[0].get_header("Apca-api-secret-key") == "secret"
@@ -144,9 +149,9 @@ def test_open_orders_asks_only_for_open_orders():
 
 
 @pytest.mark.unit
-def test_the_reader_exposes_only_two_read_methods():
+def test_the_reader_exposes_only_three_read_methods():
     public = {name for name in dir(PaperReader) if not name.startswith("_")}
-    assert public == {"positions", "open_orders"}
+    assert public == {"positions", "open_orders", "account"}
 
 
 @pytest.mark.unit
@@ -180,6 +185,13 @@ def test_a_response_that_is_not_a_list_is_a_read_failure():
     reader = PaperReader("PKTEST123", "secret", opener=FakeOpener({POSITIONS_PATH: {"message": "odd"}}))
     with pytest.raises(ReadFailed, match="expected a list"):
         reader.positions()
+
+
+@pytest.mark.unit
+def test_an_account_that_is_not_an_object_is_a_read_failure():
+    reader = PaperReader("PKTEST123", "secret", opener=FakeOpener({ACCOUNT_PATH: []}))
+    with pytest.raises(ReadFailed, match="expected an object"):
+        reader.account()
 
 
 # --- nothing that can send ---------------------------------------------------

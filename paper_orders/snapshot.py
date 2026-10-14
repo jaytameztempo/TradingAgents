@@ -10,10 +10,13 @@ does not start with "PK", and asks the paper account for two things:
 - GET /v2/positions
 - GET /v2/orders?status=open&nested=true&limit=500
 
+PaperReader has one more read, GET /v2/account, which the paper-ticket builder
+uses for equity and buying power at ticket time; the snapshot does not print it.
+
 Nothing is placed, cancelled or changed. This module imports no Alpaca package
 and nothing that loads one (not the sender, the UI broker or alpaca_bars), so
 Alpaca's trading client is never loaded. It reads the paper REST API with the
-standard library, and PaperReader can only make those two GET requests, and
+standard library, and PaperReader can only make those three GET requests, and
 only to the paper URL.
 """
 
@@ -41,6 +44,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PAPER_URL = "https://paper-api.alpaca.markets"
 POSITIONS_PATH = "/v2/positions"
 OPEN_ORDERS_PATH = "/v2/orders?status=open&nested=true&limit=500"
+ACCOUNT_PATH = "/v2/account"
 EXIT_OK, EXIT_BAD_KEYS, EXIT_READ_FAILED = 0, 2, 3
 
 
@@ -79,7 +83,7 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
 
 
 class PaperReader:
-    """The paper account over HTTPS GET. Public surface: positions, open_orders."""
+    """The paper account over HTTPS GET. Public surface: positions, open_orders, account."""
 
     def __init__(self, api_key: str, secret_key: str,
                  opener: Callable[..., Any] = urllib.request.urlopen, timeout: float = 15.0) -> None:
@@ -89,12 +93,15 @@ class PaperReader:
         self.__timeout = timeout
 
     def positions(self) -> list[dict]:
-        return self.__get(POSITIONS_PATH)
+        return self.__get(POSITIONS_PATH, list)
 
     def open_orders(self) -> list[dict]:
-        return self.__get(OPEN_ORDERS_PATH)
+        return self.__get(OPEN_ORDERS_PATH, list)
 
-    def __get(self, path: str) -> list[dict]:
+    def account(self) -> dict:
+        return self.__get(ACCOUNT_PATH, dict)
+
+    def __get(self, path: str, shape: type = list):
         req = urllib.request.Request(PAPER_URL + path, headers=self.__headers, method="GET")
         try:
             with self.__opener(req, timeout=self.__timeout) as resp:
@@ -107,8 +114,9 @@ class PaperReader:
             data = json.loads(body)
         except ValueError as exc:
             raise ReadFailed(f"GET {path}: the response is not JSON") from exc
-        if not isinstance(data, list):
-            raise ReadFailed(f"GET {path}: expected a list, got {type(data).__name__}")
+        if not isinstance(data, shape):
+            raise ReadFailed(f"GET {path}: expected {'a list' if shape is list else 'an object'}, "
+                             f"got {type(data).__name__}")
         return data
 
 

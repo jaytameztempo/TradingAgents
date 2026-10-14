@@ -1,34 +1,49 @@
 """Paper-order tickets for the SIDE names still allowed after the earnings blackout. It places no orders.
 
-It reads three saved files for one date and nothing else:
+It reads five saved files for one date:
 
 - the newest daily status (the market label and the ranked side handoff it used),
 - the newest earnings blackout, which must be built from that daily status
   (its ``allowed`` long and short names are the only names ticketed),
 - the ranked side handoff named in the daily status (each name's recorded
-  ``support``, ``resistance``, daily ``atr_14`` and ``midline``).
+  ``support``, ``resistance``, daily ``atr_14`` and ``midline``),
+- the long and short channel reports named in the handoff (each name's
+  confirmed ZigZag swing lows, ``support_touches``, and swing highs,
+  ``resistance_touches``, the swings that define its channel lines).
+
+Equity and buying power are not set here. On a day with tickets the caller
+reads them from the Alpaca paper account at ticket time and passes them in as
+an ``Account`` (run_paper_tickets does a read-only GET /v2/account). This
+module makes no request itself.
 
 Under any label but SIDE, or when the daily status blocks the channel names,
-there are no tickets. Each ticket:
+there are no tickets: only the channel names have lines to ticket. N is the
+number of names that survived the earnings blackout (4-hour confirmed names,
+long and short) and have a usable pivot and levels. Each ticket:
 
 - entry: the channel line, support for a long and resistance for a short,
-- stop_offset: ``STOP_ATR`` (0.25) ATR, the stop's distance from the fill,
-- stop: ``stop_for_fill`` at the entry, below it for a long and above it for a
-  short. This is the stop sizing uses. The stop actually placed is
-  ``stop_for_fill`` at the real fill, so a better fill moves the stop with it
-  and never leaves it on the wrong side,
+- pivot: the last confirmed daily ZigZag swing beyond the entry, the latest
+  swing low below a long entry or swing high above a short entry (latest by
+  ``confirmed_on``, see ``stop_pivot``). Swings on the entry side of the line,
+  or at the entry, are passed over; a name with no swing beyond its entry is
+  skipped with the reason,
+- stop_calculated: the pivot minus ``STOP_ATR`` (1) x atr_14 for a long, plus it
+  for a short,
+- stop: stop_calculated snapped away from the entry to a price ending in .99 or
+  .49 at or below it (long), .01 or .51 at or above it (short), see
+  ``snap_stop``,
+- stop_offset: the stop's distance from the entry, which the sender places
+  from the real fill (``stop_for_fill``),
 - target: the channel midline,
-- quantity: the smaller of whole shares risking ``RISK_PCT`` (2%) of the
-  $5,000 equity between entry and stop, and whole shares costing at most
-  ``NAME_NOTIONAL_PCT`` (25%) of the $20,000 buying power at entry. Both limits
-  and the one that bound the size are recorded.
+- quantity: floor(name notional limit / entry) whole shares.
 
-The allowed names are walked in rank order, long and short interleaved (long #1,
-short #1, long #2, ...). A name is ticketed only while adding it keeps total
-notional at or under ``BOOK_NOTIONAL_LIMIT`` ($20,000) and total stop-risk at or
-under ``BOOK_RISK_LIMIT`` ($400). The first name that would cross either one,
-and every name after it, is listed as not ticketed with the limit that stopped
-the walk.
+Size is not set by the stop distance. Every name gets the same dollars:
+buying power / N, capped at ``NAME_NOTIONAL_PCT`` (15%) of buying power
+(``name_notional_limit``); no name is shrunk or skipped because another used
+the budget. A name is skipped, with the reason, when it is in the earnings
+blackout, has no usable pivot or levels, or when not one share fits its
+dollars. Tickets are listed in rank order, long and short interleaved (long #1,
+short #1, long #2, ...).
 
 Every file is read with plain ``json``; no Alpaca module is loaded here, and
 ``refuse_trading_client`` makes any later import of ``alpaca.trading`` fail.
@@ -41,6 +56,7 @@ import importlib.abc
 import json
 import math
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -48,18 +64,14 @@ from pathlib import Path
 from extensions.status.daily_status import LONG, SHORT, SIDE, SIDES, default_handoff_dir, default_status_dir
 from extensions.status.earnings_blackout import BlackoutInputError, latest_daily_status
 
-TICKET_VERSION = 2  # 2: the stop is stop_offset from the fill, not a fixed price
+TICKET_VERSION = 4  # 2: stop_offset from the fill; 3: equal risk a name; 4: snapped pivot -/+ 1 ATR stop, buying power / N
 BLACKOUT_REPORT_VERSION = 1
-ACCOUNT_EQUITY = 5_000.0  # set by hand, not read from a broker
-BUYING_POWER = 20_000.0  # set by hand, not read from a broker
-RISK_PCT = 0.02  # of equity, at the stop, per name
-NAME_NOTIONAL_PCT = 0.25  # of buying power, per name
-BOOK_NOTIONAL_LIMIT = BUYING_POWER
-BOOK_RISK_LIMIT = 400.0
-STOP_ATR = 0.25
+NAME_NOTIONAL_PCT = 0.15  # of buying power, the most any one name gets
+STOP_ATR = 1.0  # beyond the pivot
+STOP_ENDINGS = {LONG: (49, 99), SHORT: (1, 51)}  # cents a snapped stop ends in
 LINE = {LONG: "support", SHORT: "resistance"}
-RISK, NOTIONAL = "risk", "notional"
-BOOK_NOTIONAL, BOOK_RISK = "book_notional", "book_risk"
+SWING = {LONG: "swing low", SHORT: "swing high"}
+CHANNEL_REPORT = {LONG: "long_channel_report", SHORT: "short_channel_report"}
 TRADING_MODULE = "alpaca.trading"
 
 
@@ -98,6 +110,11 @@ def refuse_trading_client() -> None:
 def default_ticket_dir() -> Path:
     """~/.tradingagents/tickets, beside the status files and out of git."""
     return Path.home() / ".tradingagents" / "tickets"
+
+
+def default_scan_dir() -> Path:
+    """~/.tradingagents/scanbot, where the channel reports are saved."""
+    return Path.home() / ".tradingagents" / "scanbot"
 
 
 def latest_blackout(as_of: date, status_dir: str | Path | None = None) -> tuple[Path, dict]:
@@ -139,6 +156,64 @@ def load_handoff(status: dict, handoff_dir: str | Path | None = None) -> tuple[P
     return path, data
 
 
+def load_channel_report(handoff: dict, side: str, scan_dir: str | Path | None = None) -> tuple[Path, dict]:
+    """The long or short channel report the handoff ranked, found by file name in scan_dir."""
+    key = CHANNEL_REPORT[side]
+    recorded = handoff.get(key)
+    if not recorded:
+        raise TicketInputError(f"the ranked side handoff names no {key.replace('_', ' ')}")
+    folder = Path(scan_dir) if scan_dir is not None else default_scan_dir()
+    path = folder / Path(recorded).name
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise TicketInputError(f"cannot read {side} channel report {path}: {exc}") from exc
+    if data.get("as_of") != handoff.get("as_of"):
+        raise TicketInputError(f"{side} channel report {path} is for {data.get('as_of')}, not {handoff.get('as_of')}")
+    if not isinstance(data.get("calls"), dict):
+        raise TicketInputError(f"{side} channel report {path} has no calls")
+    return path, data
+
+
+def channel_swings(report: dict, symbol: str, side: str) -> list[dict] | None:
+    """The confirmed swings that define the name's line: swing lows for a long, swing highs for a short."""
+    metrics = ((report.get("calls") or {}).get(symbol) or {}).get("metrics") or {}
+    swings = metrics.get(f"{LINE[side]}_touches")
+    return swings if isinstance(swings, list) else None
+
+
+# --- the account -------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Account:
+    """Equity and buying power read from the Alpaca paper account at ticket time."""
+    equity: float
+    buying_power: float
+    read_at: datetime
+    source: str
+    status: str | None = None
+
+
+def account_from_alpaca(raw: dict, read_at: datetime, source: str) -> Account:
+    """An Account from a GET /v2/account body. Raises TicketInputError unless equity and buying power are above zero."""
+    values = {}
+    for key in ("equity", "buying_power"):
+        try:
+            values[key] = float(raw.get(key))
+        except (TypeError, ValueError):
+            raise TicketInputError(f"the paper account has no usable {key} (got {raw.get(key)!r})") from None
+        if not values[key] > 0:
+            raise TicketInputError(f"the paper account {key} is {values[key]}, not above zero")
+    return Account(values["equity"], values["buying_power"], read_at, source, raw.get("status"))
+
+
+def name_notional_limit(buying_power: float, n: int) -> float:
+    """Per-name dollars: buying power / N, at most NAME_NOTIONAL_PCT of buying power, rounded down to the cent."""
+    if n < 1:
+        raise ValueError("N must be at least 1")
+    return math.floor(round(min(buying_power / n, buying_power * NAME_NOTIONAL_PCT) * 100, 6)) / 100
+
+
 # --- tickets -----------------------------------------------------------------
 
 def stop_for_fill(side: str, stop_offset: float, fill: float) -> float:
@@ -154,91 +229,128 @@ def stop_for_fill(side: str, stop_offset: float, fill: float) -> float:
     return stop
 
 
+def stop_pivot(swings: list[dict], side: str, entry: float, as_of: date | None = None) -> dict:
+    """The latest confirmed swing (by confirmed_on, then extreme date, on or before as_of) beyond the entry: the
+    latest swing low below a long entry, the latest swing high above a short entry. Swings on the entry side of
+    the line, or at the entry, are passed over. Raises ValueError when there is none."""
+    sign = 1 if side == LONG else -1
+    usable = [s for s in swings if isinstance(s, dict) and s.get("confirmed_on") and s.get("date")
+              and isinstance(s.get("price"), int | float) and s["price"] > 0
+              and (as_of is None or s["confirmed_on"] <= as_of.isoformat())]
+    if not usable:
+        raise ValueError(f"no confirmed {SWING[side]} in the {side} channel report")
+    beyond = [s for s in usable if sign * (entry - s["price"]) > 0]
+    if not beyond:
+        latest = max(usable, key=lambda s: (s["confirmed_on"], s["date"]))
+        raise ValueError(f"no confirmed {SWING[side]} {'below' if side == LONG else 'above'} entry {entry} in the "
+                         f"{side} channel report ({len(usable)} {SWING[side]}s, from {min(s['price'] for s in usable)} "
+                         f"to {max(s['price'] for s in usable)}; the latest {latest['price']} of {latest['date']})")
+    return max(beyond, key=lambda s: (s["confirmed_on"], s["date"]))
+
+
+def snap_stop(side: str, level: float) -> float:
+    """The nearest price ending in .49 or .99 at or below level (long), .01 or .51 at or above it (short)."""
+    endings = STOP_ENDINGS[side]  # the two endings are 50 cents apart, so one repeats every 50 cents
+    if side == LONG:
+        cents = math.floor(round(level * 100, 6))
+        return (cents - (cents - endings[0]) % 50) / 100
+    cents = math.ceil(round(level * 100, 6))
+    return (cents + (endings[0] - cents) % 50) / 100
+
+
 @dataclass(frozen=True)
 class Ticket:
     symbol: str
     side: str  # long or short
     order_side: str  # buy or sell
     entry: float
-    stop: float  # stop_for_fill at the entry
-    stop_offset: float  # the stop's distance from the fill
+    stop: float  # stop_calculated snapped to .99/.49 (long) or .01/.51 (short)
+    stop_offset: float  # the stop's distance from the entry
     target: float
     quantity: int
     line: str  # support or resistance
     line_level: float
     atr_14: float
     midline: float
+    pivot: dict  # the last confirmed daily ZigZag swing low (long) or high (short) beyond the entry
+    stop_calculated: float  # pivot -/+ STOP_ATR x atr_14, before the snap
     risk_per_share: float
     reward_per_share: float
     reward_risk: float
     risk_dollars: float
     notional: float
-    risk_limit_dollars: float
-    notional_limit_dollars: float
-    quantity_by_risk: int
-    quantity_by_notional: int
-    size_bound_by: str  # risk or notional
+    notional_limit_dollars: float  # buying power / N, capped at NAME_NOTIONAL_PCT of buying power
     earnings_result: str | None  # from the blackout: clear, flagged_kept, unknown_kept
     rank: int | None = None  # the handoff's rank within its side
     paper: bool = True
 
 
-def build_ticket(symbol: str, side: str, levels: dict, earnings_result: str | None = None,
-                 account_equity: float = ACCOUNT_EQUITY, buying_power: float = BUYING_POWER,
-                 rank: int | None = None) -> Ticket:
-    """One ticket from the handoff's recorded levels. Raises ValueError when they cannot make one."""
+def plan_ticket(symbol: str, side: str, levels: dict, swings: list[dict] | None, as_of: date | None = None) -> dict:
+    """Entry, stop and target from the handoff's levels and the channel report's swings, before sizing. Raises
+    ValueError when they cannot make a ticket."""
     line_word = LINE[side]
     line, atr, mid = levels.get(line_word), levels.get("atr_14"), levels.get("midline")
     if line is None or mid is None or atr is None or not atr > 0:
         raise ValueError(f"no usable {line_word}, atr_14 or midline (got {line!r}, {atr!r}, {mid!r})")
+    if not swings:
+        raise ValueError(f"no {SWING[side]}s defining {line_word} in the {side} channel report")
     sign = 1 if side == LONG else -1
     entry = round(line, 2)
-    stop_offset = round(STOP_ATR * atr, 2)
-    if not stop_offset > 0:
-        raise ValueError(f"stop offset {STOP_ATR} x atr_14 {atr} rounds to zero")
-    stop = stop_for_fill(side, stop_offset, entry)
+    pivot = stop_pivot(swings, side, entry, as_of)
+    calculated = round(pivot["price"] - sign * STOP_ATR * atr, 4)
+    stop = snap_stop(side, calculated)
+    if not stop > 0:
+        raise ValueError(f"stop {stop} from pivot {pivot['price']} - {STOP_ATR:g} x atr_14 {atr} is not above zero")
+    stop_offset = round(sign * (entry - stop), 2)
     target = round(mid, 2)
-    risk_per_share = round(sign * (entry - stop), 2)
     reward_per_share = round(sign * (target - entry), 2)
     if not reward_per_share > 0:
         raise ValueError(f"midline {target} is not on the profit side of entry {entry}")
+    return {"entry": entry, "stop": stop, "stop_offset": stop_offset, "target": target, "line": line_word,
+            "line_level": line, "atr_14": atr, "midline": mid,
+            "pivot": {"date": pivot["date"], "price": pivot["price"], "confirmed_on": pivot["confirmed_on"]},
+            "stop_calculated": calculated, "risk_per_share": stop_offset, "reward_per_share": reward_per_share}
 
-    risk_limit = round(account_equity * RISK_PCT, 2)
-    notional_limit = round(buying_power * NAME_NOTIONAL_PCT, 2)
-    by_risk = math.floor(risk_limit / risk_per_share)
-    by_notional = math.floor(notional_limit / entry)
-    quantity = min(by_risk, by_notional)
+
+def size_ticket(symbol: str, side: str, plan: dict, earnings_result: str | None = None, *, notional_limit: float,
+                rank: int | None = None) -> Ticket:
+    """A ticket of floor(notional limit / entry) whole shares. Raises ValueError when not one share fits."""
+    risk_per_share = plan["risk_per_share"]
+    quantity = math.floor(round(notional_limit / plan["entry"], 6))
     if quantity < 1:
-        raise ValueError(f"no whole share fits: {by_risk} by risk, {by_notional} by notional")
+        raise ValueError(f"no whole share fits: ${notional_limit:,.2f} a name at entry ${plan['entry']:,.2f}")
     return Ticket(
         symbol=symbol,
         side=side,
         order_side="buy" if side == LONG else "sell",
-        entry=entry,
-        stop=stop,
-        stop_offset=stop_offset,
-        target=target,
         quantity=quantity,
-        line=line_word,
-        line_level=line,
-        atr_14=atr,
-        midline=mid,
-        risk_per_share=risk_per_share,
-        reward_per_share=reward_per_share,
-        reward_risk=round(reward_per_share / risk_per_share, 2),
+        **plan,
+        reward_risk=round(plan["reward_per_share"] / risk_per_share, 2),
         risk_dollars=round(quantity * risk_per_share, 2),
-        notional=round(quantity * entry, 2),
-        risk_limit_dollars=risk_limit,
+        notional=round(quantity * plan["entry"], 2),
         notional_limit_dollars=notional_limit,
-        quantity_by_risk=by_risk,
-        quantity_by_notional=by_notional,
-        size_bound_by=RISK if by_risk <= by_notional else NOTIONAL,
         earnings_result=earnings_result,
         rank=rank,
     )
 
 
-def _walk_order(allowed: dict[str, list[str]], names: dict) -> list[tuple[str, str]]:
+def build_ticket(symbol: str, side: str, levels: dict, swings: list[dict] | None, earnings_result: str | None = None,
+                 *, notional_limit: float, rank: int | None = None, as_of: date | None = None) -> Ticket:
+    """One ticket from the handoff's levels and the channel report's swings. Raises ValueError when they cannot make one."""
+    return size_ticket(symbol, side, plan_ticket(symbol, side, levels, swings, as_of), earnings_result,
+                       notional_limit=notional_limit, rank=rank)
+
+
+def blackout_reason(check: dict) -> str:
+    """Why the blackout removed a name, from its name check."""
+    if check.get("earnings_date") is None:
+        return "in the earnings blackout"
+    source = f" ({check['date_source']})" if check.get("date_source") else ""
+    return (f"in the earnings blackout: earnings {check['earnings_date']}{source}, "
+            f"{check.get('sessions_away')} sessions away")
+
+
+def _rank_order(allowed: dict[str, list[str]], names: dict) -> list[tuple[str, str]]:
     """(symbol, side) by handoff rank, long before short on a tie; a name with no rank goes last on its side."""
     order = []
     for side_order, side in enumerate(SIDES):
@@ -249,6 +361,30 @@ def _walk_order(allowed: dict[str, list[str]], names: dict) -> list[tuple[str, s
     return [(symbol, side) for _, symbol, side in sorted(order)]
 
 
+def _rules(account: Account | None = None, n: int | None = None, notional_limit: float | None = None) -> dict:
+    return {
+        "account_equity": account.equity if account else None,
+        "buying_power": account.buying_power if account else None,
+        "account_source": account.source if account else None,
+        "account_read_at": account.read_at.isoformat() if account else None,
+        "names_n": n,
+        "names": "the earnings blackout's allowed long and short names with a usable pivot and levels",
+        "name_notional": "buying power / N, capped at name_notional_pct_of_buying_power, rounded down to the cent, "
+                         "the same for every name",
+        "name_notional_pct_of_buying_power": NAME_NOTIONAL_PCT,
+        "name_notional_limit": notional_limit,
+        "entry": "the channel line: support for long, resistance for short",
+        "pivot": "the last confirmed daily ZigZag swing beyond the entry: the latest swing low below a long entry, "
+                 "the latest swing high above a short entry, from the channel report; none, no ticket",
+        "stop_atr_beyond_pivot": STOP_ATR,
+        "stop": "pivot - STOP_ATR x atr_14 snapped down to a price ending .99 or .49 at or below it (long); "
+                "pivot + STOP_ATR x atr_14 snapped up to a price ending .01 or .51 at or above it (short)",
+        "target": "the channel midline",
+        "quantity": "floor(name notional limit / entry); not sized by the stop distance",
+        "order": "rank order, long before short on a tie; listing order does not change any size",
+    }
+
+
 @dataclass(frozen=True)
 class PaperTickets:
     as_of: date
@@ -256,27 +392,12 @@ class PaperTickets:
     market_label: str
     channel_names_blocked: bool
     tickets: list[Ticket]
-    skipped: dict[str, str]  # symbol -> why its levels made no ticket
+    skipped: dict[str, str]  # symbol -> why it made no ticket (blackout, no usable pivot or levels, no share fits)
     no_ticket_reason: str | None  # set when the day has no tickets at all
     sources: dict[str, str | None]
-    not_ticketed: dict[str, dict] = field(default_factory=dict)  # symbol -> the book limit that stopped the walk
     total_notional: float = 0.0
     total_risk: float = 0.0
-    rules: dict = field(default_factory=lambda: {
-        "account_equity": ACCOUNT_EQUITY,
-        "buying_power": BUYING_POWER,
-        "entry": "the channel line: support for long, resistance for short",
-        "stop_atr_beyond_line": STOP_ATR,
-        "stop": "stop_offset below a long fill, above a short fill; the ticket's stop is that at the entry",
-        "target": "the channel midline",
-        "risk_pct_of_equity": RISK_PCT,
-        "name_notional_pct_of_buying_power": NAME_NOTIONAL_PCT,
-        "quantity": "min(floor(risk limit / risk per share), floor(notional limit / entry))",
-        "book_notional_limit": BOOK_NOTIONAL_LIMIT,
-        "book_risk_limit": BOOK_RISK_LIMIT,
-        "walk": "rank order, long before short on a tie; stop at the first name that would cross a book limit",
-        "names": "the earnings blackout's allowed long and short names",
-    })
+    rules: dict = field(default_factory=_rules)
     warnings: list[str] = field(default_factory=list)
     paper: bool = True
     orders_placed: bool = False
@@ -294,13 +415,18 @@ def build_tickets(
     status: tuple[Path, dict],
     blackout: tuple[Path, dict] | None = None,
     handoff: tuple[Path, dict] | None = None,
+    account: Account | None = None,
     created_at: datetime | None = None,
+    channels: dict[str, tuple[Path, dict]] | None = None,
 ) -> PaperTickets:
-    """Tickets for the allowed names. Under any label but SIDE the blackout and handoff are not needed. Writes nothing."""
+    """Tickets for the allowed names, sized from the account, stops from the channel reports' swings (channels:
+    side -> report, for each side with allowed names). Under any label but SIDE the blackout, handoff, account and
+    channel reports are not needed. Writes nothing."""
     status_path, s = status
     label = s.get("market_label", "")
     created = created_at or datetime.now(UTC)
-    sources = {"daily_status": str(status_path), "earnings_blackout": None, "ranked_side_handoff": None}
+    sources = {"daily_status": str(status_path), "earnings_blackout": None, "ranked_side_handoff": None,
+               "long_channel_report": None, "short_channel_report": None}
 
     def no_tickets(reason: str) -> PaperTickets:
         return PaperTickets(as_of, created, label, bool(s.get("channel_names_blocked")), [], {}, reason, sources)
@@ -325,36 +451,50 @@ def build_tickets(
         if unconfirmed:
             raise TicketInputError(f"allowed {side} names not confirmed in the daily status: {', '.join(unconfirmed)}")
 
-    results = {c["symbol"]: c.get("result") for c in b.get("names", [])}
+    checks = {c.get("symbol"): c for c in b.get("names", []) if isinstance(c, dict)}
+    skipped: dict[str, str] = {sym: blackout_reason(checks.get(sym) or {}) for sym in b.get("removed", [])}
+    if not any(b["allowed"][side] for side in SIDES):
+        return PaperTickets(as_of, created, label, False, [], skipped,
+                            "the earnings blackout allows no names; no tickets", sources,
+                            warnings=[f"{sym}: no ticket, {why}" for sym, why in skipped.items()]
+                            + list(b.get("warnings", [])))
+    if account is None:
+        raise TicketInputError("a SIDE day needs equity and buying power read from the paper account")
+    channels = channels or {}
+    for side in SIDES:
+        if b["allowed"][side] and side not in channels:
+            raise TicketInputError(f"allowed {side} names need the {side} channel report for their swings")
+        if side in channels:
+            sources[CHANNEL_REPORT[side]] = str(channels[side][0])
+
+    # first the stops: N is the allowed names with a usable pivot and levels
     names = h.get("names", {})
-    tickets: list[Ticket] = []
-    skipped: dict[str, str] = {}
-    not_ticketed: dict[str, dict] = {}
-    total_notional = total_risk = 0.0
-    stopped_by: str | None = None
-    for symbol, side in _walk_order(b["allowed"], names):
+    plans: list[tuple[str, str, int | None, dict]] = []
+    for symbol, side in _rank_order(b["allowed"], names):
         entry = names.get(symbol)
         if entry is None or entry.get("side") != side:
             skipped[symbol] = f"not a {side} name in the ranked side handoff"
             continue
         try:
-            t = build_ticket(symbol, side, entry.get("levels") or {}, results.get(symbol), rank=entry.get("rank"))
+            plan = plan_ticket(symbol, side, entry.get("levels") or {},
+                               channel_swings(channels[side][1], symbol, side), as_of)
         except ValueError as exc:
             skipped[symbol] = str(exc)
             continue
-        if stopped_by is None:
-            next_notional = round(total_notional + t.notional, 2)
-            next_risk = round(total_risk + t.risk_dollars, 2)
-            if next_notional > BOOK_NOTIONAL_LIMIT:
-                stopped_by = BOOK_NOTIONAL
-            elif next_risk > BOOK_RISK_LIMIT:
-                stopped_by = BOOK_RISK
-            else:
-                tickets.append(t)
-                total_notional, total_risk = next_notional, next_risk
-                continue
-        not_ticketed[symbol] = {"side": side, "rank": t.rank, "stopped_by": stopped_by,
-                                "quantity": t.quantity, "notional": t.notional, "risk_dollars": t.risk_dollars}
+        plans.append((symbol, side, entry.get("rank"), plan))
+
+    # then the size: every name gets the same dollars of buying power
+    n = len(plans)
+    notional_limit = name_notional_limit(account.buying_power, n) if n else None
+    tickets: list[Ticket] = []
+    for symbol, side, rank, plan in plans:
+        try:
+            tickets.append(size_ticket(symbol, side, plan, (checks.get(symbol) or {}).get("result"),
+                                       notional_limit=notional_limit, rank=rank))
+        except ValueError as exc:
+            skipped[symbol] = str(exc)
+    total_notional = round(sum(t.notional for t in tickets), 2)
+    total_risk = round(sum(t.risk_dollars for t in tickets), 2)
 
     warnings = [f"{sym}: no ticket, {why}" for sym, why in skipped.items()]
     warnings += [f"{t.symbol}: earnings result {t.earnings_result}" for t in tickets
@@ -369,9 +509,9 @@ def build_tickets(
         skipped=skipped,
         no_ticket_reason=None if tickets else "no allowed name made a ticket",
         sources=sources,
-        not_ticketed=not_ticketed,
         total_notional=total_notional,
         total_risk=total_risk,
+        rules=_rules(account, n, notional_limit),
         warnings=list(dict.fromkeys(warnings)),
     )
 
@@ -380,14 +520,25 @@ def tickets_for_date(
     as_of: date,
     status_dir: str | Path | None = None,
     handoff_dir: str | Path | None = None,
+    read_account: Callable[[], Account] | None = None,
+    scan_dir: str | Path | None = None,
 ) -> PaperTickets:
+    """Tickets from the saved files. read_account is called only on a SIDE day with allowed names, at ticket time."""
     try:
         status = latest_daily_status(as_of, status_dir)
     except BlackoutInputError as exc:
         raise TicketInputError(str(exc)) from exc
     if status[1].get("market_label") != SIDE or status[1].get("channel_names_blocked"):
         return build_tickets(as_of, status)
-    return build_tickets(as_of, status, latest_blackout(as_of, status_dir), load_handoff(status[1], handoff_dir))
+    blackout = latest_blackout(as_of, status_dir)
+    handoff = load_handoff(status[1], handoff_dir)
+    account = None
+    channels = {side: load_channel_report(handoff[1], side, scan_dir) for side in SIDES if blackout[1]["allowed"][side]}
+    if channels:
+        if read_account is None:
+            raise TicketInputError("a SIDE day needs equity and buying power read from the paper account")
+        account = read_account()
+    return build_tickets(as_of, status, blackout, handoff, account, channels=channels)
 
 
 def save_tickets(t: PaperTickets, out_dir: str | Path | None = None) -> Path:
