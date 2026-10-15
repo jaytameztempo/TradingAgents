@@ -30,7 +30,9 @@ from extensions.scanbot.long_channel import (
     load_report,
     run_long_channel,
     save_report,
+    stop_swing,
 )
+from extensions.scanbot.pivot import SWING_LOW, Swing
 from extensions.scripts import run_scanbot_long_channel as cli
 from tests.extensions.test_pivot_confirm import HIGHER_LOWS, four_hour_frame
 
@@ -131,6 +133,95 @@ def test_touches_come_only_from_the_last_60_sessions():
 def test_short_history_and_no_bars():
     assert classify_long_channel(_frame("A", AT_SUPPORT[-59:])).reasons == [SHORT_HISTORY]
     assert classify_long_channel(_frame("A", [])).reasons == [NO_BARS]
+
+
+def _lows(*pairs):
+    """Confirmed swing lows from (bar index, price), each confirmed three bars later."""
+    return [Swing(SWING_LOW, i, p, i + 3) for i, p in pairs]
+
+
+def _stop_low(swings, support=100.0, atr=2.0, bars=130):
+    return stop_swing(_frame("A", [100.0] * bars), swings, SWING_LOW, support, atr)
+
+
+def test_the_stop_swing_low_is_the_highest_clustered_swing_low_below_support():
+    """98 is below support but alone (3 from 95, the nearest); 95 and 94 are within 1 ATR of each other, and 95 is
+    the higher. 101 is above support and is never the pick."""
+    frame = _frame("A", [100.0] * 130)
+    swing = _stop_low(_lows((50, 95.0), (70, 94.0), (100, 98.0), (110, 101.0)))
+    assert (swing["price"], swing["window_sessions"], swing["rule"]) == (95.0, 120, "clustered_within_3atr_beyond_line")
+    assert (swing["date"], swing["confirmed_on"]) == (frame["date"].iloc[50].date().isoformat(),
+                                                      frame["date"].iloc[53].date().isoformat())
+    assert swing["partner"]["price"] == 94.0
+
+
+def test_the_partner_low_need_not_be_below_support_and_1_atr_is_inclusive():
+    """98's only neighbour is 100, at support (not below it) and exactly 1 ATR away: it counts. At 1.99 ATR it does
+    not, and 98 alone is no stop swing."""
+    swings = _lows((100, 98.0), (110, 100.0))
+    assert _stop_low(swings)["price"] == 98.0 and _stop_low(swings)["partner"]["price"] == 100.0
+    assert _stop_low(swings, atr=1.99)["price"] is None
+
+
+def test_swing_lows_outside_the_120_sessions_are_neither_picked_nor_partners():
+    """Of 130 bars the window starts at bar 10: the 95.5 at bar 5 does not partner the 95 at bar 50."""
+    assert _stop_low(_lows((5, 95.5), (50, 95.0)))["price"] is None
+    assert _stop_low(_lows((10, 95.5), (50, 95.0)))["price"] == 95.5
+
+
+def test_on_a_tie_the_most_recent_swing_low_is_picked():
+    frame = _frame("A", [100.0] * 130)
+    swing = _stop_low(_lows((40, 95.0), (60, 95.0)))
+    assert swing["date"] == frame["date"].iloc[60].date().isoformat()
+
+
+def test_no_stop_swing_low_without_support_or_atr():
+    swings = _lows((50, 95.0), (70, 94.0))
+    empty = {"price": None, "date": None, "confirmed_on": None, "window_sessions": 120,
+             "rule": "clustered_within_3atr_beyond_line", "partner": None}
+    assert _stop_low(swings, support=None) == empty and _stop_low(swings, atr=float("nan")) == empty
+
+
+def test_a_clustered_swing_low_more_than_3_atr_below_support_is_discarded():
+    """95 and 94 cluster, but with ATR 1.5 the 95 is 3.33 ATR below support: no stop swing, no fallback."""
+    assert _stop_low(_lows((50, 95.0), (70, 94.0)), atr=1.5)["price"] is None
+
+
+def test_a_swing_low_exactly_3_atr_below_support_is_kept():
+    """With ATR 2, 94 is exactly 3 ATR below support: it counts. Its partner 92.5 (0.75 ATR away) is 3.75 ATR
+    below support; the limit is on the pick, not the partner."""
+    assert _stop_low(_lows((50, 94.0), (70, 92.5)))["price"] == 94.0
+
+
+def test_the_3_atr_limit_keeps_the_highest_clustered_low_when_a_deeper_one_is_discarded():
+    """97 and 96 cluster within 3 ATR; 90 and 89 cluster too but are 5 ATR down. The pick stays 97."""
+    swing = _stop_low(_lows((30, 90.0), (40, 89.0), (50, 97.0), (70, 96.0)))
+    assert swing["price"] == 97.0 and swing["partner"]["price"] == 96.0
+
+
+def test_classify_records_the_clustered_stop_swing_low_from_the_bars():
+    """Two dips 100 and 80 sessions back, 1 apart, are below support (99.5, ATR 1.7) within 3 ATR and cluster: the
+    higher is the stop swing. The same dips more than 3 ATR down, one dip alone, or a clean range whose lows all sit at
+    support, have none. Recorded only: the call does not change."""
+    closes = list(AT_SUPPORT)
+    closes[-100], closes[-80] = 96.0, 97.0
+    frame = _frame("A", closes)
+    call = classify_long_channel(frame)
+    swing = call.metrics["stop_swing_low"]
+    assert (swing["price"], swing["window_sessions"]) == (96.5, 120)
+    assert swing["date"] == frame["date"].iloc[-80].date().isoformat()
+    assert swing["partner"]["price"] == 95.5 and swing["confirmed_on"] > swing["date"]
+    deep = list(AT_SUPPORT)
+    deep[-100], deep[-80] = 90.0, 91.0
+    assert classify_long_channel(_frame("A", deep)).metrics["stop_swing_low"]["price"] is None
+    lone = list(AT_SUPPORT)
+    lone[-100] = 96.0
+    assert classify_long_channel(_frame("A", lone)).metrics["stop_swing_low"]["price"] is None
+    clean = classify_long_channel(_frame("A", AT_SUPPORT))
+    assert clean.metrics["stop_swing_low"]["price"] is None
+    assert call.passed == clean.passed
+    flat = classify_long_channel(_frame("A", [106.0] * 100)).metrics["stop_swing_low"]
+    assert (flat["price"], flat["window_sessions"]) == (None, 100)
 
 
 def test_classify_records_the_daily_pivot_and_the_close_reclaim():

@@ -23,8 +23,13 @@ A name passes only if all of these hold:
 The scan does not run the TTM Squeeze gate, and neither do the paper tickets.
 
 The SMA50 slope, the 50/200 tangle and the four quality checks are computed
-and recorded for every measured name, but they are not required here. This
-step builds no ranking, score or TickerBasket. Nothing here places an order.
+and recorded for every measured name, but they are not required here. So is
+``stop_swing_high``: of the confirmed swing highs whose extreme bar is inside
+the last 120 sessions (or all the bars, when there are fewer), the lowest one
+above resistance that has another swing high in that window within 1 ATR(14)
+of it and is no more than 3 ATR(14) above resistance, which the paper tickets
+use for the stop; no rule here reads it. This step builds no
+ranking, score or TickerBasket. Nothing here places an order.
 """
 
 from __future__ import annotations
@@ -53,9 +58,14 @@ from extensions.scanbot.long_channel import (
     SIDE_ADX_MAX,
     SLOPE_MAX_PCT,
     SLOPE_SESSIONS,
+    STOP_CLUSTER_ATR,
+    STOP_MAX_BEYOND_ATR,
+    STOP_SWING_LOOKBACK,
+    STOP_SWING_RULE,
     _recorded_trend_metrics,
     _round,
     _touch,
+    stop_swing,
 )
 from extensions.scanbot.pivot import (
     ATR_PERIOD,
@@ -141,7 +151,11 @@ POLICY = {
     "break_atr_max_above_resistance": BREAK_ATR_MAX,
     "min_bars": MIN_BARS,
     **pivot_confirm.rules(PIVOT_SIDE),
-    "recorded_not_required": ["sma50_slope", "sma_tangle", "quality_checks"],
+    "recorded_not_required": ["sma50_slope", "sma_tangle", "quality_checks", "stop_swing_high"],
+    "stop_swing_lookback_sessions": STOP_SWING_LOOKBACK,
+    "stop_swing_rule": STOP_SWING_RULE,
+    "stop_swing_cluster_atr": STOP_CLUSTER_ATR,
+    "stop_swing_max_beyond_atr": STOP_MAX_BEYOND_ATR,
     "sma50_slope_sessions": SLOPE_SESSIONS,
     "sma50_slope_max_pct": SLOPE_MAX_PCT,
     "rsi_period": RSI_PERIOD,
@@ -263,7 +277,8 @@ def classify_short_channel(
     atr = float(wilder_atr(high, low, close).iloc[-1])
 
     first_in_window = count - CHANNEL_LOOKBACK
-    swings = [s for s in zigzag_swings(high, low, close) if s.index >= first_in_window]
+    all_swings = zigzag_swings(high, low, close)
+    swings = [s for s in all_swings if s.index >= first_in_window]
     highs = [s for s in swings if s.kind == SWING_HIGH]
     lows = [s for s in swings if s.kind == SWING_LOW]
     resistance = float(np.median([s.price for s in highs])) if highs else None
@@ -298,6 +313,7 @@ def classify_short_channel(
         "support_touches": [_touch(s, bars) for s in lows],
         "resistance_touches": [_touch(s, bars) for s in highs],
         "distance_to_resistance_atr": _round(distance_atr),
+        "stop_swing_high": stop_swing(bars, all_swings, SWING_HIGH, resistance, atr),
         "pivot_confirmation": pivot_confirm.recorded(bars, swings, resistance, PIVOT_SIDE),
         **_recorded_trend_metrics(close),
         **quality_metrics,

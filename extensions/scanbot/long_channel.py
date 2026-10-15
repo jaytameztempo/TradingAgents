@@ -23,7 +23,12 @@ The scan does not run the TTM Squeeze gate. ``squeeze_filter`` below is kept
 but not called; the paper tickets do not run the gate either.
 
 The SMA50 slope, the 50/200 tangle and the four quality checks are computed
-and recorded for every measured name, but they are not required here. This
+and recorded for every measured name, but they are not required here. So is
+``stop_swing_low``: of the confirmed swing lows whose extreme bar is inside
+the last 120 sessions (or all the bars, when there are fewer), the highest one
+below support that has another swing low in that window within 1 ATR(14) of
+it and is no more than 3 ATR(14) below support, which the paper tickets use
+for the stop; no rule here reads it. This
 step builds no short channel scan, ranking, score or TickerBasket. Nothing
 here places an order.
 """
@@ -76,6 +81,10 @@ MIN_TOUCHES = 2
 PIVOT_ATR_MAX = 0.6
 BREAK_ATR_MAX = 0.25
 MIN_BARS = CHANNEL_LOOKBACK
+STOP_SWING_LOOKBACK = 120  # sessions; the paper ticket stop's swing window, recorded only
+STOP_CLUSTER_ATR = 1.0  # a stop swing needs another swing of its kind within this many ATR(14)
+STOP_MAX_BEYOND_ATR = 3.0  # a stop swing more than this many ATR(14) beyond the channel line is discarded
+STOP_SWING_RULE = "clustered_within_3atr_beyond_line"  # the paper tickets refuse a stop swing under any other rule
 
 # Recorded, not required, in this step.
 SLOPE_SESSIONS = 20
@@ -149,7 +158,11 @@ POLICY = {
     "break_atr_max_below_support": BREAK_ATR_MAX,
     "min_bars": MIN_BARS,
     **pivot_confirm.rules(PIVOT_SIDE),
-    "recorded_not_required": ["sma50_slope", "sma_tangle", "quality_checks"],
+    "recorded_not_required": ["sma50_slope", "sma_tangle", "quality_checks", "stop_swing_low"],
+    "stop_swing_lookback_sessions": STOP_SWING_LOOKBACK,
+    "stop_swing_rule": STOP_SWING_RULE,
+    "stop_swing_cluster_atr": STOP_CLUSTER_ATR,
+    "stop_swing_max_beyond_atr": STOP_MAX_BEYOND_ATR,
     "sma50_slope_sessions": SLOPE_SESSIONS,
     "sma50_slope_max_pct": SLOPE_MAX_PCT,
     "rsi_period": RSI_PERIOD,
@@ -251,7 +264,8 @@ def classify_long_channel(bars: pd.DataFrame) -> ChannelCall:
     atr = float(wilder_atr(high, low, close).iloc[-1])
 
     first_in_window = count - CHANNEL_LOOKBACK
-    swings = [s for s in zigzag_swings(high, low, close) if s.index >= first_in_window]
+    all_swings = zigzag_swings(high, low, close)
+    swings = [s for s in all_swings if s.index >= first_in_window]
     highs = [s for s in swings if s.kind == SWING_HIGH]
     lows = [s for s in swings if s.kind == SWING_LOW]
     resistance = float(np.median([s.price for s in highs])) if highs else None
@@ -283,6 +297,7 @@ def classify_long_channel(bars: pd.DataFrame) -> ChannelCall:
         "support_touches": [_touch(s, bars) for s in lows],
         "resistance_touches": [_touch(s, bars) for s in highs],
         "distance_to_support_atr": _round(distance_atr),
+        "stop_swing_low": stop_swing(bars, all_swings, SWING_LOW, support, atr),
         "pivot_confirmation": pivot_confirm.recorded(bars, swings, support, PIVOT_SIDE),
         **_recorded_trend_metrics(close),
         **quality_metrics,
@@ -309,6 +324,40 @@ def _recorded_trend_metrics(close: pd.Series) -> dict:
         out["sma_spread_pct"] = _round(spread_pct)
         out["sma_crossed_recently"] = bool(crossed)
         out["price_between_smas"] = bool(lo <= float(close.iloc[-1]) <= hi)
+    return out
+
+
+def stop_swing(bars: pd.DataFrame, swings: list, kind: str, line: float | None, atr: float) -> dict:
+    """The paper ticket stop's swing. Of the confirmed swings of this kind whose extreme bar is inside the last
+    STOP_SWING_LOOKBACK sessions (or all the bars when there are fewer), the candidates are the swing lows below
+    support (SWING_LOW, line = support) or the swing highs above resistance (SWING_HIGH, line = resistance). A
+    candidate counts when another swing of its kind in the window, beyond the line or not, is within STOP_CLUSTER_ATR
+    x atr of it (inclusive), and when it is no more than STOP_MAX_BEYOND_ATR x atr beyond the line (inclusive). The
+    pick is the highest counted low or the lowest counted high, the most recent on a tie. Recorded only: the paper
+    ticket stop is this price -/+ 1 ATR. price is None when no swing counts."""
+    window = min(STOP_SWING_LOOKBACK, len(bars))
+    first = len(bars) - window
+    found = [s for s in swings if s.kind == kind and s.index >= first]
+    out = {"price": None, "date": None, "confirmed_on": None, "window_sessions": window, "rule": STOP_SWING_RULE,
+           "partner": None}
+    if line is None or not np.isfinite(atr) or atr <= 0:
+        return out
+    reach = STOP_CLUSTER_ATR * atr + 1e-9  # inclusive, with room for float noise
+    farthest = STOP_MAX_BEYOND_ATR * atr + 1e-9  # inclusive, with room for float noise
+
+    def partners(c):
+        return [s for s in found if s is not c and abs(s.price - c.price) <= reach]
+
+    if kind == SWING_LOW:
+        counted = [s for s in found if s.price < line and line - s.price <= farthest and partners(s)]
+        key = lambda s: (s.price, s.index)  # noqa: E731  highest, then most recent
+    else:
+        counted = [s for s in found if s.price > line and s.price - line <= farthest and partners(s)]
+        key = lambda s: (-s.price, s.index)  # noqa: E731  lowest, then most recent
+    if counted:
+        pick = max(counted, key=key)
+        partner = min(partners(pick), key=lambda s: (abs(s.price - pick.price), -s.index))
+        out.update(_touch(pick, bars), partner=_touch(partner, bars))
     return out
 
 

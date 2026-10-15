@@ -9,7 +9,8 @@ It reads five saved files for one date:
   ``midline``),
 - the newest long and short channel reports for the date, by the created_at
   inside each file, not the ones the handoff names (each name's membership,
-  ``support`` or ``resistance`` and daily ``atr_14``, as the scan measured them).
+  ``support`` or ``resistance``, daily ``atr_14`` and ``stop_swing_low`` or
+  ``stop_swing_high``, as the scan measured them).
   The newest report must carry the ``pivot_confirmed`` stage; if it does not,
   there are no tickets, and an older confirmed report is never used instead. A
   name that is not a passing member of that report gets no ticket.
@@ -29,8 +30,18 @@ usable levels. Each ticket:
 - entry: a limit at the channel level from the channel report, support from the
   long channel report for a long (limit buy), resistance from the short channel
   report for a short (limit sell), rounded to the cent; never the last close,
-- channel_level: that level as the report recorded it, which is also the pivot,
-- stop_calculated: channel_level minus ``STOP_ATR`` (1) x the report's atr_14
+- channel_level: that level as the report recorded it,
+- stop_swing: of the confirmed ZigZag swings whose extreme bar is inside the
+  120 sessions ending on as_of (all the bars when there are fewer), for a long
+  the highest swing low below support that has another swing low in the window
+  within 1 ATR(14) of it (inclusive; the other one need not be below support);
+  for a short the lowest swing high above resistance with another swing high
+  within 1 ATR(14). A swing more than 3 ATR(14) beyond the line does not count.
+  The channel report records it (``stop_swing_low`` / ``stop_swing_high``, rule
+  ``clustered_within_3atr_beyond_line``); a name with no such
+  swing, or a report without the field or recorded under an older rule, gets no
+  ticket. The channel level is never used in its place,
+- stop_calculated: stop_swing minus ``STOP_ATR`` (1) x the report's atr_14
   for a long, plus it for a short,
 - stop: stop_calculated snapped away from the entry to a price ending in .99 or
   .49 at or below it (long), .01 or .51 at or above it (short), see
@@ -69,9 +80,12 @@ from pathlib import Path
 from extensions.status.daily_status import LONG, SHORT, SIDE, SIDES, default_handoff_dir, default_status_dir
 from extensions.status.earnings_blackout import BlackoutInputError, latest_daily_status
 
-TICKET_VERSION = 8  # 2: stop_offset from the fill; 3: equal risk a name; 4: snapped pivot -/+ 1 ATR stop, buying power / N;
+TICKET_VERSION = 11  # 2: stop_offset from the fill; 3: equal risk a name; 4: snapped pivot -/+ 1 ATR stop, buying power / N;
 # 5: entry and pivot are the channel report's support (long) or resistance (short); 6: 4h + 1h TTM Squeeze gate;
-# 7: the TTM Squeeze gate removed; 8: the newest pivot-confirmed channel report, members only
+# 7: the TTM Squeeze gate removed; 8: the newest pivot-confirmed channel report, members only;
+# 9: the stop is the 120-session swing extreme -/+ 1 ATR, not the channel level;
+# 10: the stop swing is the nearest clustered swing beyond the channel level in 120 sessions, not the extreme;
+# 11: a stop swing more than 3 ATR beyond the channel level is discarded
 BLACKOUT_REPORT_VERSION = 1
 CHANNEL_REPORT_VERSION = 1
 CONFIRMED_STAGE = "pivot_confirmed"  # the stage_counts key a confirmed channel report carries
@@ -79,6 +93,10 @@ NAME_NOTIONAL_PCT = 0.15  # of buying power, the most any one name gets
 STOP_ATR = 1.0  # beyond the channel level
 STOP_ENDINGS = {LONG: (49, 99), SHORT: (1, 51)}  # cents a snapped stop ends in
 LINE = {LONG: "support", SHORT: "resistance"}
+STOP_SWING = {LONG: "stop_swing_low", SHORT: "stop_swing_high"}  # recorded by the channel scans
+STOP_SWING_RULE = "clustered_within_3atr_beyond_line"  # the rule the channel scans record with the stop swing
+SWING_WORD = {LONG: "low", SHORT: "high"}
+BEYOND = {LONG: "below support", SHORT: "above resistance"}
 CHANNEL_REPORT = {LONG: "long_channel_report", SHORT: "short_channel_report"}
 CHANNEL_FILE = {LONG: "long_channel", SHORT: "short_channel"}
 TRADING_MODULE = "alpaca.trading"
@@ -201,10 +219,11 @@ def channel_members(report: dict) -> set[str]:
     return {s for s in report.get("members") or () if (calls.get(s) or {}).get("passed") is True}
 
 
-def channel_levels(report: dict, symbol: str, side: str) -> tuple[float | None, float | None]:
-    """The name's channel level (support for a long, resistance for a short) and atr_14 from the channel report."""
+def channel_levels(report: dict, symbol: str, side: str) -> tuple[float | None, float | None, dict | None]:
+    """The name's channel level (support for a long, resistance for a short), atr_14 and stop swing (stop_swing_low
+    for a long, stop_swing_high for a short) from the channel report."""
     metrics = ((report.get("calls") or {}).get(symbol) or {}).get("metrics") or {}
-    return metrics.get(LINE[side]), metrics.get("atr_14")
+    return metrics.get(LINE[side]), metrics.get("atr_14"), metrics.get(STOP_SWING[side])
 
 
 # --- the account -------------------------------------------------------------
@@ -275,10 +294,12 @@ class Ticket:
     target: float
     quantity: int
     line: str  # support or resistance
-    channel_level: float  # from the channel report, unrounded: the limit entry's level and the stop's pivot
+    channel_level: float  # from the channel report, unrounded: the limit entry's level
     atr_14: float  # from the channel report
     midline: float
-    stop_calculated: float  # channel_level -/+ STOP_ATR x atr_14, before the snap
+    stop_swing: float  # the clustered swing low (long) or high (short) from the channel report: the stop's pivot
+    stop_swing_date: str | None  # the swing's extreme bar
+    stop_calculated: float  # stop_swing -/+ STOP_ATR x atr_14, before the snap
     risk_per_share: float
     reward_per_share: float
     reward_risk: float
@@ -294,21 +315,33 @@ def _price(value) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool) and value > 0
 
 
-def plan_ticket(symbol: str, side: str, line: float | None, atr: float | None, midline: float | None) -> dict:
+def plan_ticket(symbol: str, side: str, line: float | None, atr: float | None, midline: float | None,
+                swing: dict | None) -> dict:
     """Entry, stop and target before sizing: a limit entry at the channel line (support for a long, resistance for a
-    short, from the channel report), the stop that same line -/+ STOP_ATR x the report's atr_14, snapped. Raises
-    ValueError when they cannot make a ticket."""
+    short, from the channel report), the stop the report's clustered swing low below support (long) or swing high
+    above resistance (short) -/+ STOP_ATR x the report's atr_14, snapped. Raises ValueError when they cannot make a
+    ticket."""
     line_word, mid = LINE[side], midline
     if not _price(line) or not _price(atr) or not _price(mid):
         raise ValueError(f"no usable {line_word} or atr_14 in the {side} channel report, or midline in the handoff "
                          f"(got {line!r}, {atr!r}, {mid!r})")
+    if not isinstance(swing, dict):
+        raise ValueError(f"no {STOP_SWING[side]} in the {side} channel report; rerun the {side} channel scan")
+    if swing.get("rule") != STOP_SWING_RULE:
+        raise ValueError(f"the {STOP_SWING[side]} in the {side} channel report is from an older rule; rerun the {side} "
+                         f"channel scan")
+    swing_price = swing.get("price")
+    if not _price(swing_price):
+        word = SWING_WORD[side]
+        raise ValueError(f"no confirmed swing {word} {BEYOND[side]} by at most 3 ATR with another swing {word} within "
+                         f"1 ATR in the last {swing.get('window_sessions')} sessions in the {side} channel report")
     sign = 1 if side == LONG else -1
     entry = round(line, 2)
-    calculated = round(line - sign * STOP_ATR * atr, 4)
+    calculated = round(swing_price - sign * STOP_ATR * atr, 4)
     stop = snap_stop(side, calculated)
     if not stop > 0:
-        raise ValueError(f"stop {stop} from {line_word} {line} {'-' if side == LONG else '+'} {STOP_ATR:g} x atr_14 "
-                         f"{atr} is not above zero")
+        raise ValueError(f"stop {stop} from swing {SWING_WORD[side]} {swing_price} {'-' if side == LONG else '+'} "
+                         f"{STOP_ATR:g} x atr_14 {atr} is not above zero")
     stop_offset = round(sign * (entry - stop), 2)
     if not stop_offset > 0:
         raise ValueError(f"stop {stop} is not beyond entry {entry}")
@@ -317,7 +350,9 @@ def plan_ticket(symbol: str, side: str, line: float | None, atr: float | None, m
     if not reward_per_share > 0:
         raise ValueError(f"midline {target} is not on the profit side of entry {entry}")
     return {"entry": entry, "stop": stop, "stop_offset": stop_offset, "target": target, "line": line_word,
-            "channel_level": line, "atr_14": atr, "midline": mid, "stop_calculated": calculated, "risk_per_share": stop_offset, "reward_per_share": reward_per_share}
+            "channel_level": line, "atr_14": atr, "midline": mid, "stop_swing": swing_price,
+            "stop_swing_date": swing.get("date"), "stop_calculated": calculated, "risk_per_share": stop_offset,
+            "reward_per_share": reward_per_share}
 
 
 def size_ticket(symbol: str, side: str, plan: dict, earnings_result: str | None = None, *, notional_limit: float,
@@ -343,10 +378,11 @@ def size_ticket(symbol: str, side: str, plan: dict, earnings_result: str | None 
 
 
 def build_ticket(symbol: str, side: str, line: float | None, atr: float | None, midline: float | None,
-                 earnings_result: str | None = None, *, notional_limit: float, rank: int | None = None) -> Ticket:
-    """One ticket from the channel report's line and atr_14 and the handoff's midline. Raises ValueError when they
-    cannot make one."""
-    return size_ticket(symbol, side, plan_ticket(symbol, side, line, atr, midline), earnings_result,
+                 swing: dict | None, earnings_result: str | None = None, *, notional_limit: float,
+                 rank: int | None = None) -> Ticket:
+    """One ticket from the channel report's line, atr_14 and stop swing and the handoff's midline. Raises ValueError
+    when they cannot make one."""
+    return size_ticket(symbol, side, plan_ticket(symbol, side, line, atr, midline, swing), earnings_result,
                        notional_limit=notional_limit, rank=rank)
 
 
@@ -387,10 +423,15 @@ def _rules(account: Account | None = None, n: int | None = None, notional_limit:
         "name_notional_limit": notional_limit,
         "entry": "limit at the channel level, rounded to the cent: limit buy at support from the long channel "
                  "report (long), limit sell at resistance from the short channel report (short); not the last close",
-        "pivot": "the same channel level as the entry, unrounded (channel_level)",
-        "stop_atr_beyond_pivot": STOP_ATR,
-        "stop": "channel_level - STOP_ATR x atr_14 snapped down to a price ending .99 or .49 at or below it (long); "
-                "channel_level + STOP_ATR x atr_14 snapped up to a price ending .01 or .51 at or above it (short); "
+        "stop_swing": "of the confirmed ZigZag swings whose extreme bar is inside the 120 sessions ending on as_of, "
+                      "or all the bars when there are fewer: the highest swing low below support that has another "
+                      "swing low in the window within 1 x atr_14 of it, inclusive (long); the lowest swing high above "
+                      "resistance with another swing high within 1 x atr_14 (short); the other swing need not be "
+                      "beyond the line; a swing more than 3 x atr_14 beyond the line does not count; from the channel report (stop_swing_low / stop_swing_high, rule "
+                      f"{STOP_SWING_RULE}); no such swing, no ticket",
+        "stop_atr_beyond_swing": STOP_ATR,
+        "stop": "stop_swing - STOP_ATR x atr_14 snapped down to a price ending .99 or .49 at or below it (long); "
+                "stop_swing + STOP_ATR x atr_14 snapped up to a price ending .01 or .51 at or above it (short); "
                 "atr_14 from the channel report",
         "target": "the channel midline",
         "quantity": "floor(name notional limit / entry); not sized by the stop distance",
@@ -498,8 +539,8 @@ def build_tickets(
             skipped[symbol] = f"not a member of the newest confirmed {side} channel report {channels[side][0].name}"
             continue
         try:
-            line, atr = channel_levels(channels[side][1], symbol, side)
-            plan = plan_ticket(symbol, side, line, atr, (entry.get("levels") or {}).get("midline"))
+            line, atr, swing = channel_levels(channels[side][1], symbol, side)
+            plan = plan_ticket(symbol, side, line, atr, (entry.get("levels") or {}).get("midline"), swing)
         except ValueError as exc:
             skipped[symbol] = str(exc)
             continue

@@ -15,9 +15,14 @@ read-only GET /v2/account through paper_orders.snapshot, paper keys only), and
 writes one JSON of tickets to ~/.tradingagents/tickets/ unless --out-dir is
 set. Entry is a limit at the channel level the scan measured: support from
 the long channel report (limit buy), resistance from the short channel report
-(limit sell), never the last close. That same level is the pivot: the stop is
-support - 1 ATR(14) snapped down to .99 or .49 (long), resistance + 1 ATR(14)
-snapped up to .01 or .51 (short); the target the midline. Each of the N
+(limit sell), never the last close. The stop swing is, of the confirmed swings
+in the 120 sessions ending on as_of, the highest swing low below support with
+another swing low within 1 ATR(14) of it (long), or the lowest swing high above
+resistance with another swing high within 1 ATR(14) (short); a swing more than
+3 ATR(14) beyond support or resistance does not count. The stop is that
+low - 1 ATR(14) snapped down to .99 or .49 (long), that high + 1 ATR(14)
+snapped up to .01 or .51 (short), as the channel report recorded them; a name
+with no such swing is skipped. The target is the midline. Each of the N
 allowed names with usable levels gets buying power / N, at most 15% of buying
 power, and floor(that / limit entry) shares; size does not depend on the stop. Names in the
 earnings blackout are listed as skipped with the earnings date. The TTM
@@ -102,8 +107,10 @@ def main(argv: list[str] | None = None, read_account: Callable[[], Account] = re
         print(f"  #{t.rank!s:<3}{t.symbol:<6}{t.side:<6}{t.order_side:<5}qty {t.quantity:>6}  limit {t.entry:>9.2f}  "
               f"stop {t.stop:>9.2f}  target {t.target:>9.2f}  risk ${t.risk_dollars:>9,.2f}  "
               f"notional ${t.notional:>10,.2f}  R:R {t.reward_risk:>5.2f}")
-        print(f"       channel {t.line} {t.channel_level} {sign} {rules['stop_atr_beyond_pivot']:g} x ATR "
-              f"{t.atr_14:.4f} = {t.stop_calculated:.4f}, snapped to {t.stop:.2f}")
+        swing = "low" if t.side == "long" else "high"
+        print(f"       channel {t.line} {t.channel_level}; stop: clustered swing {swing} {t.stop_swing} "
+              f"({t.stop_swing_date}) {sign} {rules['stop_atr_beyond_swing']:g} x ATR {t.atr_14:.4f} = {t.stop_calculated:.4f}, "
+              f"snapped to {t.stop:.2f}")
     if result.tickets:
         print(f"  book: notional ${result.total_notional:,.2f} of buying power ${rules['buying_power']:,.2f}, "
               f"stop-risk ${result.total_risk:,.2f}")

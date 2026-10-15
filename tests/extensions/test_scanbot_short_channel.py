@@ -34,7 +34,9 @@ from extensions.scanbot.short_channel import (
     load_report,
     run_short_channel,
     save_report,
+    stop_swing,
 )
+from extensions.scanbot.pivot import SWING_HIGH, Swing
 from extensions.scripts import run_scanbot_short_channel as cli
 from tests.extensions.test_pivot_confirm import HIGHER_LOWS, SHORT, four_hour_frame
 
@@ -154,6 +156,68 @@ def test_a_perfect_channel_fails_without_borrow():
 def test_short_history_and_no_bars():
     assert _classify(AT_RESISTANCE[-59:]).reasons == [SHORT_HISTORY]
     assert _classify([]).reasons == [NO_BARS]
+
+
+def _highs(*pairs):
+    """Confirmed swing highs from (bar index, price), each confirmed three bars later."""
+    return [Swing(SWING_HIGH, i, p, i + 3) for i, p in pairs]
+
+
+def _stop_high(swings, resistance=100.0, atr=2.0, bars=130):
+    return stop_swing(_frame("A", [100.0] * bars), swings, SWING_HIGH, resistance, atr)
+
+
+def test_the_stop_swing_high_is_the_lowest_clustered_swing_high_above_resistance():
+    """102 is above resistance but alone (3 from 105, the nearest); 105 and 106 are within 1 ATR of each other, and
+    105 is the lower. 99 is below resistance and is never the pick."""
+    frame = _frame("A", [100.0] * 130)
+    swing = _stop_high(_highs((50, 105.0), (70, 106.0), (100, 102.0), (110, 99.0)))
+    assert (swing["price"], swing["window_sessions"], swing["rule"]) == (105.0, 120, "clustered_within_3atr_beyond_line")
+    assert swing["date"] == frame["date"].iloc[50].date().isoformat() and swing["partner"]["price"] == 106.0
+
+
+def test_the_partner_high_need_not_be_above_resistance_and_1_atr_is_inclusive():
+    swings = _highs((100, 102.0), (110, 100.0))
+    assert _stop_high(swings)["price"] == 102.0 and _stop_high(swings)["partner"]["price"] == 100.0
+    assert _stop_high(swings, atr=1.99)["price"] is None
+    assert _stop_high(_highs((5, 104.5), (50, 105.0)))["price"] is None  # bar 5 is outside the 120 sessions
+
+
+def test_a_clustered_swing_high_more_than_3_atr_above_resistance_is_discarded():
+    """105 and 106 cluster, but with ATR 1.5 the 105 is 3.33 ATR above resistance: no stop swing, no fallback."""
+    assert _stop_high(_highs((50, 105.0), (70, 106.0)), atr=1.5)["price"] is None
+
+
+def test_a_swing_high_exactly_3_atr_above_resistance_is_kept():
+    """With ATR 2, 106 is exactly 3 ATR above resistance: it counts. Its partner 107.5 is 3.75 ATR above; the limit
+    is on the pick, not the partner."""
+    assert _stop_high(_highs((50, 106.0), (70, 107.5)))["price"] == 106.0
+
+
+def test_the_3_atr_limit_keeps_the_lowest_clustered_high_when_a_higher_one_is_discarded():
+    """103 and 104 cluster within 3 ATR; 110 and 111 cluster too but are 5 ATR up. The pick stays 103."""
+    swing = _stop_high(_highs((30, 110.0), (40, 111.0), (50, 103.0), (70, 104.0)))
+    assert swing["price"] == 103.0 and swing["partner"]["price"] == 104.0
+
+
+def test_classify_records_the_clustered_stop_swing_high_from_the_bars():
+    """Two spikes 100 and 80 sessions back, 1 apart, are above resistance (112.5, ATR 1.7) within 3 ATR and cluster:
+    the lower is the stop swing. The same spikes more than 3 ATR up, or a clean range whose highs all sit at
+    resistance, have none. Recorded only: the call does not change."""
+    closes = list(AT_RESISTANCE)
+    closes[-100], closes[-80] = 116.0, 115.0
+    frame = _frame("A", closes)
+    call = classify_short_channel(frame, True, True)
+    swing = call.metrics["stop_swing_high"]
+    assert (swing["price"], swing["window_sessions"]) == (115.5, 120)
+    assert swing["date"] == frame["date"].iloc[-80].date().isoformat() and swing["partner"]["price"] == 116.5
+    high = list(AT_RESISTANCE)
+    high[-100], high[-80] = 121.0, 120.0
+    assert classify_short_channel(_frame("A", high), True, True).metrics["stop_swing_high"]["price"] is None
+    clean = _classify(AT_RESISTANCE)
+    assert clean.metrics["stop_swing_high"]["price"] is None and call.passed == clean.passed
+    flat = _classify([106.0] * 100).metrics["stop_swing_high"]
+    assert (flat["price"], flat["window_sessions"]) == (None, 100)
 
 
 def test_classify_records_the_daily_pivot_and_the_close_reclaim():
