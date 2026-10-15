@@ -14,6 +14,13 @@ A name passes only if all of these hold:
 - at least two support touches and two resistance touches in 60 sessions
 - close is inside 0.6 ATR(14) above support, and not through support by
   more than 0.25 ATR
+- it passes at least one pivot confirmation (``pivot_confirm``): a daily
+  close reclaim of support in the last 5 sessions, or a 4-hour higher low
+  after the daily pivot on regular-session 4-hour bars, which are fetched for
+  the names that passed the rules above only
+
+The scan does not run the TTM Squeeze gate. ``squeeze_filter`` below is kept
+but not called; the paper tickets do not run the gate either.
 
 The SMA50 slope, the 50/200 tangle and the four quality checks are computed
 and recorded for every measured name, but they are not required here. This
@@ -25,14 +32,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from extensions.market_data.alpaca_bars import fetch_daily_bars
+from extensions.market_data.alpaca_bars import THIRTY_MINUTE_COLUMNS, fetch_4hour_bars, fetch_daily_bars
 from extensions.regime.indicators import sma, wilder_adx
 from extensions.regime.regime_bot import (
     ADX_PERIOD,
@@ -43,7 +50,8 @@ from extensions.regime.regime_bot import (
     tangle_check,
 )
 from extensions.scanbot.financials import STRONG, FinancialsReport
-from extensions.scanbot.funnel import FEED, _fetch_in_chunks, default_report_dir
+from extensions.scanbot import pivot_confirm
+from extensions.scanbot.funnel import BAR_CHUNK, FEED, _fetch_in_chunks, default_report_dir
 from extensions.scanbot.pivot import (
     ATR_PERIOD,
     RSI_PERIOD,
@@ -54,6 +62,7 @@ from extensions.scanbot.pivot import (
     wilder_rsi,
     zigzag_swings,
 )
+from extensions.status import squeeze_gate
 
 REPORT_VERSION = 1
 SCAN_NAME = "SCAN-LongSidewaysChannel"
@@ -86,9 +95,10 @@ HEIGHT_TOO_SMALL = "height_under_8pct"
 HEIGHT_TOO_LARGE = "height_over_22pct"
 TOO_FAR_ABOVE_SUPPORT = "close_over_0.6atr_above_support"
 THROUGH_SUPPORT = "close_over_0.25atr_through_support"
+NO_PIVOT_CONFIRMATION = "no_pivot_confirmation"
 REASONS = (
     NO_BARS, SHORT_HISTORY, ADX_ABOVE_MAX, TOO_FEW_SUPPORT, TOO_FEW_RESISTANCE,
-    HEIGHT_TOO_SMALL, HEIGHT_TOO_LARGE, TOO_FAR_ABOVE_SUPPORT, THROUGH_SUPPORT,
+    HEIGHT_TOO_SMALL, HEIGHT_TOO_LARGE, TOO_FAR_ABOVE_SUPPORT, THROUGH_SUPPORT, NO_PIVOT_CONFIRMATION,
 )
 
 # Sequential stages for the funnel counts. Each stage keeps names with none of its codes.
@@ -99,6 +109,7 @@ STAGES = (
     ("touches_2_and_2", (TOO_FEW_SUPPORT, TOO_FEW_RESISTANCE)),
     ("height_8_to_22pct", (HEIGHT_TOO_SMALL, HEIGHT_TOO_LARGE)),
     ("at_support", (TOO_FAR_ABOVE_SUPPORT, THROUGH_SUPPORT)),
+    ("pivot_confirmed", (NO_PIVOT_CONFIRMATION,)),
 )
 
 Q_RSI = "rsi_35_48"
@@ -106,6 +117,18 @@ Q_VOLUME = "volume_sma5_below_sma20"
 Q_WICK = "lower_wick_40pct"
 Q_NO_BREAK = "no_close_below_support_3"
 QUALITY_CHECKS = (Q_RSI, Q_VOLUME, Q_WICK, Q_NO_BREAK)
+
+
+def squeeze_policy(side: str) -> dict:
+    """The squeeze gate's rules, worded for a scan that keeps or drops a channel pass."""
+    want = squeeze_gate.DIRECTION[side]
+    return {
+        **squeeze_gate.rules(),
+        "squeeze_gate": f"keep a channel pass only when the TTM Squeeze fired {want} within the last "
+                        f"{squeeze_gate.FIRE_LOOKBACK_SESSIONS} sessions on both the regular-session 4-hour and "
+                        "1-hour bars dated on or before as_of, and the latest bar's momentum on both still agrees",
+    }
+
 
 POLICY = {
     "scan_name": SCAN_NAME,
@@ -125,6 +148,7 @@ POLICY = {
     "pivot_atr_max_above_support": PIVOT_ATR_MAX,
     "break_atr_max_below_support": BREAK_ATR_MAX,
     "min_bars": MIN_BARS,
+    **pivot_confirm.rules(PIVOT_SIDE),
     "recorded_not_required": ["sma50_slope", "sma_tangle", "quality_checks"],
     "sma50_slope_sessions": SLOPE_SESSIONS,
     "sma50_slope_max_pct": SLOPE_MAX_PCT,
@@ -259,6 +283,7 @@ def classify_long_channel(bars: pd.DataFrame) -> ChannelCall:
         "support_touches": [_touch(s, bars) for s in lows],
         "resistance_touches": [_touch(s, bars) for s in highs],
         "distance_to_support_atr": _round(distance_atr),
+        "pivot_confirmation": pivot_confirm.recorded(bars, swings, support, PIVOT_SIDE),
         **_recorded_trend_metrics(close),
         **quality_metrics,
         "bars": count,
@@ -297,6 +322,35 @@ def _touch(swing, bars: pd.DataFrame) -> dict:
 
 def _round(value: float | None) -> float | None:
     return round(float(value), 4) if value is not None and np.isfinite(value) else None
+
+
+# --- the TTM Squeeze (not called by the scans) -------------------------------
+
+def squeeze_filter(calls: dict, side: str, code: str, as_of: date, intraday_fetcher: Callable,
+                   cache_dir: str | Path | None) -> dict:
+    """Run the paper ticket squeeze gate on the names that passed the channel rules. A name that fails it is no
+    longer a pass: it carries ``code`` and the gate's reason. Every gated name records its 4h and 1h reads under
+    metrics["squeeze"]. Names that failed the channel rules are not read and come back unchanged."""
+    passed = sorted(s for s, c in calls.items() if c.passed)
+    if not passed:
+        return calls
+    start = as_of - timedelta(days=squeeze_gate.BARS_LOOKBACK_DAYS)
+    frames = [intraday_fetcher(passed[i:i + BAR_CHUNK], start, as_of, feed=squeeze_gate.BARS_FEED, cache_dir=cache_dir)
+              for i in range(0, len(passed), BAR_CHUNK)]
+    frames = [f for f in frames if not f.empty]
+    bars = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        {c: pd.to_datetime([]) if c == "timestamp" else [] for c in THIRTY_MINUTE_COLUMNS})
+    gates = squeeze_gate.squeeze_gates({s: side for s in passed}, bars, as_of)
+    out = dict(calls)
+    for symbol, g in gates.items():
+        call = calls[symbol]
+        metrics = {**call.metrics, "squeeze": g.to_dict()}
+        if g.passed:
+            out[symbol] = replace(call, detail=call.detail + [g.reads[tf].detail for tf in squeeze_gate.TIMEFRAMES],
+                                  metrics=metrics)
+        else:
+            out[symbol] = replace(call, passed=False, reasons=[code], detail=[g.reason], metrics=metrics)
+    return out
 
 
 # --- the run -----------------------------------------------------------------
@@ -354,10 +408,12 @@ def run_long_channel(
     financials_path: str | Path,
     *,
     bars_fetcher: Callable = fetch_daily_bars,
+    four_hour_fetcher: Callable = fetch_4hour_bars,
     cache_dir: str | Path | None = None,
     created_at: datetime | None = None,
 ) -> LongChannelReport:
-    """Check every STRONG survivor of the financials report. A bars failure raises and nothing is returned."""
+    """Check every STRONG survivor of the financials report, then confirm the channel passes on their pivot.
+    A bars failure, daily or 4-hour, raises and nothing is returned."""
     as_of = financials.as_of
     symbols = list(financials.gate_pass(STRONG).survivors)
     start = as_of - timedelta(days=LOOKBACK_CALENDAR_DAYS)
@@ -368,6 +424,7 @@ def run_long_channel(
     empty = pd.DataFrame({"date": pd.to_datetime([]), "open": [], "high": [], "low": [], "close": [], "volume": []})
 
     calls = {s: classify_long_channel(by_symbol.get(s, empty)) for s in sorted(symbols)}
+    calls = pivot_confirm.confirm_filter(calls, PIVOT_SIDE, NO_PIVOT_CONFIRMATION, as_of, four_hour_fetcher, cache_dir)
     members = sorted(s for s, c in calls.items() if c.passed)
     counts = stage_counts(calls)
     if counts["strong_financials"] != len(symbols) or counts[STAGES[-1][0]] != len(members):

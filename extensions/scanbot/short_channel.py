@@ -15,6 +15,12 @@ A name passes only if all of these hold:
 - at least two support touches and two resistance touches in 60 sessions
 - close is inside 0.6 ATR(14) below resistance, and not through resistance by
   more than 0.25 ATR
+- it passes at least one pivot confirmation (``pivot_confirm``): a daily
+  close reclaim of resistance (tagged, then closed back below) in the last 5
+  sessions, or a 4-hour lower high after the daily pivot on regular-session
+  4-hour bars, which are fetched for the names that passed the rules above only
+
+The scan does not run the TTM Squeeze gate, and neither do the paper tickets.
 
 The SMA50 slope, the 50/200 tangle and the four quality checks are computed
 and recorded for every measured name, but they are not required here. This
@@ -32,9 +38,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from extensions.market_data.alpaca_bars import MARKET_TZ, fetch_daily_bars
+from extensions.market_data.alpaca_bars import MARKET_TZ, fetch_4hour_bars, fetch_daily_bars
 from extensions.regime.indicators import sma, wilder_adx
 from extensions.regime.regime_bot import ADX_PERIOD, LOOKBACK_CALENDAR_DAYS
+from extensions.scanbot import pivot_confirm
 from extensions.scanbot.financials import WEAK, FinancialsReport
 from extensions.scanbot.funnel import FEED, _fetch_in_chunks, default_report_dir
 from extensions.scanbot.long_channel import (
@@ -87,9 +94,11 @@ HEIGHT_TOO_SMALL = "height_under_8pct"
 HEIGHT_TOO_LARGE = "height_over_22pct"
 TOO_FAR_BELOW_RESISTANCE = "close_over_0.6atr_below_resistance"
 THROUGH_RESISTANCE = "close_over_0.25atr_through_resistance"
+NO_PIVOT_CONFIRMATION = "no_pivot_confirmation"
 REASONS = (
     NOT_SHORTABLE, NOT_EASY_TO_BORROW, NO_BARS, SHORT_HISTORY, ADX_ABOVE_MAX, TOO_FEW_SUPPORT,
     TOO_FEW_RESISTANCE, HEIGHT_TOO_SMALL, HEIGHT_TOO_LARGE, TOO_FAR_BELOW_RESISTANCE, THROUGH_RESISTANCE,
+    NO_PIVOT_CONFIRMATION,
 )
 
 # Sequential stages for the funnel counts. Each stage keeps names with none of its codes.
@@ -101,6 +110,7 @@ STAGES = (
     ("touches_2_and_2", (TOO_FEW_SUPPORT, TOO_FEW_RESISTANCE)),
     ("height_8_to_22pct", (HEIGHT_TOO_SMALL, HEIGHT_TOO_LARGE)),
     ("at_resistance", (TOO_FAR_BELOW_RESISTANCE, THROUGH_RESISTANCE)),
+    ("pivot_confirmed", (NO_PIVOT_CONFIRMATION,)),
 )
 
 Q_RSI = "rsi_52_65"
@@ -130,6 +140,7 @@ POLICY = {
     "pivot_atr_max_below_resistance": PIVOT_ATR_MAX,
     "break_atr_max_above_resistance": BREAK_ATR_MAX,
     "min_bars": MIN_BARS,
+    **pivot_confirm.rules(PIVOT_SIDE),
     "recorded_not_required": ["sma50_slope", "sma_tangle", "quality_checks"],
     "sma50_slope_sessions": SLOPE_SESSIONS,
     "sma50_slope_max_pct": SLOPE_MAX_PCT,
@@ -287,6 +298,7 @@ def classify_short_channel(
         "support_touches": [_touch(s, bars) for s in lows],
         "resistance_touches": [_touch(s, bars) for s in highs],
         "distance_to_resistance_atr": _round(distance_atr),
+        "pivot_confirmation": pivot_confirm.recorded(bars, swings, resistance, PIVOT_SIDE),
         **_recorded_trend_metrics(close),
         **quality_metrics,
         "bars": count,
@@ -366,10 +378,12 @@ def run_short_channel(
     assets_fetched_at: datetime,
     *,
     bars_fetcher: Callable = fetch_daily_bars,
+    four_hour_fetcher: Callable = fetch_4hour_bars,
     cache_dir: str | Path | None = None,
     created_at: datetime | None = None,
 ) -> ShortChannelReport:
-    """Check every WEAK survivor of the financials report. A bars failure raises and nothing is returned."""
+    """Check every WEAK survivor of the financials report, then confirm the channel passes on their pivot.
+    A bars failure, daily or 4-hour, raises and nothing is returned."""
     as_of = financials.as_of
     symbols = list(financials.gate_pass(WEAK).survivors)
     start = as_of - timedelta(days=LOOKBACK_CALENDAR_DAYS)
@@ -384,6 +398,7 @@ def run_short_channel(
         return record.get("shortable"), record.get("easy_to_borrow")
 
     calls = {s: classify_short_channel(by_symbol.get(s, empty), *flags(s)) for s in sorted(symbols)}
+    calls = pivot_confirm.confirm_filter(calls, PIVOT_SIDE, NO_PIVOT_CONFIRMATION, as_of, four_hour_fetcher, cache_dir)
     members = sorted(s for s, c in calls.items() if c.passed)
     counts = stage_counts(calls)
     if counts["weak_financials"] != len(symbols) or counts[STAGES[-1][0]] != len(members):

@@ -1,4 +1,4 @@
-"""Daily bars, and regular-session 4-hour bars, from Alpaca's market-data API, read-only.
+"""Daily bars, regular-session 4-hour bars, and raw 30-minute bars from Alpaca's market-data API, read-only.
 
 Only Alpaca's market-data client is built here. It talks to data.alpaca.markets,
 which serves prices and has no order endpoints, so nothing in this module can
@@ -35,6 +35,7 @@ BAR_COLUMNS = ["open", "high", "low", "close", "volume", "trade_count", "vwap"]
 FRAME_COLUMNS = ["symbol", "date", *BAR_COLUMNS]
 
 FOUR_HOUR_COLUMNS = ["symbol", "timestamp", "date", "open", "high", "low", "close", "volume", "source_bars"]
+THIRTY_MINUTE_COLUMNS = ["symbol", "timestamp", "open", "high", "low", "close", "volume"]
 THIRTY_MINUTES = TimeFrame(30, TimeFrameUnit.Minute)
 # Regular session, New York time, split into two session-anchored 4-hour bars.
 SESSION_OPEN, SESSION_SPLIT, SESSION_CLOSE = time(9, 30), time(13, 30), time(16, 0)
@@ -201,6 +202,53 @@ def fetch_4hour_bars(
     return pd.concat(frames, ignore_index=True).sort_values(["symbol", "timestamp"]).reset_index(drop=True)
 
 
+def fetch_30min_bars(
+    symbols: str | Iterable[str],
+    start: date | str,
+    end: date | str,
+    *,
+    client: StockHistoricalDataClient | None = None,
+    feed: DataFeed | str = DataFeed.IEX,
+    adjustment: Adjustment | str = Adjustment.SPLIT,
+    cache_dir: str | Path | None = None,
+) -> pd.DataFrame:
+    """Alpaca's 30-minute bars for each symbol from start to end, both inclusive, extended hours included.
+
+    Returns columns THIRTY_MINUTE_COLUMNS: ``timestamp`` is the bar's New York start time without a time zone,
+    the shape ``extensions.status.squeeze_gate.roll_session_bars`` rolls into regular-session 4-hour and 1-hour
+    bars. Caching works as in ``fetch_daily_bars``, in files of their own.
+    """
+    tickers = _tickers(symbols)
+    start_date, end_date = validate_date_range(start, end)
+    feed, adjustment = DataFeed(feed), Adjustment(adjustment)
+
+    cacheable = cache_dir is not None and end_date < market_today()
+    paths = {
+        t: _cache_path(cache_dir, t, start_date, end_date, feed, adjustment).with_suffix(".30min.csv")
+        for t in tickers
+    } if cacheable else {}
+    cached = [pd.read_csv(paths[t], parse_dates=["timestamp"]) for t in tickers if t in paths and paths[t].exists()]
+    to_fetch = [t for t in tickers if not (t in paths and paths[t].exists())]
+
+    fetched = _empty_30min_frame()
+    if to_fetch:
+        client = make_client() if client is None else client
+        raw = _get_bars(client, to_fetch, start_date, end_date, feed, adjustment, THIRTY_MINUTES)
+        if not raw.empty:
+            fetched = raw.reset_index()
+            fetched["timestamp"] = fetched["timestamp"].dt.tz_convert(MARKET_TZ).dt.tz_localize(None)
+            fetched = fetched.reindex(columns=THIRTY_MINUTE_COLUMNS)
+        for ticker, rows in fetched.groupby("symbol"):
+            if ticker in paths:
+                paths[ticker].parent.mkdir(parents=True, exist_ok=True)
+                rows.to_csv(paths[ticker], index=False)
+
+    frames = [f for f in (*cached, fetched) if not f.empty]
+    if not frames:
+        return _empty_30min_frame()
+    return pd.concat(frames, ignore_index=True).sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+
+
 def regular_session_4hour(raw: pd.DataFrame) -> pd.DataFrame:
     """Roll Alpaca's 30-minute bars, indexed by (symbol, timestamp), into regular-session 4-hour bars."""
     if raw.empty:
@@ -256,6 +304,12 @@ def _tidy(raw: pd.DataFrame) -> pd.DataFrame:
 def _empty_frame() -> pd.DataFrame:
     frame = pd.DataFrame(columns=FRAME_COLUMNS)
     frame["date"] = pd.to_datetime(frame["date"])
+    return frame
+
+
+def _empty_30min_frame() -> pd.DataFrame:
+    frame = pd.DataFrame(columns=THIRTY_MINUTE_COLUMNS)
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"])
     return frame
 
 

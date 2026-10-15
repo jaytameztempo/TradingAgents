@@ -5,11 +5,14 @@ It reads five saved files for one date:
 - the newest daily status (the market label and the ranked side handoff it used),
 - the newest earnings blackout, which must be built from that daily status
   (its ``allowed`` long and short names are the only names ticketed),
-- the ranked side handoff named in the daily status (each name's recorded
-  ``support``, ``resistance``, daily ``atr_14`` and ``midline``),
-- the long and short channel reports named in the handoff (each name's
-  confirmed ZigZag swing lows, ``support_touches``, and swing highs,
-  ``resistance_touches``, the swings that define its channel lines).
+- the ranked side handoff named in the daily status (each name's rank, side and
+  ``midline``),
+- the newest long and short channel reports for the date, by the created_at
+  inside each file, not the ones the handoff names (each name's membership,
+  ``support`` or ``resistance`` and daily ``atr_14``, as the scan measured them).
+  The newest report must carry the ``pivot_confirmed`` stage; if it does not,
+  there are no tickets, and an older confirmed report is never used instead. A
+  name that is not a passing member of that report gets no ticket.
 
 Equity and buying power are not set here. On a day with tickets the caller
 reads them from the Alpaca paper account at ticket time and passes them in as
@@ -17,18 +20,18 @@ an ``Account`` (run_paper_tickets does a read-only GET /v2/account). This
 module makes no request itself.
 
 Under any label but SIDE, or when the daily status blocks the channel names,
-there are no tickets: only the channel names have lines to ticket. N is the
-number of names that survived the earnings blackout (4-hour confirmed names,
-long and short) and have a usable pivot and levels. Each ticket:
+there are no tickets: only the channel names have lines to ticket. Each name
+that survived the earnings blackout (4-hour confirmed names, long and short)
+is ticketed when it has usable levels; the TTM Squeeze gate (``squeeze_gate``)
+is not run here. N is the number of names that pass the blackout and have
+usable levels. Each ticket:
 
-- entry: the channel line, support for a long and resistance for a short,
-- pivot: the last confirmed daily ZigZag swing beyond the entry, the latest
-  swing low below a long entry or swing high above a short entry (latest by
-  ``confirmed_on``, see ``stop_pivot``). Swings on the entry side of the line,
-  or at the entry, are passed over; a name with no swing beyond its entry is
-  skipped with the reason,
-- stop_calculated: the pivot minus ``STOP_ATR`` (1) x atr_14 for a long, plus it
-  for a short,
+- entry: a limit at the channel level from the channel report, support from the
+  long channel report for a long (limit buy), resistance from the short channel
+  report for a short (limit sell), rounded to the cent; never the last close,
+- channel_level: that level as the report recorded it, which is also the pivot,
+- stop_calculated: channel_level minus ``STOP_ATR`` (1) x the report's atr_14
+  for a long, plus it for a short,
 - stop: stop_calculated snapped away from the entry to a price ending in .99 or
   .49 at or below it (long), .01 or .51 at or above it (short), see
   ``snap_stop``,
@@ -41,12 +44,14 @@ Size is not set by the stop distance. Every name gets the same dollars:
 buying power / N, capped at ``NAME_NOTIONAL_PCT`` (15%) of buying power
 (``name_notional_limit``); no name is shrunk or skipped because another used
 the budget. A name is skipped, with the reason, when it is in the earnings
-blackout, has no usable pivot or levels, or when not one share fits its
-dollars. Tickets are listed in rank order, long and short interleaved (long #1,
-short #1, long #2, ...).
+blackout, is not a member of the newest confirmed channel report, has no usable
+levels, or when not one share fits its dollars. Tickets
+are listed in rank order, long and short interleaved (long #1, short #1,
+long #2, ...).
 
-Every file is read with plain ``json``; no Alpaca module is loaded here, and
-``refuse_trading_client`` makes any later import of ``alpaca.trading`` fail.
+Every file is read with plain ``json``; no Alpaca or paper_orders module is
+loaded here, and ``refuse_trading_client`` makes any later import of
+``alpaca.trading`` fail.
 The scans, router, bots, daily status and blackout are not touched.
 """
 
@@ -64,14 +69,18 @@ from pathlib import Path
 from extensions.status.daily_status import LONG, SHORT, SIDE, SIDES, default_handoff_dir, default_status_dir
 from extensions.status.earnings_blackout import BlackoutInputError, latest_daily_status
 
-TICKET_VERSION = 4  # 2: stop_offset from the fill; 3: equal risk a name; 4: snapped pivot -/+ 1 ATR stop, buying power / N
+TICKET_VERSION = 8  # 2: stop_offset from the fill; 3: equal risk a name; 4: snapped pivot -/+ 1 ATR stop, buying power / N;
+# 5: entry and pivot are the channel report's support (long) or resistance (short); 6: 4h + 1h TTM Squeeze gate;
+# 7: the TTM Squeeze gate removed; 8: the newest pivot-confirmed channel report, members only
 BLACKOUT_REPORT_VERSION = 1
+CHANNEL_REPORT_VERSION = 1
+CONFIRMED_STAGE = "pivot_confirmed"  # the stage_counts key a confirmed channel report carries
 NAME_NOTIONAL_PCT = 0.15  # of buying power, the most any one name gets
-STOP_ATR = 1.0  # beyond the pivot
+STOP_ATR = 1.0  # beyond the channel level
 STOP_ENDINGS = {LONG: (49, 99), SHORT: (1, 51)}  # cents a snapped stop ends in
 LINE = {LONG: "support", SHORT: "resistance"}
-SWING = {LONG: "swing low", SHORT: "swing high"}
 CHANNEL_REPORT = {LONG: "long_channel_report", SHORT: "short_channel_report"}
+CHANNEL_FILE = {LONG: "long_channel", SHORT: "short_channel"}
 TRADING_MODULE = "alpaca.trading"
 
 
@@ -156,30 +165,46 @@ def load_handoff(status: dict, handoff_dir: str | Path | None = None) -> tuple[P
     return path, data
 
 
-def load_channel_report(handoff: dict, side: str, scan_dir: str | Path | None = None) -> tuple[Path, dict]:
-    """The long or short channel report the handoff ranked, found by file name in scan_dir."""
-    key = CHANNEL_REPORT[side]
-    recorded = handoff.get(key)
-    if not recorded:
-        raise TicketInputError(f"the ranked side handoff names no {key.replace('_', ' ')}")
+def latest_channel_report(as_of: date, side: str, scan_dir: str | Path | None = None) -> tuple[Path, dict]:
+    """The newest long or short channel report for as_of, by the created_at inside each file (not the file name, not
+    the report the handoff names). It must carry the pivot confirmation stage; an older confirmed report is never
+    used in its place. A file that cannot be read stops the run rather than being passed over."""
     folder = Path(scan_dir) if scan_dir is not None else default_scan_dir()
-    path = folder / Path(recorded).name
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise TicketInputError(f"cannot read {side} channel report {path}: {exc}") from exc
-    if data.get("as_of") != handoff.get("as_of"):
-        raise TicketInputError(f"{side} channel report {path} is for {data.get('as_of')}, not {handoff.get('as_of')}")
-    if not isinstance(data.get("calls"), dict):
-        raise TicketInputError(f"{side} channel report {path} has no calls")
+    found = []
+    for path in sorted(folder.glob(f"{CHANNEL_FILE[side]}_{as_of}_*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            created = datetime.fromisoformat(data["created_at"])
+            if created.tzinfo is None:
+                raise ValueError(f"created_at {data['created_at']!r} has no time zone")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise TicketInputError(f"cannot read {side} channel report {path}: {exc}") from exc
+        if data.get("as_of") == as_of.isoformat():
+            found.append((created, path, data))
+    if not found:
+        raise TicketInputError(f"no {side} channel report for {as_of} in {folder}")
+    _, path, data = max(found, key=lambda item: item[0])
+    if data.get("report_version") != CHANNEL_REPORT_VERSION:
+        raise TicketInputError(f"{side} channel report {path} has unsupported report_version "
+                               f"{data.get('report_version')!r}")
+    if CONFIRMED_STAGE not in (data.get("stage_counts") or {}):
+        raise TicketInputError(f"the newest {side} channel report {path} has no {CONFIRMED_STAGE} stage; "
+                               "rerun the scan with pivot confirmation")
+    if not isinstance(data.get("calls"), dict) or not isinstance(data.get("members"), list):
+        raise TicketInputError(f"{side} channel report {path} has no calls or members")
     return path, data
 
 
-def channel_swings(report: dict, symbol: str, side: str) -> list[dict] | None:
-    """The confirmed swings that define the name's line: swing lows for a long, swing highs for a short."""
+def channel_members(report: dict) -> set[str]:
+    """The report's members whose call passed: the only names on that side that can be ticketed."""
+    calls = report.get("calls") or {}
+    return {s for s in report.get("members") or () if (calls.get(s) or {}).get("passed") is True}
+
+
+def channel_levels(report: dict, symbol: str, side: str) -> tuple[float | None, float | None]:
+    """The name's channel level (support for a long, resistance for a short) and atr_14 from the channel report."""
     metrics = ((report.get("calls") or {}).get(symbol) or {}).get("metrics") or {}
-    swings = metrics.get(f"{LINE[side]}_touches")
-    return swings if isinstance(swings, list) else None
+    return metrics.get(LINE[side]), metrics.get("atr_14")
 
 
 # --- the account -------------------------------------------------------------
@@ -229,25 +254,6 @@ def stop_for_fill(side: str, stop_offset: float, fill: float) -> float:
     return stop
 
 
-def stop_pivot(swings: list[dict], side: str, entry: float, as_of: date | None = None) -> dict:
-    """The latest confirmed swing (by confirmed_on, then extreme date, on or before as_of) beyond the entry: the
-    latest swing low below a long entry, the latest swing high above a short entry. Swings on the entry side of
-    the line, or at the entry, are passed over. Raises ValueError when there is none."""
-    sign = 1 if side == LONG else -1
-    usable = [s for s in swings if isinstance(s, dict) and s.get("confirmed_on") and s.get("date")
-              and isinstance(s.get("price"), int | float) and s["price"] > 0
-              and (as_of is None or s["confirmed_on"] <= as_of.isoformat())]
-    if not usable:
-        raise ValueError(f"no confirmed {SWING[side]} in the {side} channel report")
-    beyond = [s for s in usable if sign * (entry - s["price"]) > 0]
-    if not beyond:
-        latest = max(usable, key=lambda s: (s["confirmed_on"], s["date"]))
-        raise ValueError(f"no confirmed {SWING[side]} {'below' if side == LONG else 'above'} entry {entry} in the "
-                         f"{side} channel report ({len(usable)} {SWING[side]}s, from {min(s['price'] for s in usable)} "
-                         f"to {max(s['price'] for s in usable)}; the latest {latest['price']} of {latest['date']})")
-    return max(beyond, key=lambda s: (s["confirmed_on"], s["date"]))
-
-
 def snap_stop(side: str, level: float) -> float:
     """The nearest price ending in .49 or .99 at or below level (long), .01 or .51 at or above it (short)."""
     endings = STOP_ENDINGS[side]  # the two endings are 50 cents apart, so one repeats every 50 cents
@@ -269,11 +275,10 @@ class Ticket:
     target: float
     quantity: int
     line: str  # support or resistance
-    line_level: float
-    atr_14: float
+    channel_level: float  # from the channel report, unrounded: the limit entry's level and the stop's pivot
+    atr_14: float  # from the channel report
     midline: float
-    pivot: dict  # the last confirmed daily ZigZag swing low (long) or high (short) beyond the entry
-    stop_calculated: float  # pivot -/+ STOP_ATR x atr_14, before the snap
+    stop_calculated: float  # channel_level -/+ STOP_ATR x atr_14, before the snap
     risk_per_share: float
     reward_per_share: float
     reward_risk: float
@@ -285,31 +290,34 @@ class Ticket:
     paper: bool = True
 
 
-def plan_ticket(symbol: str, side: str, levels: dict, swings: list[dict] | None, as_of: date | None = None) -> dict:
-    """Entry, stop and target from the handoff's levels and the channel report's swings, before sizing. Raises
+def _price(value) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and value > 0
+
+
+def plan_ticket(symbol: str, side: str, line: float | None, atr: float | None, midline: float | None) -> dict:
+    """Entry, stop and target before sizing: a limit entry at the channel line (support for a long, resistance for a
+    short, from the channel report), the stop that same line -/+ STOP_ATR x the report's atr_14, snapped. Raises
     ValueError when they cannot make a ticket."""
-    line_word = LINE[side]
-    line, atr, mid = levels.get(line_word), levels.get("atr_14"), levels.get("midline")
-    if line is None or mid is None or atr is None or not atr > 0:
-        raise ValueError(f"no usable {line_word}, atr_14 or midline (got {line!r}, {atr!r}, {mid!r})")
-    if not swings:
-        raise ValueError(f"no {SWING[side]}s defining {line_word} in the {side} channel report")
+    line_word, mid = LINE[side], midline
+    if not _price(line) or not _price(atr) or not _price(mid):
+        raise ValueError(f"no usable {line_word} or atr_14 in the {side} channel report, or midline in the handoff "
+                         f"(got {line!r}, {atr!r}, {mid!r})")
     sign = 1 if side == LONG else -1
     entry = round(line, 2)
-    pivot = stop_pivot(swings, side, entry, as_of)
-    calculated = round(pivot["price"] - sign * STOP_ATR * atr, 4)
+    calculated = round(line - sign * STOP_ATR * atr, 4)
     stop = snap_stop(side, calculated)
     if not stop > 0:
-        raise ValueError(f"stop {stop} from pivot {pivot['price']} - {STOP_ATR:g} x atr_14 {atr} is not above zero")
+        raise ValueError(f"stop {stop} from {line_word} {line} {'-' if side == LONG else '+'} {STOP_ATR:g} x atr_14 "
+                         f"{atr} is not above zero")
     stop_offset = round(sign * (entry - stop), 2)
+    if not stop_offset > 0:
+        raise ValueError(f"stop {stop} is not beyond entry {entry}")
     target = round(mid, 2)
     reward_per_share = round(sign * (target - entry), 2)
     if not reward_per_share > 0:
         raise ValueError(f"midline {target} is not on the profit side of entry {entry}")
     return {"entry": entry, "stop": stop, "stop_offset": stop_offset, "target": target, "line": line_word,
-            "line_level": line, "atr_14": atr, "midline": mid,
-            "pivot": {"date": pivot["date"], "price": pivot["price"], "confirmed_on": pivot["confirmed_on"]},
-            "stop_calculated": calculated, "risk_per_share": stop_offset, "reward_per_share": reward_per_share}
+            "channel_level": line, "atr_14": atr, "midline": mid, "stop_calculated": calculated, "risk_per_share": stop_offset, "reward_per_share": reward_per_share}
 
 
 def size_ticket(symbol: str, side: str, plan: dict, earnings_result: str | None = None, *, notional_limit: float,
@@ -334,10 +342,11 @@ def size_ticket(symbol: str, side: str, plan: dict, earnings_result: str | None 
     )
 
 
-def build_ticket(symbol: str, side: str, levels: dict, swings: list[dict] | None, earnings_result: str | None = None,
-                 *, notional_limit: float, rank: int | None = None, as_of: date | None = None) -> Ticket:
-    """One ticket from the handoff's levels and the channel report's swings. Raises ValueError when they cannot make one."""
-    return size_ticket(symbol, side, plan_ticket(symbol, side, levels, swings, as_of), earnings_result,
+def build_ticket(symbol: str, side: str, line: float | None, atr: float | None, midline: float | None,
+                 earnings_result: str | None = None, *, notional_limit: float, rank: int | None = None) -> Ticket:
+    """One ticket from the channel report's line and atr_14 and the handoff's midline. Raises ValueError when they
+    cannot make one."""
+    return size_ticket(symbol, side, plan_ticket(symbol, side, line, atr, midline), earnings_result,
                        notional_limit=notional_limit, rank=rank)
 
 
@@ -368,17 +377,21 @@ def _rules(account: Account | None = None, n: int | None = None, notional_limit:
         "account_source": account.source if account else None,
         "account_read_at": account.read_at.isoformat() if account else None,
         "names_n": n,
-        "names": "the earnings blackout's allowed long and short names with a usable pivot and levels",
+        "names": "the earnings blackout's allowed long and short names that are passing members of the channel report "
+                 "and have usable levels",
+        "channel_report": f"the newest {{long|short}}_channel report for the date by the created_at inside the file; "
+                          f"it must carry the {CONFIRMED_STAGE} stage, else no tickets",
         "name_notional": "buying power / N, capped at name_notional_pct_of_buying_power, rounded down to the cent, "
                          "the same for every name",
         "name_notional_pct_of_buying_power": NAME_NOTIONAL_PCT,
         "name_notional_limit": notional_limit,
-        "entry": "the channel line: support for long, resistance for short",
-        "pivot": "the last confirmed daily ZigZag swing beyond the entry: the latest swing low below a long entry, "
-                 "the latest swing high above a short entry, from the channel report; none, no ticket",
+        "entry": "limit at the channel level, rounded to the cent: limit buy at support from the long channel "
+                 "report (long), limit sell at resistance from the short channel report (short); not the last close",
+        "pivot": "the same channel level as the entry, unrounded (channel_level)",
         "stop_atr_beyond_pivot": STOP_ATR,
-        "stop": "pivot - STOP_ATR x atr_14 snapped down to a price ending .99 or .49 at or below it (long); "
-                "pivot + STOP_ATR x atr_14 snapped up to a price ending .01 or .51 at or above it (short)",
+        "stop": "channel_level - STOP_ATR x atr_14 snapped down to a price ending .99 or .49 at or below it (long); "
+                "channel_level + STOP_ATR x atr_14 snapped up to a price ending .01 or .51 at or above it (short); "
+                "atr_14 from the channel report",
         "target": "the channel midline",
         "quantity": "floor(name notional limit / entry); not sized by the stop distance",
         "order": "rank order, long before short on a tie; listing order does not change any size",
@@ -392,7 +405,7 @@ class PaperTickets:
     market_label: str
     channel_names_blocked: bool
     tickets: list[Ticket]
-    skipped: dict[str, str]  # symbol -> why it made no ticket (blackout, no usable pivot or levels, no share fits)
+    skipped: dict[str, str]  # symbol -> why it made no ticket (blackout, not a channel member, no usable levels, no share fits)
     no_ticket_reason: str | None  # set when the day has no tickets at all
     sources: dict[str, str | None]
     total_notional: float = 0.0
@@ -419,9 +432,9 @@ def build_tickets(
     created_at: datetime | None = None,
     channels: dict[str, tuple[Path, dict]] | None = None,
 ) -> PaperTickets:
-    """Tickets for the allowed names, sized from the account, stops from the channel reports' swings (channels:
-    side -> report, for each side with allowed names). Under any label but SIDE the blackout, handoff, account and
-    channel reports are not needed. Writes nothing."""
+    """Tickets for the allowed names, sized from the account, entries and stops from the channel reports (channels:
+    side -> report, for each side with allowed names). Only passing members of a side's channel report are ticketed.
+    Under any label but SIDE the blackout, handoff, account and channel reports are not needed. Writes nothing."""
     status_path, s = status
     label = s.get("market_label", "")
     created = created_at or datetime.now(UTC)
@@ -461,13 +474,19 @@ def build_tickets(
     if account is None:
         raise TicketInputError("a SIDE day needs equity and buying power read from the paper account")
     channels = channels or {}
+    ranked_from: list[str] = []
     for side in SIDES:
         if b["allowed"][side] and side not in channels:
-            raise TicketInputError(f"allowed {side} names need the {side} channel report for their swings")
+            raise TicketInputError(f"allowed {side} names need the {side} channel report for their levels")
         if side in channels:
             sources[CHANNEL_REPORT[side]] = str(channels[side][0])
+            recorded = Path(h.get(CHANNEL_REPORT[side]) or "").name
+            if recorded != channels[side][0].name:
+                ranked_from.append(f"the ranked side handoff ranked from {side} channel report {recorded or 'none'}; "
+                                   f"membership and levels are from the newer {channels[side][0].name}")
+    members = {side: channel_members(channels[side][1]) for side in channels}
 
-    # first the stops: N is the allowed names with a usable pivot and levels
+    # first the entries and stops: N is the allowed names that are channel members with usable levels
     names = h.get("names", {})
     plans: list[tuple[str, str, int | None, dict]] = []
     for symbol, side in _rank_order(b["allowed"], names):
@@ -475,9 +494,12 @@ def build_tickets(
         if entry is None or entry.get("side") != side:
             skipped[symbol] = f"not a {side} name in the ranked side handoff"
             continue
+        if symbol not in members[side]:
+            skipped[symbol] = f"not a member of the newest confirmed {side} channel report {channels[side][0].name}"
+            continue
         try:
-            plan = plan_ticket(symbol, side, entry.get("levels") or {},
-                               channel_swings(channels[side][1], symbol, side), as_of)
+            line, atr = channel_levels(channels[side][1], symbol, side)
+            plan = plan_ticket(symbol, side, line, atr, (entry.get("levels") or {}).get("midline"))
         except ValueError as exc:
             skipped[symbol] = str(exc)
             continue
@@ -500,6 +522,7 @@ def build_tickets(
     warnings += [f"{t.symbol}: earnings result {t.earnings_result}" for t in tickets
                  if t.earnings_result not in (None, "clear")]
     warnings += list(b.get("warnings", []))
+    warnings += ranked_from
     return PaperTickets(
         as_of=as_of,
         created_at=created,
@@ -533,7 +556,7 @@ def tickets_for_date(
     blackout = latest_blackout(as_of, status_dir)
     handoff = load_handoff(status[1], handoff_dir)
     account = None
-    channels = {side: load_channel_report(handoff[1], side, scan_dir) for side in SIDES if blackout[1]["allowed"][side]}
+    channels = {side: latest_channel_report(as_of, side, scan_dir) for side in SIDES if blackout[1]["allowed"][side]}
     if channels:
         if read_account is None:
             raise TicketInputError("a SIDE day needs equity and buying power read from the paper account")

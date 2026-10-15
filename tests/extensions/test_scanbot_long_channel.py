@@ -1,6 +1,8 @@
 """SCAN-LongSidewaysChannel keeps STRONG names with ADX <= 20, an 8-22% channel with two touches
-on each side in 60 sessions, and a close within 0.6 ATR above support and no more than 0.25 ATR
-through it. It ignores bars after as_of, counts every name once, and never overwrites. No network.
+on each side in 60 sessions, a close within 0.6 ATR above support and no more than 0.25 ATR
+through it, and a pivot confirmation (a daily close reclaim or a 4-hour higher low). It does not
+run the TTM Squeeze gate. It ignores bars after as_of, counts every name once, and never
+overwrites. No network.
 """
 
 import json
@@ -17,6 +19,7 @@ from extensions.scanbot.long_channel import (
     HEIGHT_TOO_LARGE,
     HEIGHT_TOO_SMALL,
     NO_BARS,
+    NO_PIVOT_CONFIRMATION,
     SHORT_HISTORY,
     THROUGH_SUPPORT,
     TOO_FAR_ABOVE_SUPPORT,
@@ -29,6 +32,7 @@ from extensions.scanbot.long_channel import (
     save_report,
 )
 from extensions.scripts import run_scanbot_long_channel as cli
+from tests.extensions.test_pivot_confirm import HIGHER_LOWS, four_hour_frame
 
 AS_OF = date(2026, 9, 30)
 CREATED = datetime(2026, 10, 7, 12, 5, tzinfo=UTC)
@@ -50,6 +54,8 @@ NARROW = _triangle(260, hi=106.0)
 WIDE = _triangle(260, hi=130.0)
 BROKEN = _triangle(259) + [97.0]
 RISING = [100 + 0.5 * i for i in range(260)]
+# At support, but the last daily low at support (2026-09-22) is 6 sessions back: no close reclaim.
+NO_RECLAIM = _triangle(254, half=6) + [101.0, 100.4, 100.9, 100.3, 100.8, 100.3]
 
 
 def _frame(symbol, closes, end=AS_OF):
@@ -127,6 +133,16 @@ def test_short_history_and_no_bars():
     assert classify_long_channel(_frame("A", [])).reasons == [NO_BARS]
 
 
+def test_classify_records_the_daily_pivot_and_the_close_reclaim():
+    at_support = classify_long_channel(_frame("A", AT_SUPPORT)).metrics["pivot_confirmation"]
+    assert at_support["close_reclaim"]["passed"] and at_support["pivot"]["date"] == "2026-09-30"
+    late = classify_long_channel(_frame("A", NO_RECLAIM))
+    assert late.passed  # the channel rules; the confirmation is the run's step
+    assert not late.metrics["pivot_confirmation"]["close_reclaim"]["passed"]
+    assert late.metrics["pivot_confirmation"]["pivot"] == {"date": "2026-09-22", "price": 99.5,
+                                                           "after_swing": "2026-09-14"}
+
+
 # --- the run -----------------------------------------------------------------
 
 def _financials(strong, weak=()):
@@ -168,45 +184,81 @@ FRAMES = {
     "NEW": _frame("NEW", AT_SUPPORT[-30:]),
     "OLD": _frame("OLD", AT_SUPPORT, end=date(2026, 9, 29)),
     "LOSS": _frame("LOSS", AT_SUPPORT),
+    "HL": _frame("HL", NO_RECLAIM),
+    "NOHL": _frame("NOHL", NO_RECLAIM),
 }
+FOUR_HOUR = {
+    # A higher low after the 2026-09-22 pivot; the bars after as_of would break it and must be ignored.
+    "HL": pd.concat([four_hour_frame("HL", HIGHER_LOWS), four_hour_frame("HL", [90.0, 91.0], start="2026-10-01")],
+                    ignore_index=True),
+    "SUPP": four_hour_frame("SUPP", [101.0, 100.0, 99.5]),  # no higher low: SUPP passes on the reclaim only
+}
+STRONG_NAMES = ("SUPP", "MID", "NARR", "TRND", "NEW", "GONE", "OLD", "HL", "NOHL")
 
 
-def _run(strong=("SUPP", "MID", "NARR", "TRND", "NEW", "GONE", "OLD"), weak=("LOSS",)):
-    fetcher = FakeBars(FRAMES)
-    return run_long_channel(_financials(strong, weak), "financials.json", bars_fetcher=fetcher,
-                            created_at=CREATED), fetcher
+def _run(strong=STRONG_NAMES, weak=("LOSS",)):
+    fetcher, four_hour = FakeBars(FRAMES), FakeBars(FOUR_HOUR)
+    report = run_long_channel(_financials(strong, weak), "financials.json", bars_fetcher=fetcher,
+                              four_hour_fetcher=four_hour, created_at=CREATED)
+    return report, fetcher, four_hour
 
 
 def test_run_scans_strong_survivors_only_and_counts_every_name():
-    report, fetcher = _run()
-    assert fetcher.requested[0][0] == ["SUPP", "MID", "NARR", "TRND", "NEW", "GONE", "OLD"]
+    report, fetcher, _ = _run()
+    assert fetcher.requested[0][0] == list(STRONG_NAMES)
     assert fetcher.requested[0][2] == AS_OF and fetcher.requested[0][3] == "sip"
     assert "LOSS" not in report.calls  # a WEAK name never enters, even at support
-    assert report.members == ["OLD", "SUPP"]
+    assert report.members == ["HL", "OLD", "SUPP"]
     assert report.stage_counts == {
-        "strong_financials": 7, "bars": 5, "adx_le_20": 4, "touches_2_and_2": 4,
-        "height_8_to_22pct": 3, "at_support": 2,
+        "strong_financials": 9, "bars": 7, "adx_le_20": 6, "touches_2_and_2": 6,
+        "height_8_to_22pct": 5, "at_support": 4, "pivot_confirmed": 3,
     }
     assert report.reason_counts[NO_BARS] == 1 and report.reason_counts[SHORT_HISTORY] == 1
+    assert report.reason_counts[NO_PIVOT_CONFIRMATION] == 1
     assert report.basket_id == "SCAN-LongSidewaysChannel-2026-09-30"
     assert report.mode == "LONG_SIDE" and report.pivot_side == "LONG"
 
 
+def test_4hour_bars_are_read_for_channel_passes_only():
+    _, _, four_hour = _run()
+    assert four_hour.requested == [(["HL", "NOHL", "OLD", "SUPP"], date(2026, 6, 2), AS_OF, "sip")]
+
+
+def test_a_channel_pass_needs_the_reclaim_or_the_4hour_higher_low():
+    report, _, _ = _run()
+    by = {s: report.calls[s]["metrics"]["pivot_confirmation"]["passed_by"] for s in ("SUPP", "HL", "NOHL")}
+    assert by == {"SUPP": ["close_reclaim"], "HL": ["four_hour_turn"], "NOHL": []}
+    hl = report.calls["HL"]["metrics"]["pivot_confirmation"]["four_hour_turn"]
+    assert hl["anchor_price"] == 99.5 and hl["turn_price"] == 100.4
+    nohl = report.calls["NOHL"]
+    assert not nohl["passed"] and nohl["reasons"] == [NO_PIVOT_CONFIRMATION]
+    assert nohl["detail"][0].startswith("no close reclaim") and nohl["detail"][1].startswith("no 4-hour higher low")
+    assert report.calls["MID"]["metrics"]["pivot_confirmation"]["four_hour_turn"] is None  # never read
+
+
+def test_the_scan_runs_no_squeeze_gate():
+    report, _, _ = _run()
+    assert not any("squeeze" in stage for stage in report.stage_counts)
+    assert not any("squeeze" in code for code in report.reason_counts)
+    assert not any("squeeze" in key for key in report.policy)
+    assert all("squeeze" not in call["metrics"] for call in report.calls.values())
+
+
 def test_bars_after_as_of_are_ignored():
-    report, _ = _run()
+    report, _, _ = _run()
     supp = report.calls["SUPP"]
     assert supp["passed"] and supp["metrics"]["last_bar_date"] == "2026-09-30"
     assert supp["metrics"]["bars"] == 260
 
 
 def test_warnings_carry_point_in_time_and_flag_a_missing_last_bar():
-    report, _ = _run()
+    report, _, _ = _run()
     assert any("not point in time" in w for w in report.warnings)
     assert any("no bar on 2026-09-30: OLD" in w for w in report.warnings)
 
 
 def test_report_round_trips_and_never_overwrites(tmp_path):
-    report, _ = _run()
+    report, _, _ = _run()
     path = save_report(report, tmp_path)
     assert path.name == "long_channel_2026-09-30_20261007T120500Z.json"
     assert load_report(path) == report
@@ -219,6 +271,7 @@ def test_cli_picks_the_newest_financials_report_and_writes(tmp_path, monkeypatch
     save_financials(_financials(["SUPP", "MID"]), tmp_path)
     monkeypatch.setattr(cli, "run_long_channel",
                         lambda fin, path, cache_dir=None: run_long_channel(fin, path, bars_fetcher=FakeBars(FRAMES),
+                                                                           four_hour_fetcher=FakeBars(FOUR_HOUR),
                                                                            created_at=CREATED))
     out = tmp_path / "out"
     assert cli.main(["--as-of", "2026-09-30", "--report-dir", str(tmp_path), "--out-dir", str(out)]) == cli.EXIT_OK

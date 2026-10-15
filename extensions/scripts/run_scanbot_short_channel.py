@@ -9,7 +9,10 @@ Run from the TradingAgents folder:
 shortable and easy_to_borrow come from the asset snapshot behind the
 financials report (financials -> universe -> assets) unless --assets-snapshot
 is set. Bars are split-adjusted SIP daily bars dated on or before the report's
-as-of date. If Alpaca refuses them, nothing is written. The report goes to
+as-of date. Names that pass the channel rules are confirmed on their pivot (a
+daily close reclaim, or a 4-hour lower high on regular-session 4-hour bars,
+fetched for those names only). The scan does not run the TTM Squeeze gate. If
+Alpaca refuses either read, nothing is written. The report goes to
 ~/.tradingagents/scanbot/ unless --out-dir is set. Keys are read from
 ALPACA_API_KEY and ALPACA_SECRET_KEY, in the environment or in .env.
 """

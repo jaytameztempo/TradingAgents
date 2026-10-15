@@ -203,6 +203,14 @@ Structure, all required:
 - ADX is still <= 20 on the as-of bar.
 - Financial gate in section 3.2, strong side, has already passed.
 
+Pivot confirmation, at least one, on bars dated on or before as_of (`extensions/scanbot/pivot_confirm.py`). It is checked only on names that passed the structure rules; a name that fails both is recorded as `no_pivot_confirmation` with both misses.
+
+- Daily pivot: the lowest daily low after the last confirmed ZigZag swing high (the latest bar on equal lows). It need not be confirmed by the 5% reversal.
+- Close reclaim (daily bars): a daily low at or below support in the last 5 sessions, and the as-of close strictly above support. A reclaim that has since been lost fails.
+- 4-hour higher low (regular-session 4-hour bars, 09:30–13:30 and 13:30–16:00, fetched for structure passes only): on bars from the pivot day, take the lowest 4-hour low L (latest bar on ties). A higher low is a later bar q with low[q] > L, low[q] < low[q−1] and low[q] <= low[q+1], after a bar between them traded above the L bar's high. The bar after q must exist. The latest such q must not have been undercut by any later low.
+
+The scan does not run the TTM Squeeze gate, and neither do the paper tickets. The gate code stays in `extensions/status/squeeze_gate.py` but nothing calls it.
+
 Quality, at least two: RSI(14) 35–48, volume SMA(5) below the 20-day average, lower wick at least 40% of that bar's range, no close below support in the last 3 sessions.
 
 `pivot_side` is always `LONG`. A name in the middle of the channel, or at resistance, does not enter this basket.
@@ -218,6 +226,14 @@ Structure, all required:
 - ADX is still <= 20.
 - `easy_to_borrow` is true on the as-of snapshot.
 - Financial gate in section 3.2, weak side, has already passed.
+
+Pivot confirmation, at least one, as in 4.3 and mirrored:
+
+- Daily pivot: the highest daily high after the last confirmed swing low.
+- Close reclaim: a daily high at or above resistance in the last 5 sessions, and the as-of close strictly below resistance.
+- 4-hour lower high: after the highest 4-hour high H from the pivot day, a bar traded below the H bar's low, then a bar q with high[q] < H, high[q] > high[q−1] and high[q] >= high[q+1], not exceeded by any later high.
+
+The scan does not run the TTM Squeeze gate, and neither do the paper tickets.
 
 Quality, at least two: RSI(14) 52–65, volume SMA(5) below the 20-day average, upper wick at least 40% of that bar's range, no close above resistance in the last 3 sessions.
 

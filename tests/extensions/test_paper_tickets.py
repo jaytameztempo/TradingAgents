@@ -1,11 +1,12 @@
 """Paper tickets read the newest daily status, the earnings blackout built from it, the ranked side handoff it
-names and the channel reports that handoff ranked. Only the blackout's allowed names are ticketed: entry at the
-channel line, pivot the latest confirmed daily ZigZag swing beyond the entry (a low below a long entry, a
-high above a short one; none, no ticket), stop the pivot -/+ 1 ATR snapped to .99/.49 (long) or .01/.51 (short),
-target at the midline. Buying power comes from the paper
-account at ticket time (a fake here). Each of the N allowed names with a usable pivot gets buying power / N, at most
+names and the newest pivot-confirmed channel reports for the date, by the created_at inside each file. Only the
+blackout's allowed names that are passing members of that report are ticketed: a limit entry at
+the channel report's support (long) or resistance (short), that same level the pivot, stop the level -/+ 1 ATR(14)
+snapped to .99/.49 (long) or .01/.51 (short), target at the midline. Buying power comes from the paper
+account at ticket time (a fake here). Each of the N allowed names with usable levels gets buying power / N, at most
 15% of buying power, and floor(that / entry) shares whatever its stop; no name is shrunk or skipped because
-another used the budget. Blackout names are listed as skipped with the reason. No label but SIDE writes anything. Alpaca's trading client is refused. No network, no orders.
+another used the budget. Blackout names are listed as skipped with the reason. The TTM Squeeze gate is not run.
+No label but SIDE writes anything. Alpaca's trading client is refused. No network, no orders.
 """
 
 import json
@@ -18,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from extensions.scripts import run_paper_tickets as cli
+from extensions.status import squeeze_gate
 from extensions.status.paper_tickets import (
     TICKET_VERSION,
     Account,
@@ -26,12 +28,12 @@ from extensions.status.paper_tickets import (
     account_from_alpaca,
     build_ticket,
     build_tickets,
+    latest_channel_report,
     name_notional_limit,
     refuse_trading_client,
     save_tickets,
     snap_stop,
     stop_for_fill,
-    stop_pivot,
     tickets_for_date,
 )
 
@@ -46,24 +48,16 @@ SHORT_CHANNEL_NAME = "short_channel_2026-09-30_20261008T100001Z.json"
 VST = {"support": 138.4525, "resistance": 156.99, "atr_14": 4.6929, "midline": 147.7212}
 WIDE = {"support": 10.0, "resistance": 20.0, "atr_14": 8.0, "midline": 15.0}
 SHORTY = {"support": 40.0, "resistance": 50.0, "atr_14": 2.0, "midline": 45.0}
-TEN = {"support": 10.0, "resistance": 20.0, "atr_14": 1.0, "midline": 15.0}  # stop = swing low - 1.00, snapped
+TEN = {"support": 10.0, "resistance": 20.0, "atr_14": 1.0, "midline": 15.0}
 ACCOUNT = Account(equity=5000.0, buying_power=20000.0, read_at=CREATED, source="fake paper account", status="ACTIVE")
+# VST 138.4525 - 4.6929 = 133.7596 -> 133.49; WID 10.00 - 8.00 = 2.00 -> 1.99; SHO 50.00 + 2.00 = 52.00 -> 52.01
+LEVELS = {"VST": VST, "WID": WIDE, "OUT": WIDE, "SHO": SHORTY}
 
 
-def _swing(price, day, confirmed=None):
-    return {"date": f"2026-09-{day:02d}", "price": price, "confirmed_on": f"2026-09-{confirmed or day + 2:02d}"}
-
-
-# the last confirmed swing is the second one in each list
-VST_LOWS = [_swing(137.0, 10), _swing(136.0, 20), _swing(140.0, 5, confirmed=8)]  # 136.00 - 4.6929 = 131.3071 -> 130.99
-WIDE_LOWS = [_swing(9.0, 3), _swing(9.5, 15)]  # WID 9.50 - 8.00 = 1.50 -> 1.49
-SHORTY_HIGHS = [_swing(51.0, 4), _swing(50.4, 22)]  # SHO 50.40 + 2.00 = 52.40 -> 52.51
-SWINGS = {"VST": VST_LOWS, "WID": WIDE_LOWS, "OUT": WIDE_LOWS, "SHO": SHORTY_HIGHS}
-
-
-def _ticket(symbol, side, levels, swings=None, earnings_result=None, notional_limit=3000.0):
-    return build_ticket(symbol, side, levels, swings if swings is not None else SWINGS[symbol], earnings_result,
-                        notional_limit=notional_limit, as_of=AS_OF)
+def _ticket(symbol, side, levels, earnings_result=None, notional_limit=3000.0):
+    line = levels.get("support" if side == "long" else "resistance")
+    return build_ticket(symbol, side, line, levels.get("atr_14"), levels.get("midline"), earnings_result,
+                        notional_limit=notional_limit)
 
 
 def _never_read():
@@ -100,29 +94,36 @@ def _handoff(names=None):
                                "OUT": _name("long", WIDE, 3), "SHO": _name("short", SHORTY, 1)}}
 
 
-def _report(side, swings_by_symbol):
-    key = "support_touches" if side == "long" else "resistance_touches"
-    return {"as_of": AS_OF.isoformat(), "calls": {s: {"metrics": {key: sw}} for s, sw in swings_by_symbol.items()}}
+def _report(levels_by_symbol, failed=(), created_at="2026-10-08T10:00:00+00:00", confirmed=True):
+    """A pivot-confirmed channel report whose calls carry each name's support, resistance and atr_14, as the scan
+    measured them. Every name is a passing member except those in failed, which keep their levels in calls."""
+    keys = ("close", "support", "resistance", "atr_14")
+    calls = {s: {"passed": s not in failed, "metrics": {k: lv[k] for k in keys if k in lv}}
+             for s, lv in levels_by_symbol.items()}
+    stages = {"at_support": len(calls), **({"pivot_confirmed": len(calls) - len(failed)} if confirmed else {})}
+    return {"as_of": AS_OF.isoformat(), "created_at": created_at, "report_version": 1, "stage_counts": stages,
+            "members": sorted(s for s in calls if s not in failed), "calls": calls}
 
 
-def _channels(swings=None):
-    swings = swings or SWINGS
-    return {"long": (Path(LONG_CHANNEL_NAME), _report("long", {s: swings[s] for s in swings if s != "SHO"})),
-            "short": (Path(SHORT_CHANNEL_NAME), _report("short", {s: swings[s] for s in swings if s == "SHO"}))}
+def _channels(levels=None):
+    levels = levels or LEVELS
+    return {"long": (Path(LONG_CHANNEL_NAME), _report({s: levels[s] for s in levels if s != "SHO"})),
+            "short": (Path(SHORT_CHANNEL_NAME), _report({s: levels[s] for s in levels if s == "SHO"}))}
 
 
 def _build_longs(spec):
-    """A SIDE day whose allowed names are these longs on TEN levels, ranked in the order given: symbol -> swing low."""
+    """A SIDE day whose allowed names are these longs on TEN levels, ranked in the order given: symbol -> atr_14 in
+    the long channel report, or None to leave the name out of the report."""
     symbols = list(spec)
     names = {s: _name("long", TEN, i) for i, s in enumerate(symbols, start=1)}
-    channels = {"long": (Path(LONG_CHANNEL_NAME), _report("long", {s: [_swing(p, 20)] for s, p in spec.items()}))}
+    channels = {"long": (Path(LONG_CHANNEL_NAME),
+                         _report({s: {**TEN, "atr_14": atr} for s, atr in spec.items() if atr is not None}))}
     return _build(status=_status(long=symbols, short=()), blackout=_blackout(allowed_long=symbols, allowed_short=()),
                   handoff=_handoff(names), channels=channels)
 
 
 def _build(status=None, blackout=None, handoff=None, account=ACCOUNT, channels=None):
-    return build_tickets(AS_OF, (Path(STATUS_NAME), status or _status()),
-                         (Path(BLACKOUT_NAME), blackout or _blackout()),
+    return build_tickets(AS_OF, (Path(STATUS_NAME), status or _status()), (Path(BLACKOUT_NAME), blackout or _blackout()),
                          (Path(HANDOFF_NAME), handoff or _handoff()), account, created_at=CREATED,
                          channels=channels if channels is not None else _channels())
 
@@ -155,29 +156,28 @@ def restore_meta_path(monkeypatch):
 
 
 @pytest.mark.unit
-def test_long_stop_is_one_atr_below_the_pivot_snapped_down_to_99_or_49():
+def test_long_entry_is_a_limit_at_support_and_the_stop_one_atr_below_it_snapped_down_to_99_or_49():
     t = _ticket("VST", "long", VST, earnings_result="clear")
-    assert (t.order_side, t.entry, t.target) == ("buy", 138.45, 147.72)
-    assert t.pivot == {"date": "2026-09-20", "price": 136.0, "confirmed_on": "2026-09-22"}
-    assert (t.atr_14, t.stop_calculated, t.stop) == (4.6929, 131.3071, 130.99)
-    assert t.stop_offset == t.risk_per_share == 7.46 and t.reward_per_share == 9.27 and t.reward_risk == 1.24
+    assert (t.order_side, t.line, t.entry, t.target) == ("buy", "support", 138.45, 147.72)
+    assert (t.channel_level, t.atr_14, t.stop_calculated, t.stop) == (138.4525, 4.6929, 133.7596, 133.49)
+    assert t.stop_offset == t.risk_per_share == 4.96 and t.reward_per_share == 9.27 and t.reward_risk == 1.87
     assert t.quantity == 21 and t.notional_limit_dollars == 3000.0  # floor($3,000 / $138.45)
-    assert t.notional == 2907.45 and t.risk_dollars == 156.66
+    assert t.notional == 2907.45 and t.risk_dollars == 104.16
     assert t.paper is True
 
 
 @pytest.mark.unit
-def test_short_stop_is_one_atr_above_the_pivot_snapped_up_to_01_or_51():
+def test_short_entry_is_a_limit_at_resistance_and_the_stop_one_atr_above_it_snapped_up_to_01_or_51():
     t = _ticket("SHO", "short", SHORTY)
     assert (t.order_side, t.line, t.entry, t.target) == ("sell", "resistance", 50.0, 45.0)
-    assert t.pivot["price"] == 50.4 and (t.stop_calculated, t.stop, t.stop_offset) == (52.4, 52.51, 2.51)
-    assert t.quantity == 60 and t.notional == 3000.0 and t.risk_dollars == 150.6 and t.reward_risk == 1.99
+    assert (t.channel_level, t.stop_calculated, t.stop, t.stop_offset) == (50.0, 52.0, 52.01, 2.01)
+    assert t.quantity == 60 and t.notional == 3000.0 and t.risk_dollars == 120.6 and t.reward_risk == 2.49
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("level, stop", [
     (47.30, 46.99), (47.60, 47.49), (47.49, 47.49), (47.99, 47.99), (48.00, 47.99), (47.50, 47.49),
-    (47.4899, 46.99), (131.3071, 130.99), (1.5, 1.49),
+    (47.4899, 46.99), (133.7596, 133.49), (2.0, 1.99),
 ])
 def test_a_long_stop_snaps_down_to_the_nearer_99_or_49_at_or_below(level, stop):
     assert snap_stop("long", level) == stop
@@ -186,54 +186,20 @@ def test_a_long_stop_snaps_down_to_the_nearer_99_or_49_at_or_below(level, stop):
 @pytest.mark.unit
 @pytest.mark.parametrize("level, stop", [
     (50.60, 51.01), (50.51, 50.51), (50.52, 51.01), (50.01, 50.01), (50.00, 50.01), (49.995, 50.01),
-    (50.5001, 50.51), (52.4, 52.51),
+    (50.5001, 50.51), (52.0, 52.01),
 ])
 def test_a_short_stop_snaps_up_to_the_nearer_01_or_51_at_or_above(level, stop):
     assert snap_stop("short", level) == stop
 
 
 @pytest.mark.unit
-def test_the_stop_pivot_is_the_latest_confirmed_swing_beyond_the_entry_and_never_after_as_of():
-    swings = [_swing(5.0, 10, confirmed=20), _swing(6.0, 18, confirmed=19), _swing(7.0, 28, confirmed=30)]
-    assert stop_pivot(swings, "long", 8.0, AS_OF)["price"] == 7.0
-    assert stop_pivot(swings, "long", 8.0, date(2026, 9, 29))["price"] == 5.0  # confirmed last, though its low came first
-    with pytest.raises(ValueError, match="no confirmed swing low in the long channel report"):
-        stop_pivot(swings, "long", 8.0, date(2026, 9, 18))
-
-
-@pytest.mark.unit
-def test_a_long_pivot_passes_over_swing_lows_at_or_above_the_entry():
-    swings = [_swing(5.0, 10), _swing(6.5, 15), _swing(7.0, 20), _swing(7.5, 25)]
-    assert stop_pivot(swings, "long", 7.0, AS_OF)["price"] == 6.5  # 7.5 is above the entry, 7.0 sits on it
-
-
-@pytest.mark.unit
-def test_a_short_pivot_passes_over_swing_highs_at_or_below_the_entry():
-    swings = [_swing(52.0, 10), _swing(51.0, 15), _swing(50.0, 20), _swing(49.0, 25)]
-    assert stop_pivot(swings, "short", 50.0, AS_OF)["price"] == 51.0
-
-
-@pytest.mark.unit
-def test_a_long_whose_last_swing_low_is_above_support_stops_under_the_one_before():
-    """The latest swing low 139.00 is above the 138.45 entry; the pivot is 137.00: 132.3071, snapped to 131.99."""
-    t = _ticket("VST", "long", VST, swings=[_swing(137.0, 10), _swing(139.0, 25)])
-    assert t.pivot["price"] == 137.0 and (t.stop_calculated, t.stop, t.stop_offset) == (132.3071, 131.99, 6.46)
-
-
-@pytest.mark.unit
-def test_a_short_whose_last_swing_high_is_below_resistance_stops_over_the_one_before():
-    t = _ticket("SHO", "short", SHORTY, swings=[_swing(51.0, 10), _swing(49.0, 25)])
-    assert t.pivot["price"] == 51.0 and (t.stop_calculated, t.stop, t.stop_offset) == (53.0, 53.01, 3.01)
-
-
-@pytest.mark.unit
 def test_size_does_not_depend_on_the_stop_distance():
-    """$3,000 at a $138.45 entry is 21 shares, whether the stop is $7.46 or $6.46 away."""
-    wide, tight = _ticket("VST", "long", VST), _ticket("VST", "long", VST, swings=[_swing(137.0, 10)])
-    assert (wide.stop_offset, wide.quantity) == (7.46, 21) and (tight.stop_offset, tight.quantity) == (6.46, 21)
+    """$3,000 at a $138.45 entry is 21 shares, whether the stop is $4.96 or $9.96 away."""
+    tight, wide = _ticket("VST", "long", VST), _ticket("VST", "long", {**VST, "atr_14": 9.6929})
+    assert (tight.stop_offset, tight.quantity) == (4.96, 21) and (wide.stop_offset, wide.quantity) == (9.96, 21)
     t = _ticket("WID", "long", WIDE)
     assert (t.entry, t.stop_calculated, t.stop, t.stop_offset, t.quantity, t.risk_dollars) == (
-        10.0, 1.5, 1.49, 8.51, 300, 2553.0)
+        10.0, 2.0, 1.99, 8.01, 300, 2403.0)
 
 
 @pytest.mark.unit
@@ -248,9 +214,9 @@ def test_the_ticket_stop_is_stop_for_fill_at_the_entry(symbol, side, levels):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("fill, stop", [
-    (138.45, 130.99),  # at the entry: the ticket's stop
-    (138.10, 130.64),  # a little better
-    (128.00, 120.54),  # gapped below the planned stop of 130.99
+    (138.45, 133.49),  # at the entry: the ticket's stop
+    (138.10, 133.14),  # a little better
+    (128.00, 123.04),  # gapped below the planned stop of 133.49
 ])
 def test_a_long_stop_follows_the_fill_and_stays_below_it(fill, stop):
     t = _ticket("VST", "long", VST)
@@ -260,9 +226,9 @@ def test_a_long_stop_follows_the_fill_and_stays_below_it(fill, stop):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("fill, stop", [
-    (50.00, 52.51),  # at the entry: the ticket's stop
-    (50.20, 52.71),  # a little better
-    (53.25, 55.76),  # gapped above the planned stop of 52.51
+    (50.00, 52.01),  # at the entry: the ticket's stop
+    (50.20, 52.21),  # a little better
+    (53.25, 55.26),  # gapped above the planned stop of 52.01
 ])
 def test_a_short_stop_follows_the_fill_and_stays_above_it(fill, stop):
     t = _ticket("SHO", "short", SHORTY)
@@ -283,26 +249,18 @@ def test_stop_for_fill_refuses_what_cannot_be_a_stop(side, offset, fill, match):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("levels, swings, match", [
-    ({**VST, "atr_14": 0}, VST_LOWS, "no usable"),
-    ({k: v for k, v in VST.items() if k != "midline"}, VST_LOWS, "no usable"),
-    (VST, [], "no swing lows defining support"),
-    (VST, None, "no swing lows defining support"),
-    (VST, [_swing(139.0, 25)], "no confirmed swing low below entry 138.45"),  # every swing low is above the entry
-    (VST, [_swing(138.45, 25)], "no confirmed swing low below entry 138.45"),  # at the entry is not below it
-    ({**VST, "midline": 130.0}, VST_LOWS, "profit side"),
-    ({"support": 4.0, "resistance": 6.0, "atr_14": 3.0, "midline": 5.0}, [_swing(2.5, 20)], "not above zero"),
-    ({**VST, "support": 20_000.0, "midline": 20_100.0}, [_swing(19_000.0, 20)], "no whole share"),
+@pytest.mark.parametrize("levels, match", [
+    ({**VST, "atr_14": 0}, "no usable"),
+    ({k: v for k, v in VST.items() if k != "atr_14"}, "no usable"),
+    ({k: v for k, v in VST.items() if k != "support"}, "no usable support or atr_14 in the long channel report"),
+    ({k: v for k, v in VST.items() if k != "midline"}, "no usable"),
+    ({**VST, "midline": 130.0}, "profit side"),
+    ({"support": 4.0, "resistance": 6.0, "atr_14": 4.5, "midline": 5.0}, "not above zero"),
+    ({**VST, "support": 20_000.0, "midline": 20_100.0}, "no whole share"),
 ])
-def test_unusable_levels_or_swings_make_no_ticket(levels, swings, match):
+def test_unusable_levels_make_no_ticket(levels, match):
     with pytest.raises(ValueError, match=match):
-        build_ticket("VST", "long", levels, swings, notional_limit=3000.0, as_of=AS_OF)
-
-
-@pytest.mark.unit
-def test_a_short_with_no_swing_high_above_the_entry_makes_no_ticket():
-    with pytest.raises(ValueError, match=r"no confirmed swing high above entry 50.0 .*the latest 49.0 of 2026-09-25"):
-        build_ticket("SHO", "short", SHORTY, [_swing(48.0, 10), _swing(49.0, 25)], notional_limit=3000.0, as_of=AS_OF)
+        _ticket("VST", "long", levels)
 
 
 @pytest.mark.unit
@@ -331,10 +289,10 @@ def test_every_name_gets_buying_power_over_n_capped_at_15_pct():
     result = _build()
     by = {t.symbol: t for t in result.tickets}
     assert all(t.notional_limit_dollars == 3000.0 for t in result.tickets)
-    assert (by["VST"].quantity, by["VST"].notional, by["VST"].risk_dollars) == (21, 2907.45, 156.66)
-    assert (by["SHO"].quantity, by["SHO"].notional, by["SHO"].risk_dollars) == (60, 3000.0, 150.6)
-    assert (by["WID"].quantity, by["WID"].notional, by["WID"].risk_dollars) == (300, 3000.0, 2553.0)
-    assert result.total_notional == 8907.45 and result.total_risk == 2860.26
+    assert (by["VST"].quantity, by["VST"].notional, by["VST"].risk_dollars) == (21, 2907.45, 104.16)
+    assert (by["SHO"].quantity, by["SHO"].notional, by["SHO"].risk_dollars) == (60, 3000.0, 120.6)
+    assert (by["WID"].quantity, by["WID"].notional, by["WID"].risk_dollars) == (300, 3000.0, 2403.0)
+    assert result.total_notional == 8907.45 and result.total_risk == 2627.76
     assert result.skipped == {"OUT": "in the earnings blackout: earnings 2026-10-01 (filed), 1 sessions away"}
     assert result.rules["names_n"] == 3 and result.rules["name_notional_limit"] == 3000.0
     assert result.rules["account_equity"] == 5000.0 and result.rules["buying_power"] == 20000.0
@@ -385,11 +343,101 @@ def test_only_allowed_names_are_ticketed_and_flags_carry_over():
 
 
 @pytest.mark.unit
-def test_a_name_without_swings_in_the_channel_report_is_skipped_not_ticketed():
-    result = _build(channels=_channels({k: v for k, v in SWINGS.items() if k != "WID"}))
+def test_entry_and_stop_come_from_the_channel_report_not_the_handoff_or_the_close():
+    """The handoff's support and the last close differ from the long channel report's support; the report wins."""
+    handoff = _handoff()
+    handoff["names"]["VST"] = _name("long", {**VST, "support": 139.9, "atr_14": 1.0, "close": 141.2}, 1)
+    result = _build(handoff=handoff, channels=_channels({**LEVELS, "VST": {**VST, "close": 141.2}}))
+    t = next(t for t in result.tickets if t.symbol == "VST")
+    assert (t.entry, t.channel_level, t.atr_14, t.stop_calculated, t.stop) == (138.45, 138.4525, 4.6929, 133.7596, 133.49)
+
+
+@pytest.mark.unit
+def test_a_name_missing_from_the_channel_report_is_skipped_not_ticketed():
+    result = _build(channels=_channels({k: v for k, v in LEVELS.items() if k != "WID"}))
     assert [t.symbol for t in result.tickets] == ["VST", "SHO"]
-    assert "no swing lows defining support" in result.skipped["WID"]
+    assert result.skipped["WID"] == f"not a member of the newest confirmed long channel report {LONG_CHANNEL_NAME}"
     assert result.rules["names_n"] == 2 and all(t.notional_limit_dollars == 3000.0 for t in result.tickets)
+
+
+@pytest.mark.unit
+def test_a_name_that_failed_confirmation_is_skipped_though_its_levels_are_in_the_report():
+    """A failed call still records support and atr_14; the name is not a member, so it gets no ticket and no share
+    of buying power."""
+    channels = _channels()
+    channels["long"] = (Path(LONG_CHANNEL_NAME), _report({s: LEVELS[s] for s in ("VST", "WID", "OUT")}, failed=("WID",)))
+    result = _build(channels=channels)
+    assert [t.symbol for t in result.tickets] == ["VST", "SHO"]
+    assert result.skipped["WID"].startswith("not a member of the newest confirmed long channel report")
+    assert result.rules["names_n"] == 2
+
+
+@pytest.mark.unit
+def test_a_member_whose_call_did_not_pass_is_skipped():
+    channels = _channels()
+    channels["long"][1]["calls"]["WID"]["passed"] = False
+    result = _build(channels=channels)
+    assert "WID" not in {t.symbol for t in result.tickets} and "not a member" in result.skipped["WID"]
+
+
+@pytest.mark.unit
+def test_a_handoff_ranked_from_another_channel_report_is_warned():
+    handoff = _handoff()
+    handoff["long_channel_report"] = "C:\\elsewhere\\long_channel_2026-09-30_20261007T100000Z.json"
+    result = _build(handoff=handoff)
+    assert ("the ranked side handoff ranked from long channel report long_channel_2026-09-30_20261007T100000Z.json; "
+            f"membership and levels are from the newer {LONG_CHANNEL_NAME}") in result.warnings
+    assert not any("short channel report" in w for w in result.warnings)
+
+
+@pytest.mark.unit
+def test_the_newest_channel_report_is_chosen_by_the_created_at_inside_the_file(tmp_path):
+    """The file whose name sorts last was created first; the created_at inside the file decides, not the name."""
+    newest = _report({"VST": VST}, created_at="2026-10-09T02:00:00+00:00")
+    _write(tmp_path, "long_channel_2026-09-30_20261001T000000Z.json", newest)
+    _write(tmp_path, "long_channel_2026-09-30_20261009T000000Z.json",
+           _report({"VST": VST, "WID": WIDE}, created_at="2026-10-08T00:00:00+00:00"))
+    _write(tmp_path, "long_channel_2026-09-29_20261010T000000Z.json",
+           {**_report({"VST": VST}, created_at="2026-10-10T00:00:00+00:00"), "as_of": "2026-09-29"})
+    path, data = latest_channel_report(AS_OF, "long", tmp_path)
+    assert path.name == "long_channel_2026-09-30_20261001T000000Z.json" and data["members"] == ["VST"]
+
+
+@pytest.mark.unit
+def test_a_newest_channel_report_without_pivot_confirmation_stops_with_no_fallback(tmp_path):
+    _write(tmp_path, "long_channel_2026-09-30_20261008T010000Z.json",
+           _report({"VST": VST}, created_at="2026-10-08T01:00:00+00:00"))
+    _write(tmp_path, "long_channel_2026-09-30_20261008T020000Z.json",
+           _report({"VST": VST, "WID": WIDE}, created_at="2026-10-08T02:00:00+00:00", confirmed=False))
+    with pytest.raises(TicketInputError, match="has no pivot_confirmed stage"):
+        latest_channel_report(AS_OF, "long", tmp_path)
+
+
+@pytest.mark.unit
+def test_an_unreadable_channel_report_stops(tmp_path):
+    _write(tmp_path, "long_channel_2026-09-30_20261008T010000Z.json", _report({"VST": VST}))
+    (tmp_path / "long_channel_2026-09-30_20261008T020000Z.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(TicketInputError, match="cannot read long channel report"):
+        latest_channel_report(AS_OF, "long", tmp_path)
+    (tmp_path / "long_channel_2026-09-30_20261008T020000Z.json").write_text(json.dumps({"as_of": "2026-09-30"}),
+                                                                          encoding="utf-8")
+    with pytest.raises(TicketInputError, match="cannot read long channel report"):
+        latest_channel_report(AS_OF, "long", tmp_path)
+
+
+@pytest.mark.unit
+def test_the_day_tickets_only_members_of_the_newest_confirmed_report(tmp_path):
+    """The handoff names an older unconfirmed long report in which WID passes; the newest report, confirmed, drops
+    WID, so WID gets no ticket."""
+    _write_day(tmp_path)
+    _write(tmp_path / "scanbot", "long_channel_2026-09-30_20261008T200000Z.json",
+           _report({s: LEVELS[s] for s in ("VST", "WID", "OUT")}, failed=("WID",),
+                   created_at="2026-10-08T20:00:00+00:00"))
+    result = tickets_for_date(AS_OF, tmp_path / "status", tmp_path / "handoffs", lambda: ACCOUNT, tmp_path / "scanbot")
+    assert [t.symbol for t in result.tickets] == ["VST", "SHO"]
+    assert "not a member of the newest confirmed long channel report" in result.skipped["WID"]
+    assert result.sources["long_channel_report"].endswith("long_channel_2026-09-30_20261008T200000Z.json")
+    assert result.sources["short_channel_report"].endswith(SHORT_CHANNEL_NAME)
 
 
 @pytest.mark.unit
@@ -401,21 +449,46 @@ def test_tickets_are_listed_in_rank_order_not_list_order():
 @pytest.mark.unit
 def test_every_name_gets_the_same_capital_however_the_stops_differ():
     """N = 7, $20,000 / 7 = $2,857.14 a name (under the 15% cap): 285 shares at $10 each, though E's stop is 7.49 and
-    the rest 8.49."""
-    result = _build_longs({"A": 9.75, "B": 9.75, "C": 9.75, "D": 9.75, "E": 8.6, "F": 9.95, "G": 9.75})
+    the rest 8.99."""
+    result = _build_longs({"A": 1.0, "B": 1.0, "C": 1.0, "D": 1.0, "E": 2.4, "F": 1.0, "G": 1.0})
     assert [(t.symbol, t.stop, t.quantity) for t in result.tickets] == [
-        ("A", 8.49, 285), ("B", 8.49, 285), ("C", 8.49, 285), ("D", 8.49, 285), ("E", 7.49, 285), ("F", 8.49, 285),
-        ("G", 8.49, 285)]
+        ("A", 8.99, 285), ("B", 8.99, 285), ("C", 8.99, 285), ("D", 8.99, 285), ("E", 7.49, 285), ("F", 8.99, 285),
+        ("G", 8.99, 285)]
     assert result.rules["name_notional_limit"] == 2857.14 and result.total_notional == 19950.0
     assert list(result.skipped) == ["OUT"]  # only the blackout name
 
 
 @pytest.mark.unit
-def test_a_name_with_no_swing_below_the_entry_is_skipped_and_not_counted_in_n():
-    result = _build_longs({"A": 9.75, "B": 10.5})
+def test_a_name_with_no_channel_levels_is_skipped_and_not_counted_in_n():
+    result = _build_longs({"A": 1.0, "B": None})
     assert [(t.symbol, t.quantity, t.notional_limit_dollars) for t in result.tickets] == [("A", 300, 3000.0)]
     assert result.rules["names_n"] == 1
-    assert result.skipped["B"].startswith("no confirmed swing low below entry 10.0")
+    assert result.skipped["B"].startswith("not a member of the newest confirmed long channel report")
+
+
+@pytest.mark.unit
+def test_a_member_with_no_channel_levels_is_skipped_and_not_counted_in_n():
+    channels = _channels()
+    channels["long"][1]["calls"]["WID"]["metrics"] = {}
+    result = _build(channels=channels)
+    assert result.rules["names_n"] == 2
+    assert result.skipped["WID"].startswith("no usable support or atr_14 in the long channel report")
+
+
+@pytest.mark.unit
+def test_the_ticket_gate_never_calls_the_squeeze_gate_and_reports_no_squeeze(monkeypatch, tmp_path):
+    """Every allowed name with usable levels is ticketed; the squeeze gate is not called and nothing in the report
+    names it."""
+    def never(*args, **kwargs):
+        raise AssertionError("the squeeze gate was called")
+
+    monkeypatch.setattr(squeeze_gate, "squeeze_gates", never)
+    monkeypatch.setattr(squeeze_gate, "rules", never)
+    _write_day(tmp_path)
+    result = tickets_for_date(AS_OF, tmp_path / "status", tmp_path / "handoffs", lambda: ACCOUNT, tmp_path / "scanbot")
+    assert [t.symbol for t in result.tickets] == ["VST", "SHO", "WID"] and list(result.skipped) == ["OUT"]
+    data = result.to_dict()
+    assert "squeeze" not in json.dumps([data["tickets"], data["rules"], data["skipped"], data["warnings"]]).lower()
 
 
 @pytest.mark.unit
@@ -454,11 +527,12 @@ def test_save_writes_json_and_never_overwrites(tmp_path):
     assert path.name == "paper_tickets_2026-09-30_20261008T120000Z.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["orders_placed"] is False and data["paper"] is True and data["as_of"] == "2026-09-30"
-    assert data["ticket_version"] == TICKET_VERSION == 4
+    assert data["ticket_version"] == TICKET_VERSION == 8
+    assert "squeeze" not in data["tickets"][0]
     first = data["tickets"][0]
-    assert first["pivot"] == {"date": "2026-09-20", "price": 136.0, "confirmed_on": "2026-09-22"}
-    assert (first["atr_14"], first["stop_calculated"], first["stop"], first["stop_offset"]) == (
-        4.6929, 131.3071, 130.99, 7.46)
+    assert (first["entry"], first["channel_level"], first["atr_14"], first["stop_calculated"], first["stop"],
+            first["stop_offset"]) == (138.45, 138.4525, 4.6929, 133.7596, 133.49, 4.96)
+    assert "pivot" not in first and "line_level" not in first
     assert first["notional_limit_dollars"] == 3000.0 and data["rules"]["account_source"] == "fake paper account"
     assert "risk_limit_dollars" not in first and "stop_swing" not in first and "book_risk_limit" not in data["rules"]
     assert data["total_notional"] == 8907.45 and "OUT" in data["skipped"]
@@ -472,12 +546,13 @@ def test_cli_prints_and_writes(tmp_path, capsys, restore_meta_path):
     code = cli.main(_write_day(tmp_path) + ["--out-dir", str(out_dir)], read_account=lambda: ACCOUNT)
     assert code == cli.EXIT_OK
     printed = capsys.readouterr().out
+    assert "squeeze" not in printed.lower()
     assert "VST" in printed and "no order placed" in printed
     assert "equity $5,000.00, buying power $20,000.00" in printed
     assert "N = 3: $3,000.00 a name (buying power / N, at most 15% of buying power)" in printed
-    assert ("pivot swing low 136.0 of 2026-09-20 (confirmed 2026-09-22) - 1 x ATR 4.6929 = 131.3071, snapped to "
-            "130.99") in printed
-    assert "pivot swing high 50.4 of 2026-09-22 (confirmed 2026-09-24) + 1 x ATR 2.0000 = 52.4000, snapped to 52.51" in printed
+    assert "limit    138.45" in printed
+    assert "channel support 138.4525 - 1 x ATR 4.6929 = 133.7596, snapped to 133.49" in printed
+    assert "channel resistance 50.0 + 1 x ATR 2.0000 = 52.0000, snapped to 52.01" in printed
     assert "skipped OUT: in the earnings blackout" in printed
     written = list(out_dir.glob("paper_tickets_2026-09-30_*.json"))
     assert len(written) == 1
@@ -512,7 +587,7 @@ def test_cli_without_the_channel_reports_writes_nothing_and_reads_no_account(tmp
     out_dir = tmp_path / "out"
     code = cli.main(args + ["--out-dir", str(out_dir)], read_account=_never_read)
     assert code == cli.EXIT_BAD_INPUT and not out_dir.exists()
-    assert "cannot read long channel report" in capsys.readouterr().err
+    assert "no long channel report for 2026-09-30" in capsys.readouterr().err
 
 
 @pytest.mark.unit
