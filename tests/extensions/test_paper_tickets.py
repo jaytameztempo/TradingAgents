@@ -3,9 +3,11 @@ names and the newest pivot-confirmed channel reports for the date, by the create
 blackout's allowed names that are passing members of that report are ticketed: a limit entry at
 the channel report's support (long) or resistance (short), the stop the report's clustered swing low below support
 (long) or swing high above resistance (short) -/+ 1 ATR(14) snapped to .99/.49 (long) or .01/.51 (short), target at the midline. Buying power comes from the paper
-account at ticket time (a fake here). Each of the N allowed names with usable levels gets buying power / N, at most
-15% of buying power, and floor(that / entry) shares whatever its stop; no name is shrunk or skipped because
-another used the budget. Blackout names are listed as skipped with the reason. The TTM Squeeze gate is not run.
+account at ticket time (a fake here). The basket gets the lesser of 23% of the series' original buying power (recorded
+in series.json on the first run) and buying power now; under 5% of equity there are no tickets. Each of the N allowed
+names with usable levels gets allocation / N and floor(that / entry) shares; when the basket's stop-risk is over 8%
+of equity every quantity is scaled down by the same factor. Blackout names are listed as skipped with the reason. The
+TTM Squeeze gate is not run.
 No label but SIDE writes anything. Alpaca's trading client is refused. No network, no orders.
 """
 
@@ -28,10 +30,12 @@ from extensions.status.paper_tickets import (
     TicketInputError,
     TradingClientLoaded,
     account_from_alpaca,
+    basket_allocation,
     build_ticket,
     build_tickets,
     latest_channel_report,
-    name_notional_limit,
+    load_series,
+    name_notional,
     refuse_trading_client,
     save_tickets,
     snap_stop,
@@ -53,7 +57,8 @@ WIDE = {"support": 10.0, "resistance": 20.0, "atr_14": 8.0, "midline": 15.0, "sw
 SHORTY = {"support": 40.0, "resistance": 50.0, "atr_14": 2.0, "midline": 45.0, "swing": 51.0}
 TEN = {"support": 10.0, "resistance": 20.0, "atr_14": 1.0, "midline": 15.0, "swing": 10.0}
 SWING_DATE = "2026-07-14"
-ACCOUNT = Account(equity=5000.0, buying_power=20000.0, read_at=CREATED, source="fake paper account", status="ACTIVE")
+# allocation min(23% x $20,000, $20,000) = $4,600; floor 5% x $20,000 = $1,000; book stop-risk limit 8% = $1,600
+ACCOUNT = Account(equity=20000.0, buying_power=20000.0, read_at=CREATED, source="fake paper account", status="ACTIVE")
 # VST swing low 136.10 - 4.6929 = 131.4071 -> 130.99; WID 10.00 - 8.00 = 2.00 -> 1.99; SHO swing high 51.00 + 2.00
 # = 53.00 -> 53.01. Entries stay at the channel level: VST 138.45, WID 10.00, SHO 50.00.
 LEVELS = {"VST": VST, "WID": WIDE, "OUT": WIDE, "SHO": SHORTY}
@@ -140,10 +145,11 @@ def _build_longs(spec):
                   handoff=_handoff(names), channels=channels)
 
 
-def _build(status=None, blackout=None, handoff=None, account=ACCOUNT, channels=None):
+def _build(status=None, blackout=None, handoff=None, account=ACCOUNT, channels=None, original_buying_power=None):
     return build_tickets(AS_OF, (Path(STATUS_NAME), status or _status()), (Path(BLACKOUT_NAME), blackout or _blackout()),
                          (Path(HANDOFF_NAME), handoff or _handoff()), account, created_at=CREATED,
-                         channels=channels if channels is not None else _channels())
+                         channels=channels if channels is not None else _channels(),
+                         original_buying_power=original_buying_power)
 
 
 def _write(folder, name, data):
@@ -159,7 +165,15 @@ def _write_day(tmp_path, status=None):
     _write(tmp_path / "scanbot", LONG_CHANNEL_NAME, channels["long"][1])
     _write(tmp_path / "scanbot", SHORT_CHANNEL_NAME, channels["short"][1])
     return ["--as-of", "2026-09-30", "--status-dir", str(tmp_path / "status"), "--handoff-dir",
-            str(tmp_path / "handoffs"), "--scan-dir", str(tmp_path / "scanbot")]
+            str(tmp_path / "handoffs"), "--scan-dir", str(tmp_path / "scanbot"), "--series-file",
+            str(tmp_path / "series.json")]
+
+
+def _day(tmp_path, account=ACCOUNT, **kwargs):
+    """tickets_for_date over a written day, its series file in tmp_path."""
+    _write_day(tmp_path)
+    return tickets_for_date(AS_OF, tmp_path / "status", tmp_path / "handoffs", lambda: account, tmp_path / "scanbot",
+                            tmp_path / "series.json", **kwargs)
 
 
 @pytest.fixture
@@ -296,12 +310,19 @@ def test_unusable_levels_make_no_ticket(levels, match):
 
 
 @pytest.mark.unit
-def test_name_notional_is_buying_power_over_n_capped_at_15_pct():
-    assert name_notional_limit(20000.0, 3) == 3000.0  # $6,666.67 is over the 15% cap
-    assert name_notional_limit(20000.0, 7) == 2857.14  # under the cap, rounded down
-    assert name_notional_limit(20000.0, 1) == 3000.0 and name_notional_limit(20000.0, 10) == 2000.0
+def test_the_allocation_is_the_lesser_of_23_pct_of_original_buying_power_and_buying_power_now():
+    assert basket_allocation(20000.0, 20000.0) == 4600.0
+    assert basket_allocation(20000.0, 3000.0) == 3000.0  # buying power now is the lesser
+    assert basket_allocation(10000.0, 50000.0) == 2300.0  # the original, not today's larger buying power
+    assert basket_allocation(12345.67, 99999.0) == 2839.5  # $2,839.5041 rounded down
+
+
+@pytest.mark.unit
+def test_name_notional_is_the_allocation_over_n_with_no_per_name_cap():
+    assert name_notional(4600.0, 1) == 4600.0  # all of it: there is no 15% cap
+    assert name_notional(4600.0, 3) == 1533.33 and name_notional(4600.0, 7) == 657.14
     with pytest.raises(ValueError):
-        name_notional_limit(20000.0, 0)
+        name_notional(4600.0, 0)
 
 
 @pytest.mark.unit
@@ -315,30 +336,149 @@ def test_account_comes_from_the_alpaca_account_body():
 
 
 @pytest.mark.unit
-def test_every_name_gets_buying_power_over_n_capped_at_15_pct():
-    """N = 3 (OUT is in the blackout): $20,000 / 3 is over the 15% cap, so $3,000 a name. VST at $138.45 gets 21
-    shares, SHO at $50 60, WID at $10 300, whatever their stops; none is shrunk or skipped for a risk budget."""
+def test_every_name_gets_the_allocation_over_n():
+    """N = 3 (OUT is in the blackout): $4,600 / 3 = $1,533.33 a name. VST at $138.45 gets 11 shares, SHO at $50 30,
+    WID at $10 153, whatever their stops; the $1,397.89 stop-risk is under the $1,600 limit, so nothing is scaled."""
     result = _build()
     by = {t.symbol: t for t in result.tickets}
-    assert all(t.notional_limit_dollars == 3000.0 for t in result.tickets)
-    assert (by["VST"].quantity, by["VST"].notional, by["VST"].risk_dollars) == (21, 2907.45, 156.66)
-    assert (by["SHO"].quantity, by["SHO"].notional, by["SHO"].risk_dollars) == (60, 3000.0, 180.6)
-    assert (by["WID"].quantity, by["WID"].notional, by["WID"].risk_dollars) == (300, 3000.0, 2403.0)
-    assert result.total_notional == 8907.45 and result.total_risk == 2740.26
+    assert all(t.notional_limit_dollars == 1533.33 and t.quantity_unscaled is None for t in result.tickets)
+    assert (by["VST"].quantity, by["VST"].notional, by["VST"].risk_dollars) == (11, 1522.95, 82.06)
+    assert (by["SHO"].quantity, by["SHO"].notional, by["SHO"].risk_dollars) == (30, 1500.0, 90.3)
+    assert (by["WID"].quantity, by["WID"].notional, by["WID"].risk_dollars) == (153, 1530.0, 1225.53)
+    assert result.total_notional == 4552.95 and result.total_risk == 1397.89
     assert result.skipped == {"OUT": "in the earnings blackout: earnings 2026-10-01 (filed), 1 sessions away"}
-    assert result.rules["names_n"] == 3 and result.rules["name_notional_limit"] == 3000.0
-    assert result.rules["account_equity"] == 5000.0 and result.rules["buying_power"] == 20000.0
-    assert result.rules["stop_atr_beyond_swing"] == 1.0 and result.rules["name_notional_pct_of_buying_power"] == 0.15
+    rules = result.rules
+    assert rules["names_n"] == 3 and rules["name_notional_limit"] == 1533.33
+    assert rules["account_equity"] == 20000.0 and rules["buying_power"] == 20000.0
+    assert (rules["original_buying_power"], rules["basket_allocation"], rules["allocation_floor"]) == (
+        20000.0, 4600.0, 1000.0)
+    assert (rules["book_risk_limit"], rules["book_risk_before_scale"], rules["book_risk_scale"]) == (
+        1600.0, 1397.89, 1.0)
+    assert (rules["basket_pct_of_original_buying_power"], rules["floor_pct_of_equity"],
+            rules["book_risk_pct_of_equity"]) == (0.23, 0.05, 0.08)
+    assert rules["stop_atr_beyond_swing"] == 1.0 and "name_notional_pct_of_buying_power" not in rules
 
 
 @pytest.mark.unit
 def test_sizing_follows_the_buying_power_read():
-    rich = Account(equity=100000.0, buying_power=200000.0, read_at=CREATED, source="fake")
+    rich = Account(equity=200000.0, buying_power=200000.0, read_at=CREATED, source="fake")
     result = _build(account=rich)
     by = {t.symbol: t for t in result.tickets}
-    assert result.rules["name_notional_limit"] == 30000.0 and by["VST"].notional_limit_dollars == 30000.0
-    assert (by["VST"].quantity, by["SHO"].quantity, by["WID"].quantity) == (216, 600, 3000)
-    assert result.total_notional == 89905.2
+    assert result.rules["name_notional_limit"] == 15333.33 and by["VST"].notional_limit_dollars == 15333.33
+    assert (by["VST"].quantity, by["SHO"].quantity, by["WID"].quantity) == (110, 306, 1533)
+    assert result.total_notional == 45859.5
+
+
+@pytest.mark.unit
+def test_the_allocation_uses_the_original_buying_power_not_a_larger_one_now():
+    """Buying power grew to $50,000 since the series began at $20,000: still 23% of $20,000."""
+    grown = Account(equity=50000.0, buying_power=50000.0, read_at=CREATED, source="fake")
+    result = _build(account=grown, original_buying_power=20000.0)
+    assert result.rules["basket_allocation"] == 4600.0 and result.rules["name_notional_limit"] == 1533.33
+
+
+@pytest.mark.unit
+def test_the_allocation_is_held_to_the_buying_power_left_now():
+    """23% of the original $20,000 is $4,600, but only $3,000 is free now: $1,000 a name."""
+    spent = Account(equity=20000.0, buying_power=3000.0, read_at=CREATED, source="fake")
+    result = _build(account=spent, original_buying_power=20000.0)
+    assert result.rules["basket_allocation"] == 3000.0 and result.rules["name_notional_limit"] == 1000.0
+    assert [(t.symbol, t.quantity) for t in result.tickets] == [("VST", 7), ("SHO", 20), ("WID", 100)]
+
+
+@pytest.mark.unit
+def test_an_allocation_under_5_pct_of_equity_writes_no_tickets():
+    """$900 free against a $1,000 floor (5% of $20,000 equity): no tickets, and the reason says why."""
+    low = Account(equity=20000.0, buying_power=900.0, read_at=CREATED, source="fake")
+    result = _build(account=low, original_buying_power=20000.0)
+    assert result.tickets == [] and result.total_notional == 0.0
+    assert result.no_ticket_reason == (
+        "allocation $900.00 (the lesser of 23% of original buying power $20,000.00 and buying power $900.00) is under "
+        "the floor $1,000.00 (5% of equity $20,000.00); no tickets")
+    assert result.rules["name_notional_limit"] is None and result.rules["book_risk_scale"] is None
+    assert list(result.skipped) == ["OUT"]
+    with pytest.raises(ValueError, match="no tickets to write"):
+        save_tickets(result)
+
+
+@pytest.mark.unit
+def test_an_allocation_at_the_floor_makes_tickets():
+    at_floor = Account(equity=20000.0, buying_power=1000.0, read_at=CREATED, source="fake")
+    result = _build(account=at_floor, original_buying_power=20000.0)
+    assert result.rules["basket_allocation"] == 1000.0 and result.tickets
+
+
+@pytest.mark.unit
+def test_a_basket_over_8_pct_stop_risk_is_scaled_down_proportionally():
+    """Equity $5,000: limit $400. Before scaling VST 11, SHO 30, WID 153 risk $1,397.89; every quantity x
+    400 / 1397.89 rounded down is VST 3, SHO 8, WID 43, $390.89 of stop-risk. Entries, stops and targets stay."""
+    small = Account(equity=5000.0, buying_power=20000.0, read_at=CREATED, source="fake")
+    result = _build(account=small)
+    by = {t.symbol: t for t in result.tickets}
+    assert [(t.symbol, t.quantity_unscaled, t.quantity) for t in result.tickets] == [
+        ("VST", 11, 3), ("SHO", 30, 8), ("WID", 153, 43)]
+    assert (by["VST"].risk_dollars, by["SHO"].risk_dollars, by["WID"].risk_dollars) == (22.38, 24.08, 344.43)
+    assert (by["VST"].notional, by["SHO"].notional, by["WID"].notional) == (415.35, 400.0, 430.0)
+    assert (by["VST"].entry, by["VST"].stop, by["VST"].target) == (138.45, 130.99, 147.72)
+    assert result.total_risk == 390.89 <= result.rules["book_risk_limit"] == 400.0
+    assert result.rules["book_risk_before_scale"] == 1397.89 and result.rules["book_risk_scale"] == 0.286146
+    assert all(t.notional_limit_dollars == 1533.33 for t in result.tickets)
+
+
+@pytest.mark.unit
+def test_a_name_left_with_no_share_after_the_risk_scale_is_skipped():
+    """Equity $1,000: limit $80, scale 0.0572. VST's 11 shares become 0, so VST is skipped; SHO 1, WID 8."""
+    tiny = Account(equity=1000.0, buying_power=20000.0, read_at=CREATED, source="fake")
+    result = _build(account=tiny)
+    assert [(t.symbol, t.quantity) for t in result.tickets] == [("SHO", 1), ("WID", 8)]
+    assert result.skipped["VST"] == "no whole share after the 8% book stop-risk reduction (11 x 0.0572)"
+    assert "VST: no ticket, no whole share after the 8% book stop-risk reduction (11 x 0.0572)" in result.warnings
+    assert result.total_risk <= 80.0
+
+
+@pytest.mark.unit
+def test_the_first_run_records_the_series_and_later_runs_use_it(tmp_path):
+    first = _day(tmp_path)
+    series = load_series(tmp_path / "series.json")
+    assert series["original_buying_power"] == 20000.0 and series["first_as_of"] == "2026-09-30"
+    assert first.rules["series_recorded_this_run"] is True
+    assert first.sources["series"] == str(tmp_path / "series.json")
+    later = tickets_for_date(AS_OF, tmp_path / "status", tmp_path / "handoffs",
+                             lambda: Account(equity=40000.0, buying_power=40000.0, read_at=CREATED, source="fake"),
+                             tmp_path / "scanbot", tmp_path / "series.json")
+    assert later.rules["series_recorded_this_run"] is False
+    assert later.rules["original_buying_power"] == 20000.0 and later.rules["basket_allocation"] == 4600.0
+    assert load_series(tmp_path / "series.json")["original_buying_power"] == 20000.0
+
+
+@pytest.mark.unit
+def test_a_new_series_records_the_buying_power_read_now(tmp_path):
+    _day(tmp_path)
+    grown = Account(equity=40000.0, buying_power=40000.0, read_at=CREATED, source="fake")
+    result = _day(tmp_path, account=grown, new_series=True)
+    assert result.rules["series_recorded_this_run"] is True and result.rules["basket_allocation"] == 9200.0
+    assert load_series(tmp_path / "series.json")["original_buying_power"] == 40000.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("content, match", [
+    ("{not json", "cannot read the series file"),
+    (json.dumps({"series_version": 1}), "cannot read the series file"),
+    (json.dumps({"series_version": 9, "original_buying_power": 1.0}), "unsupported series_version"),
+    (json.dumps({"series_version": 1, "original_buying_power": 0}), "no usable original_buying_power"),
+])
+def test_an_unreadable_series_file_stops_and_is_not_recorded_over(tmp_path, content, match):
+    (tmp_path / "series.json").write_text(content, encoding="utf-8")
+    with pytest.raises(TicketInputError, match=match):
+        _day(tmp_path)
+    assert (tmp_path / "series.json").read_text(encoding="utf-8") == content
+
+
+@pytest.mark.unit
+def test_a_day_without_the_account_read_records_no_series(tmp_path):
+    _write(tmp_path, STATUS_NAME, _status(label="UP"))
+    tickets_for_date(AS_OF, tmp_path, read_account=_never_read, series_file=tmp_path / "series.json")
+    assert not (tmp_path / "series.json").exists()
 
 
 @pytest.mark.unit
@@ -365,7 +505,7 @@ def test_only_allowed_names_are_ticketed_and_flags_carry_over():
     assert [(t.symbol, t.side) for t in result.tickets] == [("VST", "long"), ("SHO", "short"), ("WID", "long")]
     assert "OUT" not in {t.symbol for t in result.tickets}  # removed by the blackout
     assert "OUT: no ticket, in the earnings blackout: earnings 2026-10-01 (filed), 1 sessions away" in result.warnings
-    assert result.total_notional == 8907.45
+    assert result.total_notional == 4552.95
     assert {t.symbol: t.earnings_result for t in result.tickets} == {
         "VST": "clear", "WID": "unknown_kept", "SHO": "flagged_kept"}
     assert "WID: earnings result unknown_kept" in result.warnings and "estimated dates" in result.warnings
@@ -439,7 +579,7 @@ def test_a_name_missing_from_the_channel_report_is_skipped_not_ticketed():
     result = _build(channels=_channels({k: v for k, v in LEVELS.items() if k != "WID"}))
     assert [t.symbol for t in result.tickets] == ["VST", "SHO"]
     assert result.skipped["WID"] == f"not a member of the newest confirmed long channel report {LONG_CHANNEL_NAME}"
-    assert result.rules["names_n"] == 2 and all(t.notional_limit_dollars == 3000.0 for t in result.tickets)
+    assert result.rules["names_n"] == 2 and all(t.notional_limit_dollars == 2300.0 for t in result.tickets)
 
 
 @pytest.mark.unit
@@ -515,7 +655,8 @@ def test_the_day_tickets_only_members_of_the_newest_confirmed_report(tmp_path):
     _write(tmp_path / "scanbot", "long_channel_2026-09-30_20261008T200000Z.json",
            _report({s: LEVELS[s] for s in ("VST", "WID", "OUT")}, failed=("WID",),
                    created_at="2026-10-08T20:00:00+00:00"))
-    result = tickets_for_date(AS_OF, tmp_path / "status", tmp_path / "handoffs", lambda: ACCOUNT, tmp_path / "scanbot")
+    result = tickets_for_date(AS_OF, tmp_path / "status", tmp_path / "handoffs", lambda: ACCOUNT, tmp_path / "scanbot",
+                              tmp_path / "series.json")
     assert [t.symbol for t in result.tickets] == ["VST", "SHO"]
     assert "not a member of the newest confirmed long channel report" in result.skipped["WID"]
     assert result.sources["long_channel_report"].endswith("long_channel_2026-09-30_20261008T200000Z.json")
@@ -530,20 +671,19 @@ def test_tickets_are_listed_in_rank_order_not_list_order():
 
 @pytest.mark.unit
 def test_every_name_gets_the_same_capital_however_the_stops_differ():
-    """N = 7, $20,000 / 7 = $2,857.14 a name (under the 15% cap): 285 shares at $10 each, though E's stop is 7.49 and
-    the rest 8.99."""
+    """N = 7, $4,600 / 7 = $657.14 a name: 65 shares at $10 each, though E's stop is 7.49 and the rest 8.99."""
     result = _build_longs({"A": 1.0, "B": 1.0, "C": 1.0, "D": 1.0, "E": 2.4, "F": 1.0, "G": 1.0})
     assert [(t.symbol, t.stop, t.quantity) for t in result.tickets] == [
-        ("A", 8.99, 285), ("B", 8.99, 285), ("C", 8.99, 285), ("D", 8.99, 285), ("E", 7.49, 285), ("F", 8.99, 285),
-        ("G", 8.99, 285)]
-    assert result.rules["name_notional_limit"] == 2857.14 and result.total_notional == 19950.0
+        ("A", 8.99, 65), ("B", 8.99, 65), ("C", 8.99, 65), ("D", 8.99, 65), ("E", 7.49, 65), ("F", 8.99, 65),
+        ("G", 8.99, 65)]
+    assert result.rules["name_notional_limit"] == 657.14 and result.total_notional == 4550.0
     assert list(result.skipped) == ["OUT"]  # only the blackout name
 
 
 @pytest.mark.unit
 def test_a_name_with_no_channel_levels_is_skipped_and_not_counted_in_n():
     result = _build_longs({"A": 1.0, "B": None})
-    assert [(t.symbol, t.quantity, t.notional_limit_dollars) for t in result.tickets] == [("A", 300, 3000.0)]
+    assert [(t.symbol, t.quantity, t.notional_limit_dollars) for t in result.tickets] == [("A", 460, 4600.0)]
     assert result.rules["names_n"] == 1
     assert result.skipped["B"].startswith("not a member of the newest confirmed long channel report")
 
@@ -566,8 +706,7 @@ def test_the_ticket_gate_never_calls_the_squeeze_gate_and_reports_no_squeeze(mon
 
     monkeypatch.setattr(squeeze_gate, "squeeze_gates", never)
     monkeypatch.setattr(squeeze_gate, "rules", never)
-    _write_day(tmp_path)
-    result = tickets_for_date(AS_OF, tmp_path / "status", tmp_path / "handoffs", lambda: ACCOUNT, tmp_path / "scanbot")
+    result = _day(tmp_path)
     assert [t.symbol for t in result.tickets] == ["VST", "SHO", "WID"] and list(result.skipped) == ["OUT"]
     data = result.to_dict()
     assert "squeeze" not in json.dumps([data["tickets"], data["rules"], data["skipped"], data["warnings"]]).lower()
@@ -609,16 +748,17 @@ def test_save_writes_json_and_never_overwrites(tmp_path):
     assert path.name == "paper_tickets_2026-09-30_20261008T120000Z.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["orders_placed"] is False and data["paper"] is True and data["as_of"] == "2026-09-30"
-    assert data["ticket_version"] == TICKET_VERSION == 11
+    assert data["ticket_version"] == TICKET_VERSION == 12
     assert "squeeze" not in data["tickets"][0]
     first = data["tickets"][0]
     assert (first["entry"], first["channel_level"], first["atr_14"], first["stop_swing"], first["stop_swing_date"],
             first["stop_calculated"], first["stop"], first["stop_offset"]) == (
         138.45, 138.4525, 4.6929, 136.1, SWING_DATE, 131.4071, 130.99, 7.46)
     assert "pivot" not in first and "line_level" not in first
-    assert first["notional_limit_dollars"] == 3000.0 and data["rules"]["account_source"] == "fake paper account"
-    assert "risk_limit_dollars" not in first and "book_risk_limit" not in data["rules"]
-    assert data["total_notional"] == 8907.45 and "OUT" in data["skipped"]
+    assert first["notional_limit_dollars"] == 1533.33 and data["rules"]["account_source"] == "fake paper account"
+    assert first["quantity_unscaled"] is None and "risk_limit_dollars" not in first
+    assert data["rules"]["book_risk_limit"] == 1600.0 and data["rules"]["basket_allocation"] == 4600.0
+    assert data["total_notional"] == 4552.95 and "OUT" in data["skipped"]
     with pytest.raises(FileExistsError):
         save_tickets(result, tmp_path)
 
@@ -631,8 +771,13 @@ def test_cli_prints_and_writes(tmp_path, capsys, restore_meta_path):
     printed = capsys.readouterr().out
     assert "squeeze" not in printed.lower()
     assert "VST" in printed and "no order placed" in printed
-    assert "equity $5,000.00, buying power $20,000.00" in printed
-    assert "N = 3: $3,000.00 a name (buying power / N, at most 15% of buying power)" in printed
+    assert "equity $20,000.00, buying power $20,000.00" in printed
+    assert "series: original buying power $20,000.00 (recorded on this run)" in printed
+    assert ("allocation $4,600.00 (lesser of 23% of original buying power and buying power), floor $1,000.00 "
+            "(5% of equity)") in printed
+    assert "N = 3: $1,533.33 a name (allocation / N)" in printed
+    assert "book stop-risk $1,397.89 before scaling, limit $1,600.00 (8% of equity): within the limit" in printed
+    assert (tmp_path / "series.json").exists()
     assert "limit    138.45" in printed
     assert ("channel support 138.4525; stop: clustered swing low 136.1 (2026-07-14) - 1 x ATR 4.6929 = 131.4071, "
             "snapped to 130.99") in printed

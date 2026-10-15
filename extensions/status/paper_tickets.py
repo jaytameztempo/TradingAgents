@@ -18,7 +18,10 @@ It reads five saved files for one date:
 Equity and buying power are not set here. On a day with tickets the caller
 reads them from the Alpaca paper account at ticket time and passes them in as
 an ``Account`` (run_paper_tickets does a read-only GET /v2/account). This
-module makes no request itself.
+module makes no request itself. The original buying power of the series is the
+buying power read on the series' first run, kept in ``series.json`` beside the
+tickets; when that file is missing, the buying power read now is recorded there
+and used.
 
 Under any label but SIDE, or when the daily status blocks the channel names,
 there are no tickets: only the channel names have lines to ticket. Each name
@@ -49,14 +52,19 @@ usable levels. Each ticket:
 - stop_offset: the stop's distance from the entry, which the sender places
   from the real fill (``stop_for_fill``),
 - target: the channel midline,
-- quantity: floor(name notional limit / entry) whole shares.
+- quantity: floor(name notional limit / entry) whole shares, then the book
+  stop-risk scale below.
 
-Size is not set by the stop distance. Every name gets the same dollars:
-buying power / N, capped at ``NAME_NOTIONAL_PCT`` (15%) of buying power
-(``name_notional_limit``); no name is shrunk or skipped because another used
-the budget. A name is skipped, with the reason, when it is in the earnings
-blackout, is not a member of the newest confirmed channel report, has no usable
-levels, or when not one share fits its dollars. Tickets
+The basket gets the lesser of ``BASKET_PCT`` (23%) of the series' original
+buying power and the buying power read now (``basket_allocation``). When that
+is under ``FLOOR_PCT`` (5%) of equity there are no tickets. Otherwise every
+name gets the same dollars, allocation / N (``name_notional``). When the
+basket's total stop-risk is over ``BOOK_RISK_PCT`` (8%) of equity, every
+name's quantity is multiplied by the limit / the stop-risk and rounded down
+(``scale_to_book_risk``); a name left with no share is skipped. Size is not
+otherwise set by the stop distance. A name is skipped, with the reason, when it
+is in the earnings blackout, is not a member of the newest confirmed channel
+report, has no usable levels, or when not one share fits its dollars. Tickets
 are listed in rank order, long and short interleaved (long #1, short #1,
 long #2, ...).
 
@@ -73,23 +81,27 @@ import json
 import math
 import sys
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 from extensions.status.daily_status import LONG, SHORT, SIDE, SIDES, default_handoff_dir, default_status_dir
 from extensions.status.earnings_blackout import BlackoutInputError, latest_daily_status
 
-TICKET_VERSION = 11  # 2: stop_offset from the fill; 3: equal risk a name; 4: snapped pivot -/+ 1 ATR stop, buying power / N;
+TICKET_VERSION = 12  # 2: stop_offset from the fill; 3: equal risk a name; 4: snapped pivot -/+ 1 ATR stop, buying power / N;
 # 5: entry and pivot are the channel report's support (long) or resistance (short); 6: 4h + 1h TTM Squeeze gate;
 # 7: the TTM Squeeze gate removed; 8: the newest pivot-confirmed channel report, members only;
 # 9: the stop is the 120-session swing extreme -/+ 1 ATR, not the channel level;
 # 10: the stop swing is the nearest clustered swing beyond the channel level in 120 sessions, not the extreme;
-# 11: a stop swing more than 3 ATR beyond the channel level is discarded
+# 11: a stop swing more than 3 ATR beyond the channel level is discarded;
+# 12: basket = min(23% of the series' original buying power, buying power) / N, 5% equity floor, 8% book stop-risk
 BLACKOUT_REPORT_VERSION = 1
 CHANNEL_REPORT_VERSION = 1
+SERIES_VERSION = 1
 CONFIRMED_STAGE = "pivot_confirmed"  # the stage_counts key a confirmed channel report carries
-NAME_NOTIONAL_PCT = 0.15  # of buying power, the most any one name gets
+BASKET_PCT = 0.23  # of the series' original buying power, the most the whole basket gets
+FLOOR_PCT = 0.05  # of equity: an allocation under this writes no tickets
+BOOK_RISK_PCT = 0.08  # of equity, the most the basket may lose at its stops
 STOP_ATR = 1.0  # beyond the channel level
 STOP_ENDINGS = {LONG: (49, 99), SHORT: (1, 51)}  # cents a snapped stop ends in
 LINE = {LONG: "support", SHORT: "resistance"}
@@ -251,11 +263,81 @@ def account_from_alpaca(raw: dict, read_at: datetime, source: str) -> Account:
     return Account(values["equity"], values["buying_power"], read_at, source, raw.get("status"))
 
 
-def name_notional_limit(buying_power: float, n: int) -> float:
-    """Per-name dollars: buying power / N, at most NAME_NOTIONAL_PCT of buying power, rounded down to the cent."""
+def _cents_down(value: float) -> float:
+    return math.floor(round(value * 100, 6)) / 100
+
+
+def basket_allocation(original_buying_power: float, buying_power: float) -> float:
+    """The basket's dollars: the lesser of BASKET_PCT of the series' original buying power and the buying power now,
+    rounded down to the cent."""
+    return _cents_down(min(original_buying_power * BASKET_PCT, buying_power))
+
+
+def allocation_floor(equity: float) -> float:
+    """FLOOR_PCT of equity: an allocation under this writes no tickets."""
+    return round(equity * FLOOR_PCT, 2)
+
+
+def book_risk_limit(equity: float) -> float:
+    """BOOK_RISK_PCT of equity: the most the basket may lose at its stops."""
+    return round(equity * BOOK_RISK_PCT, 2)
+
+
+def name_notional(allocation: float, n: int) -> float:
+    """Per-name dollars: the basket allocation / N, rounded down to the cent."""
     if n < 1:
         raise ValueError("N must be at least 1")
-    return math.floor(round(min(buying_power / n, buying_power * NAME_NOTIONAL_PCT) * 100, 6)) / 100
+    return _cents_down(allocation / n)
+
+
+# --- the series --------------------------------------------------------------
+
+def default_series_file() -> Path:
+    """~/.tradingagents/tickets/series.json: the buying power read on the series' first run."""
+    return default_ticket_dir() / "series.json"
+
+
+def load_series(path: str | Path) -> dict | None:
+    """The recorded series, or None when the file does not exist. A file that cannot be read stops the run rather
+    than being recorded over."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        original = data["original_buying_power"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise TicketInputError(f"cannot read the series file {path}: {exc}") from exc
+    if data.get("series_version") != SERIES_VERSION:
+        raise TicketInputError(f"series file {path} has unsupported series_version {data.get('series_version')!r}")
+    if not _price(original):
+        raise TicketInputError(f"series file {path} has no usable original_buying_power (got {original!r})")
+    return data
+
+
+def record_series(path: str | Path, account: Account, as_of: date) -> dict:
+    """Record the buying power read now as the series' original buying power, replacing any earlier series."""
+    path = Path(path)
+    data = {"series_version": SERIES_VERSION, "original_buying_power": account.buying_power,
+            "recorded_at": account.read_at.isoformat(), "first_as_of": as_of.isoformat(),
+            "account_source": account.source}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return data
+
+
+def series_baseline(path: str | Path | None, account: Account, as_of: date,
+                    new_series: bool = False) -> tuple[Path, float, bool]:
+    """(series file, original buying power, whether it was recorded on this run). A missing file, or new_series,
+    records the buying power read now."""
+    path = Path(path) if path is not None else default_series_file()
+    series = None if new_series else load_series(path)
+    recorded = series is None
+    if recorded:
+        series = record_series(path, account, as_of)
+    return path, float(series["original_buying_power"]), recorded
 
 
 # --- tickets -----------------------------------------------------------------
@@ -305,9 +387,10 @@ class Ticket:
     reward_risk: float
     risk_dollars: float
     notional: float
-    notional_limit_dollars: float  # buying power / N, capped at NAME_NOTIONAL_PCT of buying power
+    notional_limit_dollars: float  # the basket allocation / N
     earnings_result: str | None  # from the blackout: clear, flagged_kept, unknown_kept
     rank: int | None = None  # the handoff's rank within its side
+    quantity_unscaled: int | None = None  # the quantity before the book stop-risk scale, when the scale applied
     paper: bool = True
 
 
@@ -377,6 +460,27 @@ def size_ticket(symbol: str, side: str, plan: dict, earnings_result: str | None 
     )
 
 
+def scale_to_book_risk(tickets: list[Ticket], limit: float) -> tuple[list[Ticket], dict[str, str], float]:
+    """(tickets, skipped, scale): when the tickets' total stop-risk is over limit, every quantity times limit / the
+    stop-risk, rounded down, so the total is at or under limit. A name left with no share is skipped. Entries, stops
+    and targets are not changed."""
+    total = sum(t.risk_dollars for t in tickets)
+    if total <= limit:
+        return tickets, {}, 1.0
+    scale = limit / total
+    kept: list[Ticket] = []
+    skipped: dict[str, str] = {}
+    for t in tickets:
+        quantity = math.floor(t.quantity * scale)
+        if quantity < 1:
+            skipped[t.symbol] = (f"no whole share after the {BOOK_RISK_PCT:.0%} book stop-risk reduction "
+                                 f"({t.quantity} x {scale:.4f})")
+            continue
+        kept.append(replace(t, quantity=quantity, quantity_unscaled=t.quantity,
+                            risk_dollars=round(quantity * t.risk_per_share, 2), notional=round(quantity * t.entry, 2)))
+    return kept, skipped, round(scale, 6)
+
+
 def build_ticket(symbol: str, side: str, line: float | None, atr: float | None, midline: float | None,
                  swing: dict | None, earnings_result: str | None = None, *, notional_limit: float,
                  rank: int | None = None) -> Ticket:
@@ -406,21 +510,36 @@ def _rank_order(allowed: dict[str, list[str]], names: dict) -> list[tuple[str, s
     return [(symbol, side) for _, symbol, side in sorted(order)]
 
 
-def _rules(account: Account | None = None, n: int | None = None, notional_limit: float | None = None) -> dict:
+def _rules(account: Account | None = None, n: int | None = None, notional_limit: float | None = None,
+           basket: dict | None = None) -> dict:
+    basket = basket or {}
     return {
         "account_equity": account.equity if account else None,
         "buying_power": account.buying_power if account else None,
         "account_source": account.source if account else None,
         "account_read_at": account.read_at.isoformat() if account else None,
+        "original_buying_power": basket.get("original_buying_power"),
+        "basket_pct_of_original_buying_power": BASKET_PCT,
+        "basket_allocation": basket.get("allocation"),
+        "allocation": "the lesser of basket_pct_of_original_buying_power x original_buying_power (the buying power "
+                      "read on the series' first run) and buying power now, rounded down to the cent",
+        "floor_pct_of_equity": FLOOR_PCT,
+        "allocation_floor": basket.get("floor"),
+        "floor": "an allocation under floor_pct_of_equity x equity writes no tickets",
         "names_n": n,
         "names": "the earnings blackout's allowed long and short names that are passing members of the channel report "
                  "and have usable levels",
         "channel_report": f"the newest {{long|short}}_channel report for the date by the created_at inside the file; "
                           f"it must carry the {CONFIRMED_STAGE} stage, else no tickets",
-        "name_notional": "buying power / N, capped at name_notional_pct_of_buying_power, rounded down to the cent, "
-                         "the same for every name",
-        "name_notional_pct_of_buying_power": NAME_NOTIONAL_PCT,
+        "name_notional": "the basket allocation / N, rounded down to the cent, the same for every name",
         "name_notional_limit": notional_limit,
+        "book_risk_pct_of_equity": BOOK_RISK_PCT,
+        "book_risk_limit": basket.get("risk_limit"),
+        "book_risk_before_scale": basket.get("risk_before_scale"),
+        "book_risk_scale": basket.get("scale"),
+        "book_risk": "when the tickets' total stop-risk is over book_risk_pct_of_equity x equity, every quantity is "
+                     "multiplied by book_risk_limit / that stop-risk and rounded down; a name left with no share is "
+                     "skipped",
         "entry": "limit at the channel level, rounded to the cent: limit buy at support from the long channel "
                  "report (long), limit sell at resistance from the short channel report (short); not the last close",
         "stop_swing": "of the confirmed ZigZag swings whose extreme bar is inside the 120 sessions ending on as_of, "
@@ -434,7 +553,8 @@ def _rules(account: Account | None = None, n: int | None = None, notional_limit:
                 "stop_swing + STOP_ATR x atr_14 snapped up to a price ending .01 or .51 at or above it (short); "
                 "atr_14 from the channel report",
         "target": "the channel midline",
-        "quantity": "floor(name notional limit / entry); not sized by the stop distance",
+        "quantity": "floor(name notional limit / entry), then the book stop-risk scale; not otherwise sized by the "
+                    "stop distance",
         "order": "rank order, long before short on a tie; listing order does not change any size",
     }
 
@@ -446,7 +566,8 @@ class PaperTickets:
     market_label: str
     channel_names_blocked: bool
     tickets: list[Ticket]
-    skipped: dict[str, str]  # symbol -> why it made no ticket (blackout, not a channel member, no usable levels, no share fits)
+    skipped: dict[str, str]  # symbol -> why it made no ticket (blackout, not a channel member, no usable levels, no
+    # share fits, or no share left after the book stop-risk scale)
     no_ticket_reason: str | None  # set when the day has no tickets at all
     sources: dict[str, str | None]
     total_notional: float = 0.0
@@ -472,10 +593,12 @@ def build_tickets(
     account: Account | None = None,
     created_at: datetime | None = None,
     channels: dict[str, tuple[Path, dict]] | None = None,
+    original_buying_power: float | None = None,
 ) -> PaperTickets:
     """Tickets for the allowed names, sized from the account, entries and stops from the channel reports (channels:
     side -> report, for each side with allowed names). Only passing members of a side's channel report are ticketed.
-    Under any label but SIDE the blackout, handoff, account and channel reports are not needed. Writes nothing."""
+    original_buying_power is the series' first buying power; None uses the account's buying power. Under any label
+    but SIDE the blackout, handoff, account and channel reports are not needed. Writes nothing."""
     status_path, s = status
     label = s.get("market_label", "")
     created = created_at or datetime.now(UTC)
@@ -546,16 +669,30 @@ def build_tickets(
             continue
         plans.append((symbol, side, entry.get("rank"), plan))
 
-    # then the size: every name gets the same dollars of buying power
+    # then the size: the basket allocation, unless under the floor, split equally, then held to the book stop-risk
     n = len(plans)
-    notional_limit = name_notional_limit(account.buying_power, n) if n else None
+    original = original_buying_power if original_buying_power is not None else account.buying_power
+    basket = {"original_buying_power": original, "allocation": basket_allocation(original, account.buying_power),
+              "floor": allocation_floor(account.equity), "risk_limit": book_risk_limit(account.equity)}
+    notional_limit = None
     tickets: list[Ticket] = []
-    for symbol, side, rank, plan in plans:
-        try:
-            tickets.append(size_ticket(symbol, side, plan, (checks.get(symbol) or {}).get("result"),
-                                       notional_limit=notional_limit, rank=rank))
-        except ValueError as exc:
-            skipped[symbol] = str(exc)
+    if basket["allocation"] < basket["floor"]:
+        no_ticket_reason = (f"allocation ${basket['allocation']:,.2f} (the lesser of {BASKET_PCT:.0%} of original "
+                            f"buying power ${original:,.2f} and buying power ${account.buying_power:,.2f}) is under "
+                            f"the floor ${basket['floor']:,.2f} ({FLOOR_PCT:.0%} of equity ${account.equity:,.2f}); "
+                            "no tickets")
+    else:
+        no_ticket_reason = "no allowed name made a ticket"
+        notional_limit = name_notional(basket["allocation"], n) if n else None
+        for symbol, side, rank, plan in plans:
+            try:
+                tickets.append(size_ticket(symbol, side, plan, (checks.get(symbol) or {}).get("result"),
+                                           notional_limit=notional_limit, rank=rank))
+            except ValueError as exc:
+                skipped[symbol] = str(exc)
+        basket["risk_before_scale"] = round(sum(t.risk_dollars for t in tickets), 2)
+        tickets, scaled_out, basket["scale"] = scale_to_book_risk(tickets, basket["risk_limit"])
+        skipped.update(scaled_out)
     total_notional = round(sum(t.notional for t in tickets), 2)
     total_risk = round(sum(t.risk_dollars for t in tickets), 2)
 
@@ -571,11 +708,11 @@ def build_tickets(
         channel_names_blocked=False,
         tickets=tickets,
         skipped=skipped,
-        no_ticket_reason=None if tickets else "no allowed name made a ticket",
+        no_ticket_reason=None if tickets else no_ticket_reason,
         sources=sources,
         total_notional=total_notional,
         total_risk=total_risk,
-        rules=_rules(account, n, notional_limit),
+        rules=_rules(account, n, notional_limit, basket),
         warnings=list(dict.fromkeys(warnings)),
     )
 
@@ -586,8 +723,12 @@ def tickets_for_date(
     handoff_dir: str | Path | None = None,
     read_account: Callable[[], Account] | None = None,
     scan_dir: str | Path | None = None,
+    series_file: str | Path | None = None,
+    new_series: bool = False,
 ) -> PaperTickets:
-    """Tickets from the saved files. read_account is called only on a SIDE day with allowed names, at ticket time."""
+    """Tickets from the saved files. read_account is called only on a SIDE day with allowed names, at ticket time;
+    that run also reads the series file (default ~/.tradingagents/tickets/series.json) and records the buying power
+    read now in it when it is missing or new_series is set."""
     try:
         status = latest_daily_status(as_of, status_dir)
     except BlackoutInputError as exc:
@@ -602,7 +743,13 @@ def tickets_for_date(
         if read_account is None:
             raise TicketInputError("a SIDE day needs equity and buying power read from the paper account")
         account = read_account()
-    return build_tickets(as_of, status, blackout, handoff, account, channels=channels)
+    else:
+        return build_tickets(as_of, status, blackout, handoff, account, channels=channels)
+    path, original, recorded = series_baseline(series_file, account, as_of, new_series)
+    result = build_tickets(as_of, status, blackout, handoff, account, channels=channels,
+                           original_buying_power=original)
+    return replace(result, sources={**result.sources, "series": str(path)},
+                   rules={**result.rules, "series_recorded_this_run": recorded})
 
 
 def save_tickets(t: PaperTickets, out_dir: str | Path | None = None) -> Path:
