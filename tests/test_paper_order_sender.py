@@ -6,7 +6,7 @@ No test reaches Alpaca: a fake client stands in for the trading API.
 """
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -333,3 +333,47 @@ def test_a_dry_run_builds_no_client(tmp_path, capsys):
     code = sender.main(["--as-of", "2026-09-30", "--ticket-dir", str(tmp_path)], make_client=no_client)
     out = capsys.readouterr().out
     assert code == sender.EXIT_OK and "nothing sent" in out and client_order_id(AS_OF, VST) in out
+
+
+# --- the trading window --------------------------------------------------------
+
+def _window(tmp_path, monkeypatch, days=("mon", "tue", "wed", "thu", "fri"), sessions=(("09:35", "15:55"),)):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"trading": {
+        "days": list(days), "sessions": [{"start": a, "end": b} for a, b in sessions]}}), encoding="utf-8")
+    monkeypatch.setenv("TRADINGAGENTS_SETTINGS_PATH", str(settings))
+
+
+# Friday 2026-10-09 in New York (EDT, UTC-4).
+INSIDE = datetime(2026, 10, 9, 14, 0, tzinfo=UTC)    # 10:00 New York
+BEFORE = datetime(2026, 10, 9, 13, 0, tzinfo=UTC)    # 09:00 New York
+SATURDAY = datetime(2026, 10, 10, 14, 0, tzinfo=UTC)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("now", [BEFORE, SATURDAY])
+def test_a_send_outside_the_trading_window_sends_nothing(tmp_path, monkeypatch, capsys, now):
+    _window(tmp_path, monkeypatch)
+    _write(tmp_path, "20261009T003216Z", _file())
+    client = FakeClient()
+    code = sender.main(["--as-of", "2026-09-30", "--ticket-dir", str(tmp_path), "--send"],
+                       env=PAPER_ENV, make_client=lambda env: client, now=now)
+    assert code == sender.EXIT_BAD_INPUT and "outside the trading window" in capsys.readouterr().err
+    assert client.submitted == []
+
+
+@pytest.mark.unit
+def test_a_send_inside_the_trading_window_goes(tmp_path, monkeypatch):
+    _window(tmp_path, monkeypatch)
+    _write(tmp_path, "20261009T003216Z", _file())
+    client = FakeClient()
+    code = sender.main(["--as-of", "2026-09-30", "--ticket-dir", str(tmp_path), "--send"],
+                       env=PAPER_ENV, make_client=lambda env: client, now=INSIDE)
+    assert code == sender.EXIT_OK and len(client.submitted) == 2
+
+
+@pytest.mark.unit
+def test_a_dry_run_is_allowed_outside_the_window(tmp_path, monkeypatch):
+    _window(tmp_path, monkeypatch)
+    _write(tmp_path, "20261009T003216Z", _file())
+    assert sender.main(["--as-of", "2026-09-30", "--ticket-dir", str(tmp_path)], now=SATURDAY) == sender.EXIT_OK

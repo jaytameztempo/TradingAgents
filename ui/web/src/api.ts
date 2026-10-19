@@ -34,6 +34,71 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 const get = <T>(path: string) => request<T>(path);
 const post = <T>(path: string, body: unknown) =>
   request<T>(path, { method: "POST", body: JSON.stringify(body) });
+const put = <T>(path: string, body: unknown) =>
+  request<T>(path, { method: "PUT", body: JSON.stringify(body) });
+
+// --- settings ------------------------------------------------------------------------
+
+export interface Automation {
+  enabled: boolean;
+  days: string[];
+  times: string[];
+  run: "daily" | "scans";
+}
+
+export interface Trading {
+  days: string[];
+  sessions: { start: string; end: string }[];
+  auto_send: { enabled: boolean; times: string[] };
+}
+
+export interface SchedulerEvent {
+  at: string;
+  kind: string;
+  slot: string;
+  outcome: "started" | "skipped" | "error";
+  detail: string;
+  job_id: string | null;
+}
+
+export interface SchedulerStatus {
+  running: boolean;
+  now: string;
+  next_scan: string | null;
+  next_send: string | null;
+  auto_send_enabled: boolean;
+  window_saved: boolean;
+  events: SchedulerEvent[];
+}
+
+export interface LlmField {
+  label: string;
+  value: string;
+  choices?: string[];
+  int?: [number, number];
+  pattern?: string;
+}
+
+export interface SettingsData {
+  error: string | null;
+  automation: Automation;
+  automation_runs: Record<string, string>;
+  trading: Trading;
+  trading_saved: boolean;
+  llm: Record<string, LlmField>;
+  keys: { name: string; label: string; set: boolean }[];
+  provider_keys: Record<string, string | null>;
+  scheduler: SchedulerStatus;
+  env_path: string;
+  settings_path: string;
+}
+
+export interface Health {
+  ok: boolean;
+  data_home: string;
+  orders_enabled: boolean;
+  scheduler_running: boolean;
+}
 
 // --- broker (paper, read-only) -------------------------------------------------------
 
@@ -257,6 +322,14 @@ export const api = {
   report: (name: string) => get<{ name: string; sections: Record<string, string> }>(`/api/research/reports/${name}`),
 
   jobs: () => get<Job[]>("/api/jobs"),
+  health: () => get<Health>("/api/health"),
+
+  settings: () => get<SettingsData>("/api/settings"),
+  saveAutomation: (body: Automation) => put<Automation>("/api/settings/automation", body),
+  saveTrading: (body: Trading) => put<Trading>("/api/settings/trading", body),
+  saveLlm: (values: Record<string, string>) => put<{ ok: true }>("/api/settings/llm", { values }),
+  saveKeys: (body: { set: Record<string, string>; clear: string[] }) =>
+    put<{ ok: true; saved: string[]; cleared: string[] }>("/api/settings/keys", body),
 
   runScans: (body: { as_of: string; kind: ScanKind; tickers: string[] }) =>
     post<Job>("/api/scans/run", body),

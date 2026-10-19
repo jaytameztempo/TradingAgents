@@ -7,11 +7,12 @@ import {
 } from "../components/ui";
 import { dateTime, money, num, qty, signedMoney, signedPct } from "../format";
 import { Ticker, TickerChips } from "../components/Ticker";
+import { usePrefs } from "../prefs";
 
-const REFRESH_MS = 15_000;
 const RANGES: HistoryRange[] = ["1D", "1W", "1M", "1Y"];
 
 export default function Dashboard() {
+  const REFRESH_MS = usePrefs().prefs.refreshSeconds * 1000;
   const account = useQuery({ queryKey: ["account"], queryFn: api.account, refetchInterval: REFRESH_MS });
   const keysMissing = isMissingKeys(account.error);
 
@@ -19,7 +20,7 @@ export default function Dashboard() {
     <>
       <div className="page-head">
         <h1>Dashboard</h1>
-        <span className="muted">Paper account · refreshes every 15s</span>
+        <span className="muted">Paper account · refreshes every {REFRESH_MS / 1000}s</span>
       </div>
       {keysMissing ? <ConnectKeys message={(account.error as Error).message} /> : (
         <>
@@ -43,6 +44,7 @@ function ConnectKeys({ message }: { message: string }) {
 }
 
 function AccountCard() {
+  const REFRESH_MS = usePrefs().prefs.refreshSeconds * 1000;
   const [range, setRange] = useState<HistoryRange>("1M");
   const account = useQuery({ queryKey: ["account"], queryFn: api.account, refetchInterval: REFRESH_MS });
   const history = useQuery({ queryKey: ["history", range], queryFn: () => api.history(range), refetchInterval: REFRESH_MS * 4 });
@@ -131,6 +133,7 @@ function AccountCard() {
 const DISABLED_REASON = "Order placement is disabled in this build";
 
 function PositionsOrders() {
+  const REFRESH_MS = usePrefs().prefs.refreshSeconds * 1000;
   const [tab, setTab] = useState<"positions" | "orders">("positions");
   const [closeAllOpen, setCloseAllOpen] = useState(false);
   const positions = useQuery({ queryKey: ["positions"], queryFn: api.positions, refetchInterval: REFRESH_MS });
@@ -232,6 +235,7 @@ function PositionsOrders() {
 }
 
 function PipelineStrip() {
+  const { regimeSymbol } = usePrefs().prefs;
   const qc = useQueryClient();
   const summary = useQuery({ queryKey: ["summary"], queryFn: () => api.summary() });
   const research = useQuery({ queryKey: ["researchRuns"], queryFn: api.researchRuns });
@@ -248,7 +252,7 @@ function PipelineStrip() {
   async function run() {
     setError(null);
     try {
-      setJob(await api.runPipeline({ as_of: asOf, tickers: [], regime_symbol: "SPY" }));
+      setJob(await api.runPipeline({ as_of: asOf, tickers: [], regime_symbol: regimeSymbol }));
       setRunning(true);
       setRunning(true);
     } catch (e) {

@@ -164,3 +164,9 @@ def get_broker() -> ReadOnlyBroker:
         load_dotenv(REPO_ROOT / ".env")
         _broker = ReadOnlyBroker()
     return _broker
+
+
+def reset() -> None:
+    """Forget the shared broker, so the next read builds a client from the current keys."""
+    global _broker
+    _broker = None

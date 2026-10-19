@@ -17,6 +17,22 @@ def data_home() -> Path:
     return Path(os.environ.get(HOME_ENV) or Path.home() / ".tradingagents")
 
 
+def settings_path() -> Path:
+    """Shared settings (automation, trading window): TRADINGAGENTS_SETTINGS_PATH, else data_home()/settings.json."""
+    override = os.environ.get("TRADINGAGENTS_SETTINGS_PATH")
+    return Path(override) if override else data_home() / "settings.json"
+
+
+def env_path() -> Path:
+    """The .env the scripts and research runs read (BATS_ENV_PATH lets tests use a temp file)."""
+    override = os.environ.get("BATS_ENV_PATH")
+    return Path(override) if override else REPO_ROOT / ".env"
+
+
+def tickets_dir() -> Path:
+    return data_home() / "tickets"
+
+
 def baskets_dir() -> Path:
     return data_home() / "baskets"
 

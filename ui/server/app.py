@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import asynccontextmanager
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -9,18 +12,35 @@ from fastapi.staticfiles import StaticFiles
 
 from ui.server import paths
 from ui.server.routes import broker, jobs, pipeline, research
+from ui.server.routes import settings as settings_routes
+from ui.server.scheduler import scheduler
 
 # The same .env the scripts read, so TRADINGAGENTS_RESULTS_DIR and the paper keys are visible here.
 load_dotenv(paths.REPO_ROOT / ".env")
 
-app = FastAPI(title="TradingAgents local UI", docs_url="/api/docs", redoc_url=None, openapi_url="/api/openapi.json")
-for module in (pipeline, research, jobs, broker):
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # The scheduler runs while the server runs; BATS_SCHEDULER=0 turns it off.
+    if os.environ.get("BATS_SCHEDULER", "1") != "0":
+        scheduler.start_thread()
+    yield
+    scheduler.stop_thread()
+
+
+app = FastAPI(title="BATS local UI", docs_url="/api/docs", redoc_url=None, openapi_url="/api/openapi.json",
+              lifespan=lifespan)
+for module in (pipeline, research, jobs, broker, settings_routes):
     app.include_router(module.router)
 
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True, "data_home": str(paths.data_home()), "orders_enabled": False}
+    status = scheduler.status()
+    # orders_enabled: only the scheduler's paper auto-send can send orders; no route can.
+    return {"ok": True, "data_home": str(paths.data_home()), "orders_enabled": status["auto_send_enabled"],
+            "scheduler_running": status["running"]}
 
 
 if paths.WEB_DIST.is_dir():

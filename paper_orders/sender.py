@@ -32,6 +32,8 @@ Each entry carries a client order ID, ``pt-<as_of>-<SYMBOL>-<buy|sell>``, and
 each exit ``pt-<as_of>-<SYMBOL>-exit``. Before sending either, the paper
 account is asked for that ID; if an order already has it, its status is printed
 and nothing is sent, so a second run never double-sends.
+A --send outside the operator's trading window (``paper_orders.trade_window``, set on the UI's Settings
+page) sends nothing; with no window saved, nothing is gated. A dry run is allowed at any time.
 The ticket files, scans, router and bots are not touched.
 """
 
@@ -44,7 +46,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +60,7 @@ from dotenv import load_dotenv
 from extensions.market_data.alpaca_bars import API_KEY_ENV, PAPER_KEY_PREFIX, SECRET_KEY_ENV, validate_ticker
 from extensions.status.daily_status import LONG, SHORT, SIDE
 from extensions.status.paper_tickets import TICKET_VERSION, default_ticket_dir, stop_for_fill
+from paper_orders.trade_window import SettingsError, load_window
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PAPER_URL = BaseURL.TRADING_PAPER.value
@@ -422,7 +425,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
-         make_client: Callable[[Mapping[str, str]], Any] = paper_client) -> int:
+         make_client: Callable[[Mapping[str, str]], Any] = paper_client, now: datetime | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         as_of = date.fromisoformat(args.as_of)
@@ -443,6 +446,16 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
     if not args.send:
         print("dry run: nothing sent (add --send to send to Alpaca paper)")
         return EXIT_OK
+
+    # The operator's trading window (Settings page): a --send outside it sends nothing.
+    try:
+        window = load_window()
+    except SettingsError as exc:
+        print(f"error: {exc}; nothing sent", file=sys.stderr)
+        return EXIT_BAD_INPUT
+    if window is not None and not window.allows(now or datetime.now(UTC)):
+        print(f"error: outside the trading window ({window.describe()}); nothing sent", file=sys.stderr)
+        return EXIT_BAD_INPUT
 
     if env is None:
         load_dotenv(REPO_ROOT / ".env")

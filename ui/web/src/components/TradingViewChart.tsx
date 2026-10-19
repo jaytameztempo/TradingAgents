@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { usePrefs } from "../prefs";
 
 // TradingView's free embeddable Advanced Chart. The script and market data come
 // from TradingView; the only thing sent to them is the symbol being charted.
@@ -14,8 +15,11 @@ function prefersDark(): boolean {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false;
 }
 
-export function TradingViewChart({ symbol, interval = "D" }: { symbol: string; interval?: string }) {
+export function TradingViewChart({ symbol, interval }: { symbol: string; interval?: string }) {
   const ref = useRef<HTMLDivElement>(null);
+  const { prefs } = usePrefs();
+  const chartInterval = interval ?? prefs.chartInterval;
+  const style = prefs.chartStyle;
 
   useEffect(() => {
     const host = ref.current;
@@ -39,10 +43,10 @@ export function TradingViewChart({ symbol, interval = "D" }: { symbol: string; i
         width: Math.floor(width),
         height,
         symbol,
-        interval,
+        interval: chartInterval,
         timezone: "America/New_York",
         theme: prefersDark() ? "dark" : "light",
-        style: "1",
+        style,
         locale: "en",
         withdateranges: true,
         allow_symbol_change: true,
@@ -62,7 +66,7 @@ export function TradingViewChart({ symbol, interval = "D" }: { symbol: string; i
       observer.disconnect();
       host.innerHTML = "";
     };
-  }, [symbol, interval]);
+  }, [symbol, chartInterval, style]);
 
   return <div ref={ref} className="tradingview-widget-container tv-chart" />;
 }

@@ -39,6 +39,8 @@ def _own_file_locations():
     os.environ["TRADINGAGENTS_RESULTS_DIR"] = os.path.join(home, "logs")
     os.environ["TRADINGAGENTS_CACHE_DIR"] = os.path.join(home, "cache")
     os.environ["TRADINGAGENTS_MEMORY_LOG_PATH"] = os.path.join(home, "memory", "trading_memory.md")
+    # No settings file here: the paper sender's trading window is off unless a test writes one.
+    os.environ["TRADINGAGENTS_SETTINGS_PATH"] = os.path.join(home, "settings.json")
 
 
 _own_file_locations()

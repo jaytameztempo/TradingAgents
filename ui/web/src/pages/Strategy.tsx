@@ -5,6 +5,7 @@ import { Card, Empty, ErrorBox, JobLog, RegimeBadge } from "../components/ui";
 import { dateTime, num } from "../format";
 import { useJob } from "../useJob";
 import { Ticker, TickerChips } from "../components/Ticker";
+import { usePrefs } from "../prefs";
 
 type Bot = "up" | "down" | "side";
 const BOT_FOR_LABEL: Record<string, Bot> = { UP: "up", DOWN: "down", SIDE: "side" };
@@ -39,7 +40,7 @@ function RegimeCard() {
   const list = regimes.data ?? [];
   const current = list.find((r) => r.file === file) ?? list[0];
   const [asOf, setAsOf] = useState(defaultAsOf());
-  const [symbol, setSymbol] = useState("SPY");
+  const [symbol, setSymbol] = useState(usePrefs().prefs.regimeSymbol);
   const runner = useJob();
   const r: Regime | undefined = current?.data;
 

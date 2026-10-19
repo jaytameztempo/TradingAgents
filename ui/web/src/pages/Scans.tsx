@@ -5,6 +5,7 @@ import { Card, Column, DataTable, Empty, ErrorBox, JobLog, Tabs } from "../compo
 import { dateTime, num } from "../format";
 import { useJob } from "../useJob";
 import { Ticker } from "../components/Ticker";
+import { usePrefs } from "../prefs";
 
 type Kind = "up" | "down" | "long" | "short";
 const KIND_LABEL: Record<Kind, string> = {
@@ -29,8 +30,9 @@ const USES_FINANCIALS: ScanKind[] = ["all", "sideways", "long_side", "short_side
 
 export default function Scans() {
   const [asOf, setAsOf] = useState(defaultAsOf());
-  const [which, setWhich] = useState<ScanKind>("all");
-  const [tickerText, setTickerText] = useState("");
+  const { prefs } = usePrefs();
+  const [which, setWhich] = useState<ScanKind>(prefs.defaultScan);
+  const [tickerText, setTickerText] = useState(prefs.defaultTickers);
   const runner = useJob();
 
   return (

@@ -33,7 +33,14 @@ SCRIPTS = frozenset({
     "run_up_bot",
     "run_down_bot",
     "run_research",
+    "run_daily",  # the 13-step daily SIDE pipeline; it writes paper tickets but never sends an order
 })
+
+# The paper order sender. Only the in-app scheduler starts it (ui/server/scheduler.py), and only when
+# auto-send is switched on in Settings; no HTTP route can. The sender itself checks the trading window,
+# paper keys and the paper URL, and never sends a client order ID twice.
+SENDER = "paper_orders_sender"
+SCHEDULER_ONLY = {SENDER: "paper_orders.sender"}
 
 # Exit codes shared by the extension scripts.
 EXIT_MEANINGS = {0: "ok", 1: "failed", 2: "bad input", 3: "regime mismatch: bot blocked"}
@@ -55,12 +62,16 @@ class Step:
     exit_code: int | None = None
 
     def __post_init__(self) -> None:
-        if self.script not in SCRIPTS:
+        if self.script not in SCRIPTS and self.script not in SCHEDULER_ONLY:
             raise ValueError(f"script not allowed: {self.script}")
 
     @property
+    def module(self) -> str:
+        return SCHEDULER_ONLY.get(self.script) or f"extensions.scripts.{self.script}"
+
+    @property
     def command(self) -> list[str]:
-        return [sys.executable, "-m", f"extensions.scripts.{self.script}", *self.args]
+        return [sys.executable, "-m", self.module, *self.args]
 
 
 @dataclass
@@ -124,7 +135,7 @@ class JobRunner:
         env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
         code = 0
         for step in job.steps:
-            job.lines.append(f"$ python -m extensions.scripts.{step.script} {' '.join(step.args)}")
+            job.lines.append(f"$ python -m {step.module} {' '.join(step.args)}")
             try:
                 proc = subprocess.Popen(
                     step.command, cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE,
