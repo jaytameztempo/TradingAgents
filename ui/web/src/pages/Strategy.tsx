@@ -6,6 +6,7 @@ import { dateTime, num } from "../format";
 import { useJob } from "../useJob";
 import { Ticker, TickerChips } from "../components/Ticker";
 import { usePrefs } from "../prefs";
+import { StrategyQueue } from "../components/Queues";
 
 type Bot = "up" | "down" | "side";
 const BOT_FOR_LABEL: Record<string, Bot> = { UP: "up", DOWN: "down", SIDE: "side" };
@@ -19,6 +20,7 @@ export default function Strategy() {
         <RegimeCard />
         <RouteCard />
       </div>
+      <StrategyQueue />
       <BotCard />
     </>
   );

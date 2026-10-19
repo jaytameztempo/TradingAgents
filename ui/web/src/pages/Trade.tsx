@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api, Plan } from "../api";
 import { Card, Empty, ErrorBox, RegimeBadge } from "../components/ui";
 import { Ticker } from "../components/Ticker";
+import { TradeQueue } from "../components/Queues";
 
 // Read-only plan review. Nothing on this page talks to the broker.
 const CHECKLIST = [
@@ -37,8 +38,9 @@ export default function Trade() {
       <div className="page-head"><h1>Trade</h1></div>
       <div className="banner" role="note">
         <span className="badge badge-paper">PAPER</span>
-        <span>🔒 Paper keys only — order placement is disabled in this build. This page reviews plans; it sends nothing to Alpaca.</span>
+        <span>🔒 Paper keys only. Nothing on this page sends an order; paper auto-send in Settings is the only order path.</span>
       </div>
+      <TradeQueue />
       <Card title="Plans">
         <ErrorBox error={plans.error} />
         {!plans.data?.length ? <Empty>No plans yet. Run a playbook on the Strategy page.</Empty> : (

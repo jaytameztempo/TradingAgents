@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from ui.server import paths
-from ui.server.routes import broker, jobs, pipeline, research
+from ui.server.routes import broker, jobs, pipeline, queues, research
 from ui.server.routes import settings as settings_routes
 from ui.server.scheduler import scheduler
 
@@ -31,7 +31,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="BATS local UI", docs_url="/api/docs", redoc_url=None, openapi_url="/api/openapi.json",
               lifespan=lifespan)
-for module in (pipeline, research, jobs, broker, settings_routes):
+for module in (pipeline, research, jobs, broker, settings_routes, queues):
     app.include_router(module.router)
 
 

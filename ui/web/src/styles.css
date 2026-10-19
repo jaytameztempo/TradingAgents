@@ -253,3 +253,20 @@ label.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; 
 .toggle input:focus-visible + .toggle-track { outline: 2px solid var(--accent); outline-offset: 2px; }
 .event-log { margin: 8px 0 0; padding-left: 18px; font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
 .sidebar-foot a.badge { text-decoration: none; }
+
+/* Scans "Send to" */
+.list-row { display: flex; align-items: center; gap: 6px; border-radius: 6px; border: 1px solid transparent; }
+.list-row:hover { background: var(--surface-2); }
+.list-row.active { background: var(--surface-2); border-color: var(--border); }
+.list-row.active .list-item { font-weight: 600; }
+.list-row .list-item { flex: 1; min-width: 0; border: 0; background: none; }
+.list-row .list-item:hover { background: none; }
+.list-row .send-to { padding-right: 6px; }
+.send-to { display: inline-flex; align-items: center; gap: 6px; position: relative; }
+.send-to-select { font-size: 12px; padding: 3px 6px; color: var(--text-2); }
+/* Confirmation pops up in the corner so it never squeezes a row. */
+.send-to-note {
+  position: fixed; right: 20px; bottom: 20px; z-index: 50; font-size: 13px; white-space: nowrap;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
+  box-shadow: 0 4px 16px rgb(0 0 0 / .15);
+}

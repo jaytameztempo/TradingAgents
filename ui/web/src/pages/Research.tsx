@@ -5,6 +5,7 @@ import { Card, Dialog, Empty, ErrorBox, JobLog, Markdown, Tabs } from "../compon
 import { dateTime } from "../format";
 import { useJob } from "../useJob";
 import { Ticker } from "../components/Ticker";
+import { ResearchQueue } from "../components/Queues";
 
 const ANALYSTS = ["market", "social", "news", "fundamentals"] as const;
 
@@ -12,6 +13,7 @@ export default function Research() {
   return (
     <>
       <div className="page-head"><h1>Research</h1></div>
+      <ResearchQueue />
       <RunCard />
       <RunsBrowser />
       <ReportsBrowser />

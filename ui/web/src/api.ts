@@ -37,6 +37,31 @@ const post = <T>(path: string, body: unknown) =>
 const put = <T>(path: string, body: unknown) =>
   request<T>(path, { method: "PUT", body: JSON.stringify(body) });
 
+const del = <T>(path: string) => request<T>(path, { method: "DELETE" });
+
+// --- queues (Scans page "Send to") ------------------------------------------------------
+
+export type ScanSource = "up" | "down" | "long" | "short";
+export type QueueName = "research" | "strategy" | "trade";
+
+export interface QueueItem {
+  id: string;
+  ticker: string;
+  as_of: string | null;
+  kind: ScanSource;
+  scan: string;
+  scan_file: string;
+  side: "long" | "short";
+  needs_regime: string;
+  metrics: Record<string, number | null>;
+  added_at: string;
+  route_status?: "ALLOWED" | "BLOCKED" | "NOT_ROUTED" | "NO_ROUTE";
+  regime_label?: string | null;
+  regime_source?: string | null;
+  verdict?: "ALLOWED" | "BLOCKED" | "NO_REGIME";
+  reason?: string;
+}
+
 // --- settings ------------------------------------------------------------------------
 
 export interface Automation {
@@ -311,6 +336,11 @@ export const api = {
   dates: () => get<string[]>("/api/dates"),
   summary: (asOf?: string) => get<Summary>(`/api/summary${asOf ? `?as_of=${asOf}` : ""}`),
   baskets: (kind?: "up" | "down") => get<Artifact<Basket>[]>(`/api/baskets${kind ? `?kind=${kind}` : ""}`),
+  queues: () => get<Record<QueueName, QueueItem[]>>("/api/queues"),
+  sendTo: (queue: QueueName, body: { kind: ScanSource; file: string; tickers: string[] }) =>
+    post<{ queue: QueueName; added: string[]; already_queued: string[] }>(`/api/queues/${queue}`, body),
+  removeQueued: (queue: QueueName, id: string) => del<{ removed: boolean }>(`/api/queues/${queue}/${id}`),
+  trashScan: (body: { kind: ScanSource; file: string; ticker?: string }) => post<unknown>("/api/scans/trash", body),
   channelScans: (side: "long" | "short") => get<Artifact<ChannelReport>[]>(`/api/channel-scans?side=${side}`),
   regimes: () => get<Artifact<Regime>[]>("/api/regimes"),
   routes: () => get<Artifact<Route>[]>("/api/routes"),

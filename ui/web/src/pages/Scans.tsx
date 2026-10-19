@@ -1,6 +1,7 @@
 import { ReactNode, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { api, Artifact, Basket, BasketMember, ChannelCall, ChannelReport, defaultAsOf, parseTickers, ScanKind } from "../api";
+import { api, Artifact, Basket, BasketMember, ChannelCall, ChannelReport, defaultAsOf, parseTickers, ScanKind, ScanSource } from "../api";
+import { SendTo } from "../components/SendTo";
 import { Card, Column, DataTable, Empty, ErrorBox, JobLog, Tabs } from "../components/ui";
 import { dateTime, num } from "../format";
 import { useJob } from "../useJob";
@@ -91,11 +92,12 @@ function BasketBrowser() {
 }
 
 /** A list of reports on the left, the selected one on the right. */
-function ReportList<T>({ items, render, count, empty }: {
+function ReportList<T>({ items, render, count, empty, kind }: {
   items: Artifact<T>[];
   render: (item: Artifact<T>) => ReactNode;
   count: (data: T) => number;
   empty: ReactNode;
+  kind: ScanSource;
 }) {
   const [selected, setSelected] = useState<string | null>(null);
   const current = items.find((b) => b.file === selected) ?? items[0];
@@ -104,10 +106,14 @@ function ReportList<T>({ items, render, count, empty }: {
     <div className="split">
       <div className="list">
         {items.map((b) => (
-          <button key={b.file} className={`list-item ${b === current ? "active" : ""}`} onClick={() => setSelected(b.file)}>
-            <span>{b.as_of}</span>
-            <span className="muted">{b.error || !b.data ? "unreadable" : `${count(b.data)} passed`}</span>
-          </button>
+          <div key={b.file} className={`list-row ${b === current ? "active" : ""}`}>
+            <button className="list-item" onClick={() => setSelected(b.file)} title={b.file}>
+              <span>{b.as_of}</span>
+              <span className="muted">{b.error || !b.data ? "unreadable" : `${count(b.data)} passed`}</span>
+            </button>
+            <SendTo kind={kind} file={b.file} count={b.data ? count(b.data) : undefined}
+                    onTrashed={() => b.file === current?.file && setSelected(null)} />
+          </div>
         ))}
       </div>
       {current && render(current)}
@@ -120,8 +126,8 @@ function TrendBaskets({ kind }: { kind: "up" | "down" }) {
   return (
     <>
       <ErrorBox error={baskets.error} />
-      <ReportList items={baskets.data ?? []} count={(b) => b.members.length}
-                  render={(b) => <BasketDetail basket={b} />} empty="No baskets yet. Run a scan above." />
+      <ReportList kind={kind} items={baskets.data ?? []} count={(b) => b.members.length}
+                  render={(b) => <BasketDetail basket={b} kind={kind} />} empty="No baskets yet. Run a scan above." />
     </>
   );
 }
@@ -131,7 +137,7 @@ function ChannelReports({ side }: { side: "long" | "short" }) {
   return (
     <>
       <ErrorBox error={reports.error} />
-      <ReportList items={reports.data ?? []} count={(r) => r.members.length}
+      <ReportList kind={side} items={reports.data ?? []} count={(r) => r.members.length}
                   render={(r) => <ChannelDetail report={r} side={side} />}
                   empty="No sideways channel reports yet. Run the financials step, then this scan." />
     </>
@@ -170,6 +176,7 @@ function ChannelDetail({ report, side }: { report: Artifact<ChannelReport>; side
       ),
       sortValue: (m) => m.call?.quality_passed,
     },
+    { key: "send", label: "", align: "right", render: (m) => <SendTo kind={side} file={report.file} ticker={m.ticker} /> },
   ];
   const stages = Object.entries(r.stage_counts);
   const reasons = Object.entries(r.reason_counts).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
@@ -210,7 +217,7 @@ function ChannelDetail({ report, side }: { report: Artifact<ChannelReport>; side
   );
 }
 
-function BasketDetail({ basket }: { basket: Artifact<Basket> }) {
+function BasketDetail({ basket, kind }: { basket: Artifact<Basket>; kind: "up" | "down" }) {
   if (basket.error || !basket.data) return <ErrorBox error={basket.error ?? "unreadable basket"} />;
   const b = basket.data;
   const memberCols: Column<BasketMember>[] = [
@@ -221,6 +228,7 @@ function BasketDetail({ basket }: { basket: Artifact<Basket> }) {
     { key: "sma200", label: "SMA 200", align: "right", render: (m) => num(m.metrics.sma_200), sortValue: (m) => m.metrics.sma_200 as number },
     { key: "bars", label: "Bars", align: "right", render: (m) => num(m.metrics.bars, 0) },
     { key: "last", label: "Last bar", render: (m) => String(m.metrics.last_bar_date ?? "—") },
+    { key: "send", label: "", align: "right", render: (m) => <SendTo kind={kind} file={basket.file} ticker={m.ticker} /> },
   ];
   return (
     <div className="grid">
