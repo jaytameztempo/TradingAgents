@@ -192,10 +192,13 @@ function AutomationCard({ data }: { data: SettingsData }) {
         </select>
       </Field>
       <Field label="Days"><DayPicker value={a.days} onChange={(days) => setA({ ...a, days })} /></Field>
-      <Field label="Times (New York)" hint="After 4:15 PM on a weekday a run uses that day's bars; earlier, the previous weekday's.">
+      <Field label="Times (New York)"
+             hint="Each run scans the last open session with complete bars: after 4:15 PM on a trading day, that day; earlier, or on Sat, Sun or a market holiday, the last trading day before it (Friday for a weekend run, Thursday if Friday was a holiday).">
         <TimeList value={a.times} onChange={(times) => setA({ ...a, times })} label="scan time" />
       </Field>
-      <Field label="Next run">{a.enabled ? nyTime(s.next_scan) : <span className="muted">Off</span>}</Field>
+      <Field label="Next run">
+        {a.enabled ? <>{nyTime(s.next_scan)}{s.next_scan_as_of && <span className="muted"> · scans the {s.next_scan_as_of} session</span>}</> : <span className="muted">Off</span>}
+      </Field>
       <SaveRow save={save} onSave={() => save.run(() => api.saveAutomation(a))} />
       <EventLog events={s.events.filter((e) => e.kind !== "send")} />
     </Card>

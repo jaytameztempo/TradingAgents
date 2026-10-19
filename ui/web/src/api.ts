@@ -90,6 +90,7 @@ export interface SchedulerStatus {
   running: boolean;
   now: string;
   next_scan: string | null;
+  next_scan_as_of: string | null;
   next_send: string | null;
   auto_send_enabled: boolean;
   window_saved: boolean;

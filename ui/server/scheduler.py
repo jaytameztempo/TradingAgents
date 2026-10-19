@@ -4,8 +4,9 @@ It runs on a background thread while the UI server runs (``python -m ui.server``
 app is closed, and a time missed while it was closed is not made up later. Every 20 seconds it checks the
 settings saved on the Settings page, in New York time:
 
-- recurring scans: on each chosen day, at each chosen time, it starts either the four scans or run_daily
-  (which writes paper tickets but sends nothing).
+- recurring scans: on each chosen day (weekends included), at each chosen time, it starts either the four
+  scans or run_daily (which writes paper tickets but sends nothing), dated the last open session whose bars
+  are complete: Friday for a weekend run, the session before a market holiday (see scan_as_of).
 - auto-send: only when switched on, on each trading day, at each send time that is inside a session, it
   starts ``python -m paper_orders.sender --as-of <date> --send`` for the newest ticket file dated before
   today (at most MAX_TICKET_AGE_DAYS old). The sender re-checks the window, refuses non-paper keys, and
@@ -25,7 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
 from paper_orders.trade_window import MARKET_TZ, WEEKDAYS, SettingsError, TradeWindow, parse_hhmm
-from ui.server import jobs, paths, settings
+from ui.server import jobs, market_calendar, paths, settings
 from ui.server.routes import common
 
 TICK_SECONDS = 20
@@ -46,18 +47,16 @@ class Event:
     job_id: str | None = None
 
 
-def previous_weekday(d: date) -> date:
-    d -= timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
-
-
 def scan_as_of(local: datetime) -> date:
-    """After the close (16:15 New York) on a weekday, today's bars are complete; otherwise the last weekday's."""
-    if local.weekday() < 5 and local.time() >= SCAN_CLOSE_CUTOFF:
+    """The last open session whose daily bars are complete.
+
+    On a trading day after the close (16:15 New York), that is today. Before the close, or on a Saturday,
+    Sunday or market holiday, it is the last trading day before today: Friday for a weekend run, or
+    Thursday when that Friday was a holiday such as Good Friday.
+    """
+    if market_calendar.is_trading_day(local.date()) and local.time() >= SCAN_CLOSE_CUTOFF:
         return local.date()
-    return previous_weekday(local.date())
+    return market_calendar.previous_trading_day(local.date())
 
 
 def newest_ticket_date(today: date) -> date | None:
@@ -224,10 +223,12 @@ class Scheduler:
         except SettingsError:
             trading = None
         auto_send = (trading or {}).get("auto_send") or {}
+        next_scan = self._next(auto["days"], auto["times"], now) if auto["enabled"] else None
         return {
             "running": self.running,
             "now": now.astimezone(MARKET_TZ).isoformat(timespec="seconds"),
-            "next_scan": self._next(auto["days"], auto["times"], now) if auto["enabled"] else None,
+            "next_scan": next_scan,
+            "next_scan_as_of": scan_as_of(datetime.fromisoformat(next_scan)).isoformat() if next_scan else None,
             "next_send": (self._next(trading.get("days", []), auto_send.get("times", []), now)
                           if trading and auto_send.get("enabled") else None),
             "auto_send_enabled": bool(trading and auto_send.get("enabled")),

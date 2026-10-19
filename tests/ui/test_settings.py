@@ -173,7 +173,7 @@ def test_a_recurring_scan_fires_once_in_its_slot(home):
 
 
 @pytest.mark.unit
-def test_morning_scans_use_the_previous_weekday():
+def test_morning_scans_use_the_previous_trading_day():
     monday_morning = datetime(2026, 10, 12, 8, 0)
     assert scheduler_mod.scan_as_of(monday_morning) == date(2026, 10, 9)
 
@@ -217,3 +217,54 @@ def test_no_route_can_start_the_sender():
         text = path.read_text(encoding="utf-8")
         assert not re.search(r"SENDER|paper_orders\.sender|paper_orders_sender|SCHEDULER_ONLY", text), path.name
     assert jobs.SENDER not in jobs.SCRIPTS
+
+
+# --- weekend and holiday runs -----------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("year", "expected"), [
+    (2025, ["2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26", "2025-06-19", "2025-07-04",
+            "2025-09-01", "2025-11-27", "2025-12-25"]),
+    (2026, ["2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03",
+            "2026-09-07", "2026-11-26", "2026-12-25"]),
+    (2027, ["2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18", "2027-07-05",
+            "2027-09-06", "2027-11-25", "2027-12-24"]),
+])
+def test_market_holidays_match_the_nyse_calendar(year, expected):
+    from ui.server import market_calendar
+
+    assert sorted(d.isoformat() for d in market_calendar.holidays(year)) == expected
+
+
+@pytest.mark.unit
+def test_a_saturday_new_years_day_is_not_made_up_on_friday():
+    from ui.server import market_calendar
+
+    assert market_calendar.is_trading_day(date(2021, 12, 31))  # Jan 1 2022 was a Saturday
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("local", "as_of"), [
+    (datetime(2026, 10, 17, 10, 0), date(2026, 10, 16)),  # Saturday -> Friday
+    (datetime(2026, 10, 18, 20, 0), date(2026, 10, 16)),  # Sunday evening -> Friday
+    (datetime(2026, 4, 4, 9, 0), date(2026, 4, 2)),  # Saturday after Good Friday -> Thursday
+    (datetime(2026, 4, 3, 17, 0), date(2026, 4, 2)),  # Good Friday after 16:15: no session that day
+    (datetime(2026, 9, 8, 9, 0), date(2026, 9, 4)),  # Tuesday morning after Labor Day -> Friday
+    (datetime(2026, 10, 16, 16, 30), date(2026, 10, 16)),  # Friday after the close -> Friday
+])
+def test_scans_use_the_last_open_session(local, as_of):
+    assert scheduler_mod.scan_as_of(local) == as_of
+
+
+@pytest.mark.unit
+def test_a_weekend_scan_fires_and_scans_friday(home):
+    _save(automation={"enabled": True, "days": ["sat", "sun"], "times": ["10:00"], "run": "scans"})
+    sched, started = _scheduler(Clock(datetime(2026, 10, 17, 14, 1, tzinfo=UTC)))  # Sat 10:01 New York
+    sched.tick()
+    assert len(started) == 1
+    _, steps, _ = started[0]
+    assert all(step.args[:2] == ["--as-of", "2026-10-16"] for step in steps)
+    assert [s.script for s in steps] == ["run_upward_trend_scan", "run_breakdown_scan",
+                                         "run_scanbot_long_channel", "run_scanbot_short_channel"]
+    status = sched.status()
+    assert status["next_scan"].startswith("2026-10-18T10:00") and status["next_scan_as_of"] == "2026-10-16"
