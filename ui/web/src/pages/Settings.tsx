@@ -256,7 +256,7 @@ function TradingCard({ data }: { data: SettingsData }) {
         </div>
       )}
       <Field label="Trading days"><DayPicker value={t.days} onChange={(days) => setT({ ...t, days })} /></Field>
-      <Field label="Sessions (New York)" hint="paper_orders.sender refuses a --send outside these windows. Dry runs are always allowed.">
+      <Field label="Sessions (New York)" hint="paper_orders.sender refuses a --send outside these windows, on NYSE market holidays, and after the 1:00 PM close on early-close days (day after Thanksgiving, July 3, Dec 24). Dry runs are always allowed.">
         <div className="grid" style={{ gap: 8 }}>
           {t.sessions.map((x, i) => (
             <div key={i} className="row">
@@ -274,7 +274,7 @@ function TradingCard({ data }: { data: SettingsData }) {
         <Toggle checked={t.auto_send.enabled} label={t.auto_send.enabled ? "On — sends paper orders on schedule" : "Off"}
                 onChange={(enabled) => setT({ ...t, auto_send: { ...t.auto_send, enabled } })} />
       </Field>
-      <Field label="Send times (New York)" hint="Each must be inside a session. At each time the newest ticket file dated before today (at most 5 days old) is sent with paper_orders.sender --send. A later run only places exits for entries that filled since; nothing is sent twice.">
+      <Field label="Send times (New York)" hint="Each must be inside a session. Market holidays are skipped, and on early-close days only times before 1:00 PM run. At each time the newest ticket file dated before today (at most 5 days old) is sent with paper_orders.sender --send. A later run only places exits for entries that filled since; nothing is sent twice.">
         <TimeList value={t.auto_send.times} onChange={(times) => setT({ ...t, auto_send: { ...t.auto_send, times } })} label="send time" />
       </Field>
       <Field label="Next send">{s.auto_send_enabled ? nyTime(s.next_send) : <span className="muted">Off</span>}</Field>

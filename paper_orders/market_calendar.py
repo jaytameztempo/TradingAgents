@@ -3,13 +3,18 @@
 Full-day holidays: New Year's Day, Martin Luther King Jr. Day, Washington's Birthday, Good Friday,
 Memorial Day, Juneteenth (from 2022), Independence Day, Labor Day, Thanksgiving and Christmas. A holiday on
 a Saturday is observed the Friday before and one on a Sunday the Monday after, except New Year's Day on a
-Saturday, which is not made up (NYSE Rule 7.2). Early closes are trading days. One-off closures (a national
-day of mourning, a storm) are not predictable from rules and are not here.
+Saturday, which is not made up (NYSE Rule 7.2).
+
+Early closes (1:00 PM New York) are trading days: the day after Thanksgiving, and July 3 and December 24
+when they are trading days. One-off closures (a national day of mourning, a storm) are not predictable
+from rules and are not here.
+
+Standard library only, so paper_orders.trade_window (and through it the sender) and the UI share it.
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 from functools import cache
 
 
@@ -76,6 +81,20 @@ def previous_trading_day(d: date) -> date:
     while not is_trading_day(d):
         d -= timedelta(days=1)
     return d
+
+
+EARLY_CLOSE = time(13, 0)
+
+
+def early_close(d: date) -> time | None:
+    """The 1:00 PM close on an early-close trading day, else None."""
+    if not is_trading_day(d):
+        return None
+    if d == _nth_weekday(d.year, 11, 3, 4) + timedelta(days=1):  # day after Thanksgiving
+        return EARLY_CLOSE
+    if (d.month, d.day) in ((7, 3), (12, 24)):
+        return EARLY_CLOSE
+    return None
 
 
 def holiday_name(d: date) -> str | None:

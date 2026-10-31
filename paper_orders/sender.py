@@ -453,8 +453,9 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
     except SettingsError as exc:
         print(f"error: {exc}; nothing sent", file=sys.stderr)
         return EXIT_BAD_INPUT
-    if window is not None and not window.allows(now or datetime.now(UTC)):
-        print(f"error: outside the trading window ({window.describe()}); nothing sent", file=sys.stderr)
+    closed = window.closed_reason(now or datetime.now(UTC)) if window is not None else None
+    if closed:
+        print(f"error: outside the trading window: {closed} ({window.describe()}); nothing sent", file=sys.stderr)
         return EXIT_BAD_INPUT
 
     if env is None:

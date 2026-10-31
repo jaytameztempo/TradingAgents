@@ -7,7 +7,8 @@ settings saved on the Settings page, in New York time:
 - recurring scans: on each chosen day (weekends included), at each chosen time, it starts either the four
   scans or run_daily (which writes paper tickets but sends nothing), dated the last open session whose bars
   are complete: Friday for a weekend run, the session before a market holiday (see scan_as_of).
-- auto-send: only when switched on, on each trading day, at each send time that is inside a session, it
+- auto-send: only when switched on, on each trading day that is not a market holiday, at each send time
+  inside a session and before any 1:00 PM early close, it
   starts ``python -m paper_orders.sender --as-of <date> --send`` for the newest ticket file dated before
   today (at most MAX_TICKET_AGE_DAYS old). The sender re-checks the window, refuses non-paper keys, and
   never sends a client order ID twice, so a repeat run only places exits for entries that filled since.
@@ -26,7 +27,8 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
 from paper_orders.trade_window import MARKET_TZ, WEEKDAYS, SettingsError, TradeWindow, parse_hhmm
-from ui.server import jobs, market_calendar, paths, settings
+from paper_orders import market_calendar
+from ui.server import jobs, paths, settings
 from ui.server.routes import common
 
 TICK_SECONDS = 20
@@ -164,10 +166,11 @@ class Scheduler:
                 key = f"send|{local.date()}|{t}"
                 if key not in self._fired and self._due(local, t):
                     self._fired.add(key)
-                    if window.allows(now):
+                    closed = window.closed_reason(now)
+                    if closed is None:
                         self._run_sender(local, t)
                     else:
-                        self._record("send", t, "skipped", "outside the trading window")
+                        self._record("send", t, "skipped", f"outside the trading window: {closed}")
                     changed = True
 
         if changed:
@@ -202,16 +205,17 @@ class Scheduler:
 
     # --- status for the Settings page -----------------------------------------
 
-    def _next(self, days, times, after: datetime) -> str | None:
+    def _next(self, days, times, after: datetime, window: TradeWindow | None = None) -> str | None:
+        """The next slot after `after`; with a window, only slots it allows (no holiday, no early-close tail)."""
         local = after.astimezone(MARKET_TZ)
-        for offset in range(8):
+        for offset in range(15):
             d = local.date() + timedelta(days=offset)
             if WEEKDAYS[d.weekday()] not in days:
                 continue
             for t in sorted(times):
                 at = parse_hhmm(t)
                 slot = MARKET_TZ.localize(datetime(d.year, d.month, d.day, at.hour, at.minute))
-                if slot > local:
+                if slot > local and (window is None or window.allows(slot)):
                     return slot.isoformat()
         return None
 
@@ -229,7 +233,8 @@ class Scheduler:
             "now": now.astimezone(MARKET_TZ).isoformat(timespec="seconds"),
             "next_scan": next_scan,
             "next_scan_as_of": scan_as_of(datetime.fromisoformat(next_scan)).isoformat() if next_scan else None,
-            "next_send": (self._next(trading.get("days", []), auto_send.get("times", []), now)
+            "next_send": (self._next(trading.get("days", []), auto_send.get("times", []), now,
+                                     TradeWindow.from_dict(trading))
                           if trading and auto_send.get("enabled") else None),
             "auto_send_enabled": bool(trading and auto_send.get("enabled")),
             "window_saved": trading is not None,

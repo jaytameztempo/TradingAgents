@@ -377,3 +377,15 @@ def test_a_dry_run_is_allowed_outside_the_window(tmp_path, monkeypatch):
     _window(tmp_path, monkeypatch)
     _write(tmp_path, "20261009T003216Z", _file())
     assert sender.main(["--as-of", "2026-09-30", "--ticket-dir", str(tmp_path)], now=SATURDAY) == sender.EXIT_OK
+
+
+@pytest.mark.unit
+def test_a_send_on_a_market_holiday_sends_nothing(tmp_path, monkeypatch, capsys):
+    _window(tmp_path, monkeypatch)
+    _write(tmp_path, "20261009T003216Z", _file())
+    client = FakeClient()
+    thanksgiving = datetime(2026, 11, 26, 15, 0, tzinfo=UTC)  # Thursday 10:00 New York
+    code = sender.main(["--as-of", "2026-09-30", "--ticket-dir", str(tmp_path), "--send"],
+                       env=PAPER_ENV, make_client=lambda env: client, now=thanksgiving)
+    assert code == sender.EXIT_BAD_INPUT and "market holiday" in capsys.readouterr().err
+    assert client.submitted == []

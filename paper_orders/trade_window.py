@@ -6,7 +6,8 @@ TRADINGAGENTS_SETTINGS_PATH), which the local UI's Settings page writes. ``paper
 so the sender behaves as it did before the window existed.
 
 Standard library and pytz only: importing this loads no Alpaca module, so the UI and the scheduler can read
-the window without loading Alpaca's trading client.
+the window without loading Alpaca's trading client. Market holidays and early closes come from
+``paper_orders.market_calendar``.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from datetime import datetime, time
 from pathlib import Path
 
 import pytz
+
+from paper_orders import market_calendar
 
 SETTINGS_PATH_ENV = "TRADINGAGENTS_SETTINGS_PATH"
 MARKET_TZ = pytz.timezone("America/New_York")
@@ -81,18 +84,34 @@ class TradeWindow:
             sessions.append((start, end))
         return cls(days, tuple(sorted(sessions)))
 
-    def allows(self, when: datetime) -> bool:
-        """True when `when` (any time zone) falls on an allowed New York weekday inside a session."""
+    def closed_reason(self, when: datetime) -> str | None:
+        """Why `when` (any time zone) is outside the window, or None when orders may be sent.
+
+        A market holiday is closed even on an allowed weekday, and on an early-close day (1:00 PM) every
+        session ends at the close.
+        """
         local = when.astimezone(MARKET_TZ)
+        day = local.date()
         if WEEKDAYS[local.weekday()] not in self.days:
-            return False
+            return f"{local:%A} is not a trading day in Settings"
+        if not market_calendar.is_trading_day(day):
+            return f"{day} is a market holiday"
         now = local.time().replace(second=0, microsecond=0)
-        return any(start <= now < end for start, end in self.sessions)
+        close = market_calendar.early_close(day)
+        if any(start <= now < (min(end, close) if close else end) for start, end in self.sessions):
+            return None
+        if close and any(start <= now < end for start, end in self.sessions):
+            return f"{day} is an early-close day; the market closes at {close:%H:%M}"
+        return f"{now:%H:%M} New York is outside the sessions"
+
+    def allows(self, when: datetime) -> bool:
+        """True on an allowed trading day, inside a session, before any early close."""
+        return self.closed_reason(when) is None
 
     def describe(self) -> str:
         days = ", ".join(d.capitalize() for d in self.days) or "no days"
         sessions = ", ".join(f"{a:%H:%M}-{b:%H:%M}" for a, b in self.sessions) or "no sessions"
-        return f"{days}; {sessions} New York time"
+        return f"{days}; {sessions} New York time; market holidays skipped, early closes at 13:00"
 
 
 def load_window(path: Path | None = None) -> TradeWindow | None:

@@ -2,7 +2,7 @@
 
 import json
 import re
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -231,14 +231,14 @@ def test_no_route_can_start_the_sender():
             "2027-09-06", "2027-11-25", "2027-12-24"]),
 ])
 def test_market_holidays_match_the_nyse_calendar(year, expected):
-    from ui.server import market_calendar
+    from paper_orders import market_calendar
 
     assert sorted(d.isoformat() for d in market_calendar.holidays(year)) == expected
 
 
 @pytest.mark.unit
 def test_a_saturday_new_years_day_is_not_made_up_on_friday():
-    from ui.server import market_calendar
+    from paper_orders import market_calendar
 
     assert market_calendar.is_trading_day(date(2021, 12, 31))  # Jan 1 2022 was a Saturday
 
@@ -268,3 +268,62 @@ def test_a_weekend_scan_fires_and_scans_friday(home):
                                          "run_scanbot_long_channel", "run_scanbot_short_channel"]
     status = sched.status()
     assert status["next_scan"].startswith("2026-10-18T10:00") and status["next_scan_as_of"] == "2026-10-16"
+
+
+# --- auto-send skips market holidays and early-close afternoons ------------------------------
+
+WINDOW = {"days": ["mon", "tue", "wed", "thu", "fri"], "sessions": [{"start": "09:35", "end": "15:55"}]}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("year", "expected"), [
+    (2025, ["2025-07-03", "2025-11-28", "2025-12-24"]),
+    (2026, ["2026-11-27", "2026-12-24"]),  # July 3 2026 is the observed Independence Day holiday
+])
+def test_early_closes_match_the_nyse_calendar(year, expected):
+    from paper_orders import market_calendar
+
+    days = [date(year, 1, 1) + timedelta(days=i) for i in range(366)]
+    got = [d.isoformat() for d in days if d.year == year and market_calendar.early_close(d)]
+    assert got == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("when", "reason"), [
+    (datetime(2026, 11, 26, 15, 0, tzinfo=UTC), "market holiday"),  # Thanksgiving, 10:00 New York
+    (datetime(2026, 11, 27, 19, 0, tzinfo=UTC), "early-close"),  # day after Thanksgiving, 14:00 New York
+    (datetime(2026, 11, 28, 15, 0, tzinfo=UTC), "not a trading day"),  # Saturday
+    (datetime(2026, 11, 25, 22, 0, tzinfo=UTC), "outside the sessions"),  # Wednesday 17:00 New York
+])
+def test_the_window_is_closed_on_holidays_and_after_early_closes(when, reason):
+    from paper_orders.trade_window import TradeWindow
+
+    assert reason in TradeWindow.from_dict(WINDOW).closed_reason(when)
+
+
+@pytest.mark.unit
+def test_the_window_is_open_before_an_early_close():
+    from paper_orders.trade_window import TradeWindow
+
+    assert TradeWindow.from_dict(WINDOW).allows(datetime(2026, 11, 27, 15, 0, tzinfo=UTC))  # 10:00 New York
+
+
+@pytest.mark.unit
+def test_auto_send_skips_thanksgiving_and_says_why(home):
+    tickets = home / "tickets"
+    tickets.mkdir()
+    (tickets / "paper_tickets_2026-11-25_20261126T000000Z.json").write_text("{}")
+    _save(trading={**WINDOW, "auto_send": {"enabled": True, "times": ["09:40"]}})
+    sched, started = _scheduler(Clock(datetime(2026, 11, 26, 14, 41, tzinfo=UTC)))  # Thanksgiving 09:41 New York
+    sched.tick()
+    assert started == []
+    event = sched.status()["events"][0]
+    assert event["outcome"] == "skipped" and "market holiday" in event["detail"]
+
+
+@pytest.mark.unit
+def test_next_send_skips_holidays_and_early_close_afternoons(home):
+    _save(trading={**WINDOW, "auto_send": {"enabled": True, "times": ["14:00"]}})
+    sched, _ = _scheduler(Clock(datetime(2026, 11, 25, 20, 0, tzinfo=UTC)))  # Wed 15:00 New York, after 14:00
+    # Thu is Thanksgiving, Fri closes at 13:00, the weekend is off: next is Monday.
+    assert sched.status()["next_send"].startswith("2026-11-30T14:00")
