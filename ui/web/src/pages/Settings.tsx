@@ -123,10 +123,9 @@ const INTERVALS: [string, string][] = [["1", "1 minute"], ["5", "5 minutes"], ["
   ["60", "1 hour"], ["240", "4 hours"], ["D", "1 day"], ["W", "1 week"]];
 const STYLES: [string, string][] = [["1", "Candles"], ["0", "Bars (OHLC)"], ["9", "Hollow candles"], ["8", "Heikin Ashi"],
   ["2", "Line"], ["3", "Area"]];
-const SCANS: [ScanKind, string][] = [["all", "All four scans"], ["both", "Both trend scans"], ["sideways", "Both sideways scans"],
-  ["up", "Upward trend momentum"], ["down", "Breakdown short candidates"], ["long_side", "Long sideways channel"],
-  ["short_side", "Short sideways channel"], ["cat_up", "Category: upward"], ["cat_down", "Category: downward"],
-  ["cat_side", "Category: sideways (long + short)"], ["cat_all", "Category: all three"]];
+const SCANS: [ScanKind, string][] = [["cat_all", "Category: all three"], ["cat_up", "Category: upward"],
+  ["cat_down", "Category: downward"], ["cat_side", "Category: sideways (long + short)"],
+  ["sideways", "Both sideways scans"], ["long_side", "Long sideways channel"], ["short_side", "Short sideways channel"]];
 
 function AppPrefs() {
   const { prefs, setPrefs, reset } = usePrefs();
@@ -163,14 +162,11 @@ function AppPrefs() {
           {SCANS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
         </select>
       </Field>
-      <Field label="Default category" hint="Pre-selected for the category scans on the Scans page. Recurring scans do not use it.">
+      <Field label="Default category"
+             hint="Pre-selected for the category scans on the Scans page, and used by Run full pipeline. Recurring scans use the category set under Automation.">
         <select value={prefs.defaultCategory} onChange={(e) => set("defaultCategory")(Number(e.target.value) as Category)}>
           {CATEGORIES.map((c) => <option key={c} value={c}>{CATEGORY_LABEL[c]}</option>)}
         </select>
-      </Field>
-      <Field label="Default trend-scan tickers" hint="Blank uses each scan's default universe.">
-        <input value={prefs.defaultTickers} placeholder="SPY QQQ NVDA AAPL MSFT" style={{ width: "100%", maxWidth: 420 }}
-               onChange={(e) => set("defaultTickers")(e.target.value.toUpperCase())} />
       </Field>
       <Field label="Regime symbol" hint={`Used by Run full pipeline and Run RegimeBot. Default ${DEFAULT_PREFS.regimeSymbol}.`}>
         <input value={prefs.regimeSymbol} size={8} onChange={(e) => set("regimeSymbol")(e.target.value.toUpperCase().trim())} />
@@ -197,6 +193,13 @@ function AutomationCard({ data }: { data: SettingsData }) {
           {Object.entries(data.automation_runs).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
         </select>
       </Field>
+      {a.run === "category_scans" && (
+        <Field label="Category" hint="Saved with the schedule; the recurring category scans run at this category.">
+          <select value={a.category} onChange={(e) => setA({ ...a, category: Number(e.target.value) as Category })}>
+            {CATEGORIES.map((c) => <option key={c} value={c}>{CATEGORY_LABEL[c]}</option>)}
+          </select>
+        </Field>
+      )}
       <Field label="Days"><DayPicker value={a.days} onChange={(days) => setA({ ...a, days })} /></Field>
       <Field label="Times (New York)"
              hint="Each run scans the last open session with complete bars: after 4:15 PM on a trading day, that day; earlier, or on Sat, Sun or a market holiday, the last trading day before it (Friday for a weekend run, Thursday if Friday was a holiday).">

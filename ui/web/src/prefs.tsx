@@ -1,5 +1,5 @@
 import { createContext, ReactNode, useCallback, useContext, useEffect, useState } from "react";
-import type { Category, ScanKind } from "./api";
+import { CATEGORIES, SCAN_KINDS, type Category, type ScanKind } from "./api";
 
 /** App preferences, kept in this browser only (localStorage); nothing here reaches the server. */
 export interface Prefs {
@@ -9,7 +9,6 @@ export interface Prefs {
   chartStyle: string; // TradingView style: 0 bars, 1 candles, 9 hollow candles, 8 Heikin Ashi, 2 line, 3 area
   defaultScan: ScanKind;
   defaultCategory: Category; // pre-selected for the category scans; the scheduler never reads it
-  defaultTickers: string;
   regimeSymbol: string;
 }
 
@@ -18,18 +17,26 @@ export const DEFAULT_PREFS: Prefs = {
   refreshSeconds: 15,
   chartInterval: "D",
   chartStyle: "1",
-  defaultScan: "all",
+  defaultScan: "cat_all",
   defaultCategory: 1,
-  defaultTickers: "",
   regimeSymbol: "SPY",
 };
 
 const STORAGE_KEY = "bats.prefs.v1";
 
+/** Saved prefs, with values that are no longer offered (a retired scan kind, say) put back to the default. */
+function clean(saved: Record<string, unknown>): Prefs {
+  const { defaultTickers: _retired, ...rest } = saved; // the five-name trend scans' tickers; no scan takes them now
+  const prefs = { ...DEFAULT_PREFS, ...rest } as Prefs;
+  if (!SCAN_KINDS.includes(prefs.defaultScan)) prefs.defaultScan = DEFAULT_PREFS.defaultScan;
+  if (!CATEGORIES.includes(prefs.defaultCategory)) prefs.defaultCategory = DEFAULT_PREFS.defaultCategory;
+  return prefs;
+}
+
 function load(): Prefs {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? { ...DEFAULT_PREFS, ...JSON.parse(raw) } : DEFAULT_PREFS;
+    return raw ? clean(JSON.parse(raw)) : DEFAULT_PREFS;
   } catch {
     return DEFAULT_PREFS;
   }

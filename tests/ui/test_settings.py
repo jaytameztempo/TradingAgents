@@ -71,8 +71,30 @@ def test_bad_trading_settings_are_refused(home, client, body, message):
 @pytest.mark.unit
 def test_automation_needs_days_and_times_to_switch_on(home, client):
     assert client.put("/api/settings/automation", json={"enabled": True, "days": [], "times": ["16:30"]}).status_code == 400
-    ok = client.put("/api/settings/automation", json={"enabled": True, "days": ["fri"], "times": ["16:30"], "run": "scans"})
-    assert ok.status_code == 200 and settings.automation()["run"] == "scans"
+    ok = client.put("/api/settings/automation",
+                    json={"enabled": True, "days": ["fri"], "times": ["16:30"], "run": "category_scans", "category": 2})
+    assert ok.status_code == 200 and settings.automation()["run"] == "category_scans"
+    assert settings.automation()["category"] == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("body", [
+    {"run": "scans"},  # retired: the five-name trend scans
+    {"run": "category_scans", "category": 4},
+    {"run": "category_scans", "category": 0},
+    {"run": "category_scans", "category": "2"},
+    {"run": "category_scans", "category": True},
+])
+def test_retired_runs_and_bad_categories_are_refused(home, client, body):
+    resp = client.put("/api/settings/automation", json={"enabled": False, "days": ["fri"], "times": ["16:30"], **body})
+    assert resp.status_code == 400 and not (home / "settings.json").exists()
+
+
+@pytest.mark.unit
+def test_category_defaults_to_1_and_a_saved_scans_run_reads_as_the_category_scans(home):
+    assert settings.automation()["category"] == 1
+    _save(automation={"enabled": True, "days": ["fri"], "times": ["16:30"], "run": "scans"})  # saved before retiring
+    assert settings.automation()["run"] == "category_scans" and settings.automation()["category"] == 1
 
 
 # --- .env: LLM settings and keys ------------------------------------------------------------
@@ -262,16 +284,29 @@ def test_scans_use_the_last_open_session(local, as_of):
 
 @pytest.mark.unit
 def test_a_weekend_scan_fires_and_scans_friday(home):
-    _save(automation={"enabled": True, "days": ["sat", "sun"], "times": ["10:00"], "run": "scans"})
+    _save(automation={"enabled": True, "days": ["sat", "sun"], "times": ["10:00"], "run": "category_scans",
+                      "category": 3})
     sched, started = _scheduler(Clock(datetime(2026, 10, 17, 14, 1, tzinfo=UTC)))  # Sat 10:01 New York
     sched.tick()
     assert len(started) == 1
     _, steps, _ = started[0]
-    assert all(step.args[:2] == ["--as-of", "2026-10-16"] for step in steps)
-    assert [s.script for s in steps] == ["run_upward_trend_scan", "run_breakdown_scan",
-                                         "run_scanbot_long_channel", "run_scanbot_short_channel"]
+    assert {s.script for s in steps} == {"run_category_scan"}
+    assert [s.args[:6] for s in steps] == [["--scan", scan, "--as-of", "2026-10-16", "--category", "3"]
+                                           for scan in ("up", "down", "side")]
+    assert "category 3" in sched.status()["events"][0]["detail"]
     status = sched.status()
     assert status["next_scan"].startswith("2026-10-18T10:00") and status["next_scan_as_of"] == "2026-10-16"
+
+
+@pytest.mark.unit
+def test_a_schedule_saved_with_the_retired_scans_run_starts_the_category_scans(home):
+    _save(automation={"enabled": True, "days": ["sat"], "times": ["10:00"], "run": "scans"})
+    sched, started = _scheduler(Clock(datetime(2026, 10, 17, 14, 1, tzinfo=UTC)))
+    sched.tick()
+    (_, steps, _), = started
+    assert [s.script for s in steps] == ["run_category_scan"] * 3
+    assert all(s.args[s.args.index("--category") + 1] == "1" for s in steps)
+    assert not {"run_upward_trend_scan", "run_breakdown_scan"} & jobs.SCRIPTS
 
 
 # --- auto-send skips market holidays and early-close afternoons ------------------------------

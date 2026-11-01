@@ -15,15 +15,20 @@ from paper_orders.trade_window import SettingsError, TradeWindow, load_settings,
 from ui.server import paths
 
 AUTOMATION_RUNS = {
-    "scans": "All four scans (trend + sideways)",
+    "category_scans": "Category scans (upward, downward, sideways)",
     "daily": "Daily SIDE pipeline (run_daily: regime → … → paper tickets; sends nothing)",
 }
+# Saved runs that are retired, and what they now mean: "scans" ran the five-name trend scans and the
+# sideways channel scans; a schedule saved with it keeps running, as the category scans.
+RETIRED_RUNS = {"scans": "category_scans"}
+CATEGORIES = (1, 2, 3)
 
 DEFAULT_AUTOMATION: dict[str, Any] = {
     "enabled": False,
     "days": ["mon", "tue", "wed", "thu", "fri"],
     "times": ["16:30"],
     "run": "daily",
+    "category": 1,  # used by the category_scans run
 }
 
 DEFAULT_TRADING: dict[str, Any] = {
@@ -38,7 +43,11 @@ def read_all() -> dict:
 
 
 def automation() -> dict:
-    return {**DEFAULT_AUTOMATION, **(read_all().get("automation") or {})}
+    auto = {**DEFAULT_AUTOMATION, **(read_all().get("automation") or {})}
+    auto["run"] = RETIRED_RUNS.get(auto["run"], auto["run"])
+    if auto["category"] not in CATEGORIES:
+        auto["category"] = DEFAULT_AUTOMATION["category"]
+    return auto
 
 
 def trading(saved_only: bool = False) -> dict | None:
@@ -59,11 +68,15 @@ def validate_automation(data: dict) -> dict:
     run = data.get("run", "daily")
     if run not in AUTOMATION_RUNS:
         raise SettingsError(f"run must be one of {', '.join(AUTOMATION_RUNS)}")
+    category = data.get("category", DEFAULT_AUTOMATION["category"])
+    if isinstance(category, bool) or category not in CATEGORIES:
+        raise SettingsError(f"category must be one of {', '.join(map(str, CATEGORIES))}")
     clean = {
         "enabled": bool(data.get("enabled")),
         "days": list(parse_days(data.get("days"))),
         "times": _times(data.get("times"), "scan time"),
         "run": run,
+        "category": category,
     }
     if clean["enabled"] and not (clean["days"] and clean["times"]):
         raise SettingsError("pick at least one day and one time to switch recurring scans on")

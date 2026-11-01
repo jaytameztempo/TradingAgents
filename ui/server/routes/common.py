@@ -56,16 +56,6 @@ def start(kind: str, steps: list[jobs.Step], group: str | None = None) -> dict:
     return job.summary()
 
 
-def scan_steps(as_of: str, universe: list[str], which: tuple[str, ...] = ("up", "down")) -> list[jobs.Step]:
-    """Steps for the upward and/or breakdown scans, writing to the UI's baskets folder."""
-    scripts = {"up": "run_upward_trend_scan", "down": "run_breakdown_scan"}
-    extra = ["--tickers", *universe] if universe else []
-    return [
-        jobs.Step(scripts[w], ["--as-of", as_of, *extra, "--out-dir", str(paths.baskets_dir())])
-        for w in which
-    ]
-
-
 # Sideways channel scans read the newest financials report for the date (from
 # run_scanbot_financials) and scan its survivors, so they take no ticker list.
 CHANNEL_SCRIPTS = {"long_side": "run_scanbot_long_channel", "short_side": "run_scanbot_short_channel"}
@@ -104,7 +94,9 @@ def regime_step(as_of: str, symbol: str) -> jobs.Step:
                                         "--out-dir", str(paths.regimes_dir())])
 
 
-def router_step(as_of: str) -> jobs.Step:
-    return jobs.Step("run_router", ["--as-of", as_of, "--basket-dir", str(paths.baskets_dir()),
+def router_step(as_of: str, category: int = 1) -> jobs.Step:
+    """The router reads the SCAN-UP / SCAN-DOWN baskets of `category`."""
+    return jobs.Step("run_router", ["--as-of", as_of, "--category", str(category),
+                                    "--basket-dir", str(paths.baskets_dir()),
                                     "--regime-dir", str(paths.regimes_dir()),
                                     "--out-dir", str(paths.routes_dir())])

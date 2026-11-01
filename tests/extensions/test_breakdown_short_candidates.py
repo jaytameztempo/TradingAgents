@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 from extensions.market_data.alpaca_bars import FRAME_COLUMNS
-from extensions.router.strategy_router import latest_basket
+from extensions.router.strategy_router import MissingInput, latest_basket
 from extensions.scans import breakdown_short_candidates as scan
 from extensions.scans import upward_trend_momentum
 from extensions.scans.basket import load_basket, save_basket
@@ -170,17 +170,18 @@ def test_an_existing_basket_file_is_never_overwritten(tmp_path):
 
 
 @pytest.mark.unit
-def test_the_router_still_picks_the_upward_basket(tmp_path):
-    """A breakdown basket beside the upward one, even a newer one, is not routed."""
+def test_the_router_no_longer_routes_the_retired_trend_baskets(tmp_path):
+    """The router now routes SCAN-UP / SCAN-DOWN category baskets. The retired upward and breakdown baskets are
+    still found by their own names (a newer breakdown basket does not shadow the upward one), but not by default."""
     upward = upward_trend_momentum.build_basket(_bars("SPY", RISING), ["SPY"], AS_OF, created_at=CREATED)
     up_path = save_basket(upward, tmp_path)
     breakdown = build_basket(_bars("SPY", FALLING), ["SPY"], AS_OF, created_at=CREATED + timedelta(hours=1))
     save_basket(breakdown, tmp_path)
 
-    path, basket = latest_basket(AS_OF, tmp_path)
-
-    assert path == up_path
-    assert basket.scan_name == "SCAN-Upward Trend Momentum"
+    path, basket = latest_basket(AS_OF, tmp_path, scan_name=upward_trend_momentum.SCAN_NAME)
+    assert path == up_path and basket.scan_name == "SCAN-Upward Trend Momentum"
+    with pytest.raises(MissingInput, match="no SCAN-UP Category 1 basket"):
+        latest_basket(AS_OF, tmp_path)
 
 
 @pytest.mark.unit

@@ -235,7 +235,7 @@ function PositionsOrders() {
 }
 
 function PipelineStrip() {
-  const { regimeSymbol } = usePrefs().prefs;
+  const { regimeSymbol, defaultCategory } = usePrefs().prefs;
   const qc = useQueryClient();
   const summary = useQuery({ queryKey: ["summary"], queryFn: () => api.summary() });
   const research = useQuery({ queryKey: ["researchRuns"], queryFn: api.researchRuns });
@@ -252,7 +252,7 @@ function PipelineStrip() {
   async function run() {
     setError(null);
     try {
-      setJob(await api.runPipeline({ as_of: asOf, tickers: [], regime_symbol: regimeSymbol }));
+      setJob(await api.runPipeline({ as_of: asOf, regime_symbol: regimeSymbol, category: defaultCategory }));
       setRunning(true);
       setRunning(true);
     } catch (e) {

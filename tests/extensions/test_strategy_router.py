@@ -1,6 +1,7 @@
 """The router builds a market label from SPY and QQQ, allows UPBot only when both are UP and
 DOWNBot only when both are DOWN, routes everything else as SIDE to SIDEBot, and makes no
-decision without any regime label or without the allowed side's basket.
+decision without any regime label or without the allowed side's basket. The baskets are the
+SCAN-UP / SCAN-DOWN category baskets of one category (default 1).
 
 Baskets and labels are written to temporary folders; nothing fetches bars.
 """
@@ -16,6 +17,7 @@ from extensions.regime.regime_bot import DOWN, SIDE, UP, RegimeLabel, save_label
 from extensions.router.strategy_router import (
     MissingInput,
     RouteDecision,
+    down_scan_name,
     latest_basket,
     latest_regime,
     load_decision,
@@ -23,16 +25,22 @@ from extensions.router.strategy_router import (
     route,
     route_for_date,
     save_decision,
+    up_scan_name,
 )
-from extensions.scans import breakdown_short_candidates, upward_trend_momentum
+from extensions.scans import (
+    breakdown_short_candidates,
+    scan_down_category,
+    scan_up_category,
+    upward_trend_momentum,
+)
 from extensions.scans.basket import BasketMember, Rejection, TickerBasket, save_basket
 from extensions.scripts import run_down_bot, run_side_bot, run_up_bot
 from extensions.scripts import run_router as cli
 
 AS_OF = date(2026, 9, 30)
 T0 = datetime(2026, 9, 30, 21, 0, tzinfo=UTC)
-UP_SCAN = upward_trend_momentum.SCAN_NAME
-DOWN_SCAN = breakdown_short_candidates.SCAN_NAME
+UP_SCAN = up_scan_name(1)
+DOWN_SCAN = down_scan_name(1)
 
 
 @pytest.fixture(autouse=True)
@@ -274,7 +282,7 @@ def test_latest_is_by_created_at_inside_the_file_not_the_file_name(dirs):
 def test_baskets_from_other_scans_are_ignored(dirs):
     baskets, regimes, _ = dirs
     save_basket(_basket(scan_name="SCAN-Something Else"), baskets)
-    with pytest.raises(MissingInput, match="no SCAN-Upward Trend Momentum basket"):
+    with pytest.raises(MissingInput, match="no SCAN-UP Category 1 basket"):
         latest_basket(AS_OF, baskets)
     _save_labels(regimes, SIDE, SIDE)
     assert route_for_date(AS_OF, baskets, regimes).blocked == []
@@ -365,6 +373,7 @@ def test_decision_round_trips_through_json(dirs):
     assert data["up_allowed"] is False and data["down_allowed"] is False
     assert data["blocked"] == ["QQQ", "SPY", "NVDA"]
     assert data["basket_file"] == "up.json" and data["down_basket_file"] == "down.json"
+    assert data["category"] == 1
     assert load_decision(path) == decision
     with pytest.raises(FileExistsError):
         save_decision(decision, routes)
@@ -385,6 +394,7 @@ def test_a_route_written_before_the_extension_still_loads(tmp_path):
     assert decision.blocked == ["NVDA"] and decision.down_allowed is False
     assert decision.down_passed == [] and decision.down_basket_file is None
     assert decision.regime_labels == {} and decision.regime_files == {}
+    assert decision.category is None
 
 
 def _plans_written(cli_module, routes, out_dir, symbol):
@@ -434,8 +444,8 @@ def test_cli_prints_a_missing_label_and_side(dirs, capsys):
     assert "QQQ regime as of 2026-09-30: missing" in out
     assert "market regime (SPY+QQQ): SIDE" in out
     assert "reason: SPY+QQQ market is SIDE: QQQ label is missing;" in out
-    assert "UPBot: BLOCKED  (upward scan passed: QQQ, SPY)" in out
-    assert "DOWNBot: BLOCKED  (breakdown scan passed: none)" in out
+    assert "UPBot: BLOCKED  (SCAN-UP Category 1 passed: QQQ, SPY)" in out
+    assert "DOWNBot: BLOCKED  (SCAN-DOWN Category 1 passed: none)" in out
     assert "routed to SIDEBot only: QQQ, SPY" in out
     (path,) = routes.glob("*.json")
     assert load_decision(path).regime_labels == {"SPY": SIDE, "QQQ": None}
@@ -451,8 +461,8 @@ def test_cli_prints_upbot_allowed_when_both_are_up(dirs, capsys):
 
     out = capsys.readouterr().out
     assert "market regime (SPY+QQQ): UP" in out
-    assert "UPBot: ALLOWED  (upward scan passed: QQQ, SPY)" in out
-    assert "DOWNBot: BLOCKED  (breakdown scan passed: no basket)" in out
+    assert "UPBot: ALLOWED  (SCAN-UP Category 1 passed: QQQ, SPY)" in out
+    assert "DOWNBot: BLOCKED  (SCAN-DOWN Category 1 passed: no basket)" in out
     assert "SIDEBot" not in out
 
 
@@ -466,8 +476,8 @@ def test_cli_prints_downbot_allowed_when_both_are_down(dirs, capsys):
 
     out = capsys.readouterr().out
     assert "market regime (SPY+QQQ): DOWN" in out
-    assert "UPBot: BLOCKED  (upward scan passed: no basket)" in out
-    assert "DOWNBot: ALLOWED  (breakdown scan passed: NVDA)" in out
+    assert "UPBot: BLOCKED  (SCAN-UP Category 1 passed: no basket)" in out
+    assert "DOWNBot: ALLOWED  (SCAN-DOWN Category 1 passed: NVDA)" in out
 
 
 @pytest.mark.unit
@@ -524,6 +534,64 @@ def test_cli_uses_the_default_folders(monkeypatch, tmp_path):
 @pytest.mark.unit
 def test_cli_refuses_a_bad_date(dirs):
     assert cli.main(["--as-of", "30/09/2026"]) == cli.EXIT_BAD_INPUT
+
+
+@pytest.mark.unit
+def test_router_names_match_the_category_scans():
+    for c in (1, 2, 3):
+        assert up_scan_name(c) == scan_up_category.scan_name(c)
+        assert down_scan_name(c) == scan_down_category.scan_name(c)
+
+
+@pytest.mark.unit
+def test_the_retired_trend_scan_baskets_are_ignored(dirs):
+    baskets, regimes, _ = dirs
+    save_basket(_basket(scan_name=upward_trend_momentum.SCAN_NAME), baskets)
+    save_basket(_basket(scan_name=breakdown_short_candidates.SCAN_NAME), baskets)
+    _save_labels(regimes, UP, UP)
+    with pytest.raises(MissingInput, match="no SCAN-UP Category 1 basket for 2026-09-30; it is required"):
+        route_for_date(AS_OF, baskets, regimes)
+
+
+@pytest.mark.unit
+def test_route_for_date_reads_only_the_chosen_category(dirs):
+    baskets, regimes, _ = dirs
+    save_basket(_basket(("SPY",), scan_name=up_scan_name(1)), baskets)
+    two = save_basket(_basket(("NVDA",), scan_name=up_scan_name(2)), baskets)
+    save_basket(_basket(("MSFT",), scan_name=up_scan_name(3), created_at=T0 + timedelta(hours=1)), baskets)
+    _save_labels(regimes, UP, UP)
+
+    decision = route_for_date(AS_OF, baskets, regimes, category=2)
+
+    assert decision.tradeable == ["NVDA"] and decision.basket_file == str(two) and decision.category == 2
+    assert "UPBot is allowed for the SCAN-UP Category 2 passers" in decision.reason
+    assert route_for_date(AS_OF, baskets, regimes).tradeable == ["SPY"]  # default category 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("category", [0, 4])
+def test_a_bad_category_is_refused(dirs, category):
+    baskets, regimes, _ = dirs
+    _save_labels(regimes, SIDE, SIDE)
+    with pytest.raises(ValueError, match="category must be one of 1, 2, 3"):
+        route_for_date(AS_OF, baskets, regimes, category=category)
+
+
+@pytest.mark.unit
+def test_cli_routes_the_chosen_category(dirs, capsys):
+    baskets, regimes, routes = dirs
+    save_basket(_basket(("NVDA",), scan_name=up_scan_name(3)), baskets)
+    _save_labels(regimes, UP, UP)
+
+    assert cli.main(_argv(dirs, "--category", "3")) == cli.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "UPBot: ALLOWED  (SCAN-UP Category 3 passed: NVDA)" in out
+    (path,) = routes.glob("*.json")
+    assert load_decision(path).category == 3
+    assert cli.main(_argv(dirs)) == cli.EXIT_FAILED  # no Category 1 basket
+    with pytest.raises(SystemExit):
+        cli.main(_argv(dirs, "--category", "4"))
 
 
 @pytest.mark.unit

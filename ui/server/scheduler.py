@@ -4,8 +4,9 @@ It runs on a background thread while the UI server runs (``python -m ui.server``
 app is closed, and a time missed while it was closed is not made up later. Every 20 seconds it checks the
 settings saved on the Settings page, in New York time:
 
-- recurring scans: on each chosen day (weekends included), at each chosen time, it starts either the four
-  scans or run_daily (which writes paper tickets but sends nothing), dated the last open session whose bars
+- recurring scans: on each chosen day (weekends included), at each chosen time, it starts either the three
+  category scans (upward, downward, sideways) at the saved category, or run_daily (which writes paper tickets
+  but sends nothing), dated the last open session whose bars
   are complete: Friday for a weekend run, the session before a market holiday (see scan_as_of).
 - auto-send: only when switched on, on each trading day that is not a market holiday, at each send time
   inside a session and before any 1:00 PM early close, it
@@ -155,7 +156,7 @@ class Scheduler:
                 key = f"scan|{local.date()}|{t}"
                 if key not in self._fired and self._due(local, t):
                     self._fired.add(key)
-                    self._run_scans(local, t, auto["run"])
+                    self._run_scans(local, t, auto["run"], auto["category"])
                     changed = True
 
         trading = settings.trading(saved_only=True)
@@ -176,18 +177,20 @@ class Scheduler:
         if changed:
             self._save_state()
 
-    def _run_scans(self, local: datetime, slot: str, run: str) -> None:
+    def _run_scans(self, local: datetime, slot: str, run: str, category: int = 1) -> None:
         as_of = scan_as_of(local).isoformat()
         if run == "daily":
             steps = [jobs.Step("run_daily", ["--as-of", as_of])]
+            what = settings.AUTOMATION_RUNS[run]
         else:
-            steps = [*common.scan_steps(as_of, []), *common.channel_scan_steps(as_of)]
+            steps = common.category_scan_steps(as_of, common.CATEGORY_SCANS, category)
+            what = f"{settings.AUTOMATION_RUNS[run]}, category {category}"
         try:
             job = self._start(f"scheduled:{run}", steps, "pipeline")
         except jobs.JobConflict as exc:
             self._record("scan", slot, "skipped", f"{exc}")
             return
-        self._record("scan", slot, "started", f"{settings.AUTOMATION_RUNS[run]} for {as_of}", job.id)
+        self._record("scan", slot, "started", f"{what} for {as_of}", job.id)
 
     def _run_sender(self, local: datetime, slot: str) -> None:
         as_of = newest_ticket_date(local.date())

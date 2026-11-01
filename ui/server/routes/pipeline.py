@@ -10,6 +10,7 @@ from ui.server.routes import common
 
 router = APIRouter(prefix="/api", tags=["pipeline"])
 
+# Baskets of the retired five-name trend scans: still readable (and queueable) from disk, never started.
 TREND_PREFIXES = {"up": "scan-upward-trend-momentum", "down": "scan-breakdown-short-candidates"}
 # Category baskets are named {prefix}-{category}_{as_of}_{stamp}.json (run_category_scan).
 CATEGORY_PREFIXES = {
@@ -20,15 +21,12 @@ CATEGORY_PREFIXES = {
 }
 SCAN_PREFIXES = {**TREND_PREFIXES, **CATEGORY_PREFIXES}
 CHANNEL_PREFIXES = {"long": "long_channel", "short": "short_channel"}
-# Scan picker on the Scans page -> (trend scans, sideways channel scans).
+# Scan picker on the Scans page -> the sideways channel scans they start. The five-name trend kinds
+# (up, down, both, all) are retired; the category kinds below replace them.
 SCAN_KINDS = {
-    "up": (("up",), ()),
-    "down": (("down",), ()),
-    "both": (("up", "down"), ()),
-    "long_side": ((), ("long_side",)),
-    "short_side": ((), ("short_side",)),
-    "sideways": ((), ("long_side", "short_side")),
-    "all": (("up", "down"), ("long_side", "short_side")),
+    "long_side": ("long_side",),
+    "short_side": ("short_side",),
+    "sideways": ("long_side", "short_side"),
 }
 # Category picks on the Scans page -> the run_category_scan scans they start, at the chosen category.
 CATEGORY_KINDS = {
@@ -128,15 +126,14 @@ def plans() -> list[dict]:
 
 class ScanRun(BaseModel):
     as_of: str
-    kind: str = "both"  # a key of SCAN_KINDS or CATEGORY_KINDS
-    tickers: list[str] = []
+    kind: str = "cat_all"  # a key of SCAN_KINDS or CATEGORY_KINDS
     category: int = 1  # 1, 2 or 3; used by the CATEGORY_KINDS only
 
 
 class PipelineRun(BaseModel):
     as_of: str
-    tickers: list[str] = []
     regime_symbol: str = "SPY"
+    category: int = 1  # the category scanned and routed
 
 
 class RegimeRun(BaseModel):
@@ -146,6 +143,7 @@ class RegimeRun(BaseModel):
 
 class RouterRun(BaseModel):
     as_of: str
+    category: int = 1  # whose SCAN-UP / SCAN-DOWN baskets are routed
 
 
 class BotRun(BaseModel):
@@ -160,24 +158,21 @@ def run_scans(body: ScanRun) -> dict:
         category = common.category(body.category)
         steps = common.category_scan_steps(common.iso_date(body.as_of), CATEGORY_KINDS[body.kind], category)
         return common.start(f"scan:{body.kind}:{category}", steps)
-    kinds = SCAN_KINDS.get(body.kind)
-    if kinds is None:
+    channel = SCAN_KINDS.get(body.kind)
+    if channel is None:
         raise common.bad_request(f"kind must be one of {', '.join([*SCAN_KINDS, *CATEGORY_KINDS])}")
-    trend, channel = kinds
-    as_of, universe = common.iso_date(body.as_of), common.tickers(body.tickers)
-    steps = [*(common.scan_steps(as_of, universe, trend) if trend else []),
-             *(common.channel_scan_steps(as_of, channel) if channel else [])]
-    return common.start(f"scan:{body.kind}", steps)
+    return common.start(f"scan:{body.kind}", common.channel_scan_steps(common.iso_date(body.as_of), channel))
 
 
 @router.post("/pipeline/run")
 def run_pipeline(body: PipelineRun) -> dict:
-    """Both scans, then RegimeBot, then the router, stopping at the first failure."""
-    as_of = common.iso_date(body.as_of)
+    """The upward and downward category scans, then RegimeBot, then the router on that category's baskets,
+    stopping at the first failure."""
+    as_of, category = common.iso_date(body.as_of), common.category(body.category)
     steps = [
-        *common.scan_steps(as_of, common.tickers(body.tickers)),
+        *common.category_scan_steps(as_of, ("up", "down"), category),
         common.regime_step(as_of, common.ticker(body.regime_symbol)),
-        common.router_step(as_of),
+        common.router_step(as_of, category),
     ]
     return common.start("pipeline", steps, group="pipeline")
 
@@ -189,7 +184,7 @@ def run_regime(body: RegimeRun) -> dict:
 
 @router.post("/router/run")
 def run_router(body: RouterRun) -> dict:
-    return common.start("router", [common.router_step(common.iso_date(body.as_of))])
+    return common.start("router", [common.router_step(common.iso_date(body.as_of), common.category(body.category))])
 
 
 @router.post("/bots/run")

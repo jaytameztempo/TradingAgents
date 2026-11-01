@@ -1,12 +1,15 @@
-"""Decide which trend bot may run on which names, from the SPY and QQQ regime labels and both scan baskets.
+"""Decide which trend bot may run on which names, from the SPY and QQQ regime labels and the category baskets.
 
 It reads saved files only. It fetches no bars and places no orders.
 
 Run from the TradingAgents folder:
 
     python -m extensions.scripts.run_router --as-of 2026-09-30
+    python -m extensions.scripts.run_router --as-of 2026-09-30 --category 2
 
-Reads ~/.tradingagents/baskets/ and ~/.tradingagents/regimes/ (or --basket-dir and
+The baskets are the newest SCAN-UP Category N and SCAN-DOWN Category N baskets
+for the date (run_category_scan), N from --category (default 1). Reads
+~/.tradingagents/baskets/ and ~/.tradingagents/regimes/ (or --basket-dir and
 --regime-dir) and writes the decision to ~/.tradingagents/routes/ unless --out-dir is set.
 """
 
@@ -16,16 +19,26 @@ import argparse
 import sys
 
 from extensions.market_data.alpaca_bars import validate_date_range
-from extensions.router.strategy_router import MissingInput, route_for_date, save_decision
+from extensions.router.strategy_router import (
+    CATEGORIES,
+    DEFAULT_CATEGORY,
+    MissingInput,
+    down_scan_name,
+    route_for_date,
+    save_decision,
+    up_scan_name,
+)
 
 EXIT_OK, EXIT_FAILED, EXIT_BAD_INPUT = 0, 1, 2
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Route the upward and breakdown baskets by the SPY+QQQ market regime (read-only)."
+        description="Route the SCAN-UP and SCAN-DOWN category baskets by the SPY+QQQ market regime (read-only)."
     )
     parser.add_argument("--as-of", required=True, help="date of the baskets and regime label, YYYY-MM-DD")
+    parser.add_argument("--category", type=int, choices=CATEGORIES, default=DEFAULT_CATEGORY,
+                        help=f"which category's baskets to route (default: {DEFAULT_CATEGORY})")
     parser.add_argument("--basket-dir", help="folder of basket JSON files (default: ~/.tradingagents/baskets)")
     parser.add_argument("--regime-dir", help="folder of regime JSON files (default: ~/.tradingagents/regimes)")
     parser.add_argument("--out-dir", help="folder for the decision JSON (default: ~/.tradingagents/routes)")
@@ -47,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_BAD_INPUT
 
     try:
-        decision = route_for_date(as_of, args.basket_dir, args.regime_dir)
+        decision = route_for_date(as_of, args.basket_dir, args.regime_dir, args.category)
     except (MissingInput, ValueError) as exc:
         print(f"error: {exc}; no decision written", file=sys.stderr)
         return EXIT_FAILED
@@ -57,9 +70,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"market regime ({decision.regime_symbol}): {decision.regime_label}")
     print(f"  reason: {decision.reason}")
     print(f"UPBot: {'ALLOWED' if decision.up_allowed else 'BLOCKED'}"
-          f"  (upward scan passed: {_names(decision.up_passed, decision.basket_file)})")
+          f"  ({up_scan_name(args.category)} passed: {_names(decision.up_passed, decision.basket_file)})")
     print(f"DOWNBot: {'ALLOWED' if decision.down_allowed else 'BLOCKED'}"
-          f"  (breakdown scan passed: {_names(decision.down_passed, decision.down_basket_file)})")
+          f"  ({down_scan_name(args.category)} passed: {_names(decision.down_passed, decision.down_basket_file)})")
     if decision.regime_label == "SIDE":
         print(f"routed to SIDEBot only: {', '.join(decision.blocked) or '(no passed names)'}")
 

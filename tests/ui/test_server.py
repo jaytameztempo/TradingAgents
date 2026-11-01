@@ -176,8 +176,6 @@ def test_missing_keys_is_a_503_not_a_crash(monkeypatch, client):
     ("long_side", ["run_scanbot_long_channel"]),
     ("short_side", ["run_scanbot_short_channel"]),
     ("sideways", ["run_scanbot_long_channel", "run_scanbot_short_channel"]),
-    ("all", ["run_upward_trend_scan", "run_breakdown_scan", "run_scanbot_long_channel", "run_scanbot_short_channel"]),
-    ("both", ["run_upward_trend_scan", "run_breakdown_scan"]),
 ])
 def test_scan_kinds_start_the_matching_scripts(home, client, monkeypatch, kind, scripts):
     started = []
@@ -192,11 +190,36 @@ def test_scan_kinds_start_the_matching_scripts(home, client, monkeypatch, kind, 
     assert [s.script for s in started] == scripts
     scanbot = str(paths.scanbot_dir())
     for step in started:
-        if step.script.startswith("run_scanbot_"):
-            # Channel scans scan the financials survivors: no ticker list, report dir and out dir = scanbot.
-            assert step.args == ["--as-of", AS_OF, "--report-dir", scanbot, "--out-dir", scanbot]
-        else:
-            assert "NVDA" in step.args
+        # Channel scans scan the financials survivors: no ticker list, report dir and out dir = scanbot.
+        assert step.args == ["--as-of", AS_OF, "--report-dir", scanbot, "--out-dir", scanbot]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kind", ["up", "down", "both", "all"])
+def test_the_retired_five_name_trend_kinds_are_refused(home, client, monkeypatch, kind):
+    started = _capture_steps(monkeypatch)
+    assert client.post("/api/scans/run", json={"as_of": AS_OF, "kind": kind}).status_code == 400
+    assert started == []
+    assert not {"run_upward_trend_scan", "run_breakdown_scan"} & jobs.SCRIPTS
+
+
+@pytest.mark.unit
+def test_the_pipeline_runs_the_category_scans_then_regime_then_the_router(home, client, monkeypatch):
+    started = _capture_steps(monkeypatch)
+    assert client.post("/api/pipeline/run", json={"as_of": AS_OF, "category": 2}).status_code == 200
+    assert [s.script for s in started] == ["run_category_scan", "run_category_scan", "run_regime_bot", "run_router"]
+    assert [s.args[1] for s in started[:2]] == ["up", "down"]
+    assert all(s.args[s.args.index("--category") + 1] == "2" for s in (started[0], started[1], started[3]))
+    assert client.post("/api/pipeline/run", json={"as_of": AS_OF, "category": 5}).status_code == 400
+
+
+@pytest.mark.unit
+def test_the_router_runs_on_the_chosen_category(home, client, monkeypatch):
+    started = _capture_steps(monkeypatch)
+    assert client.post("/api/router/run", json={"as_of": AS_OF}).status_code == 200
+    assert client.post("/api/router/run", json={"as_of": AS_OF, "category": 3}).status_code == 200
+    assert [s.args[:4] for s in started] == [["--as-of", AS_OF, "--category", "1"], ["--as-of", AS_OF, "--category", "3"]]
+    assert client.post("/api/router/run", json={"as_of": AS_OF, "category": 0}).status_code == 400
 
 
 def _capture_steps(monkeypatch) -> list:
@@ -243,11 +266,11 @@ def test_bad_categories_are_refused(home, client, monkeypatch, category):
 
 
 @pytest.mark.unit
-def test_old_kinds_ignore_the_category(home, client, monkeypatch):
+def test_sideways_kinds_ignore_the_category(home, client, monkeypatch):
     started = _capture_steps(monkeypatch)
-    body = {"as_of": AS_OF, "kind": "both", "tickers": ["NVDA"], "category": 3}
+    body = {"as_of": AS_OF, "kind": "sideways", "category": 3}
     assert client.post("/api/scans/run", json=body).status_code == 200
-    assert [s.script for s in started] == ["run_upward_trend_scan", "run_breakdown_scan"]
+    assert [s.script for s in started] == ["run_scanbot_long_channel", "run_scanbot_short_channel"]
     assert all("--category" not in s.args for s in started)
 
 

@@ -23,8 +23,8 @@ from ui.server.paths import REPO_ROOT
 # Every script the UI may start. None of them places an order.
 SCRIPTS = frozenset({
     "fetch_bars",
-    "run_upward_trend_scan",
-    "run_breakdown_scan",
+    # run_upward_trend_scan and run_breakdown_scan (the five-name trend scans) are retired: the category scans
+    # replace them, and the UI and scheduler no longer start them.
     "run_scanbot_long_channel",
     "run_scanbot_short_channel",
     "run_category_scan",  # SCANUP / SCANDOWN / SCANSIDE at category 1, 2 or 3; writes baskets only

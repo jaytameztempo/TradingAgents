@@ -2,7 +2,7 @@ import { ReactNode, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   api, Artifact, Basket, BasketKind, BasketMember, CATEGORIES, Category, CATEGORY_LABEL, CATEGORY_SCAN_KINDS,
-  CategoryBasketKind, ChannelCall, ChannelReport, defaultAsOf, parseTickers, ScanKind, ScanSource,
+  CategoryBasketKind, ChannelCall, ChannelReport, defaultAsOf, ScanKind, ScanSource,
 } from "../api";
 import { SendTo } from "../components/SendTo";
 import { Card, Column, DataTable, Empty, ErrorBox, JobLog, Tabs } from "../components/ui";
@@ -11,38 +11,30 @@ import { useJob } from "../useJob";
 import { Ticker } from "../components/Ticker";
 import { usePrefs } from "../prefs";
 
-type Kind = "up" | "down" | "long" | "short" | "category";
+// The five-name trend scans (Upward trend momentum, Breakdown short candidates) are retired; the category
+// scans replace them. Their old basket files stay on disk and in any queue rows already sent.
+type Kind = "long" | "short" | "category";
 const KIND_LABEL: Record<Kind, string> = {
-  up: "Upward trend momentum",
-  down: "Breakdown short candidates",
   long: "Long sideways channel",
   short: "Short sideways channel",
   category: "Category baskets",
 };
 
 const SCAN_OPTIONS: { value: ScanKind; label: string }[] = [
-  { value: "all", label: "All four scans" },
-  { value: "both", label: "Both trend scans" },
-  { value: "sideways", label: "Both sideways scans" },
-  { value: "up", label: KIND_LABEL.up },
-  { value: "down", label: KIND_LABEL.down },
-  { value: "long_side", label: KIND_LABEL.long },
-  { value: "short_side", label: KIND_LABEL.short },
+  { value: "cat_all", label: "Category: all three" },
   { value: "cat_up", label: "Category: upward" },
   { value: "cat_down", label: "Category: downward" },
   { value: "cat_side", label: "Category: sideways (long + short)" },
-  { value: "cat_all", label: "Category: all three" },
+  { value: "sideways", label: "Both sideways scans" },
+  { value: "long_side", label: KIND_LABEL.long },
+  { value: "short_side", label: KIND_LABEL.short },
 ];
-// Kinds that run a trend scan, the only scans that take a ticker list.
-const USES_TICKERS: ScanKind[] = ["all", "both", "up", "down"];
-const USES_FINANCIALS: ScanKind[] = ["all", "sideways", "long_side", "short_side", ...CATEGORY_SCAN_KINDS];
 
 export default function Scans() {
   const [asOf, setAsOf] = useState(defaultAsOf());
   const { prefs } = usePrefs();
   const [which, setWhich] = useState<ScanKind>(prefs.defaultScan);
   const [category, setCategory] = useState<Category>(prefs.defaultCategory);
-  const [tickerText, setTickerText] = useState(prefs.defaultTickers);
   const runner = useJob();
   const isCategory = CATEGORY_SCAN_KINDS.includes(which);
 
@@ -66,33 +58,20 @@ export default function Scans() {
               </select>
             </label>
           )}
-          <label className="field" style={{ flex: 1, minWidth: 220 }}>
-            {USES_TICKERS.includes(which)
-              ? `Tickers for the trend scans (blank = default universe)${which === "all" ? "; sideways scans use the financials survivors" : ""}`
-              : isCategory
-                ? "Tickers (category scans use the financials report's universe)"
-                : "Tickers (sideways scans use the financials survivors)"}
-            <input value={tickerText} placeholder="SPY QQQ NVDA AAPL MSFT" disabled={!USES_TICKERS.includes(which)}
-                   onChange={(e) => setTickerText(e.target.value)} />
-          </label>
           <button className="btn btn-primary" disabled={runner.running}
                   onClick={() => runner.start(() => api.runScans({
-                    as_of: asOf, kind: which, tickers: USES_TICKERS.includes(which) ? parseTickers(tickerText) : [],
-                    ...(isCategory ? { category } : {}),
+                    as_of: asOf, kind: which, ...(isCategory ? { category } : {}),
                   }))}>
             {runner.running ? "Running…" : "Run"}
           </button>
         </div>
         <p className="muted">
-          Fetches daily bars from Alpaca (paper keys, read-only). Trend scans write a basket to ~/.tradingagents/baskets.
-          {isCategory ? (
-            <> Category scans scan the universe behind the newest financials report for the date (STRONG names for
-              upward and downward), so run <code>run_scanbot_financials</code> for that date first; they write category
-              baskets to ~/.tradingagents/baskets, shown under the Category baskets tab.</>
-          ) : USES_FINANCIALS.includes(which) && (
-            <> Sideways scans scan the STRONG (long) or WEAK (short) survivors of the newest financials report for the date,
-              so run <code>run_scanbot_financials</code> for that date first; they write to ~/.tradingagents/scanbot.</>
-          )}
+          Fetches daily bars from Alpaca (paper keys, read-only) and reads the newest financials report for the date, so
+          run <code>run_scanbot_financials</code> for that date first.
+          {isCategory
+            ? <> Category scans scan that report's whole liquidity universe (STRONG names for upward and downward) and
+                write category baskets to ~/.tradingagents/baskets, shown under the Category baskets tab.</>
+            : <> Sideways scans scan its STRONG (long) or WEAK (short) survivors and write to ~/.tradingagents/scanbot.</>}
         </p>
         <ErrorBox error={runner.error} />
         <JobLog job={runner.job} onDone={runner.onDone} />
@@ -102,18 +81,14 @@ export default function Scans() {
   );
 }
 
-const TABS: { id: Kind; label: string }[] = (["up", "down", "long", "short", "category"] as Kind[])
+const TABS: { id: Kind; label: string }[] = (["category", "long", "short"] as Kind[])
   .map((id) => ({ id, label: KIND_LABEL[id] }));
 
 function BasketBrowser() {
-  const [kind, setKind] = useState<Kind>("up");
+  const [kind, setKind] = useState<Kind>("category");
   return (
     <Card title={<Tabs value={kind} onChange={setKind} tabs={TABS} />}>
-      {kind === "category"
-        ? <CategoryBaskets />
-        : kind === "up" || kind === "down"
-          ? <TrendBaskets key={kind} kind={kind} />
-          : <ChannelReports key={kind} side={kind} />}
+      {kind === "category" ? <CategoryBaskets /> : <ChannelReports key={kind} side={kind} />}
     </Card>
   );
 }
@@ -179,17 +154,6 @@ function ReportList<T>({ items, render, count, empty, kind }: {
       </div>
       {current && render(current)}
     </div>
-  );
-}
-
-function TrendBaskets({ kind }: { kind: "up" | "down" }) {
-  const baskets = useQuery({ queryKey: ["baskets", kind], queryFn: () => api.baskets(kind) });
-  return (
-    <>
-      <ErrorBox error={baskets.error} />
-      <ReportList kind={kind} items={baskets.data ?? []} count={(b) => b.members.length}
-                  render={(b) => <BasketDetail basket={b} kind={kind} />} empty="No baskets yet. Run a scan above." />
-    </>
   );
 }
 

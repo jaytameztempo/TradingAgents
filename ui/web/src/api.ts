@@ -106,7 +106,8 @@ export interface Automation {
   enabled: boolean;
   days: string[];
   times: string[];
-  run: "daily" | "scans";
+  run: "daily" | "category_scans";
+  category: Category; // used by the category_scans run; saved on the server, so the scheduler reads it
 }
 
 export interface Trading {
@@ -275,9 +276,11 @@ export interface ChannelReport {
   warnings?: string[];
 }
 
+// Scan picks the server will start. The five-name trend kinds (all, both, up, down) are retired.
 export type CategoryScanKind = "cat_up" | "cat_down" | "cat_side" | "cat_all";
-export type ScanKind = "all" | "both" | "sideways" | "up" | "down" | "long_side" | "short_side" | CategoryScanKind;
+export type ScanKind = "sideways" | "long_side" | "short_side" | CategoryScanKind;
 export const CATEGORY_SCAN_KINDS: ScanKind[] = ["cat_up", "cat_down", "cat_side", "cat_all"];
+export const SCAN_KINDS: ScanKind[] = [...CATEGORY_SCAN_KINDS, "sideways", "long_side", "short_side"];
 
 export interface Regime {
   symbol: string;
@@ -415,12 +418,13 @@ export const api = {
     put<{ ok: true; saved: string[]; cleared: string[] }>("/api/settings/keys", body),
 
   // category is read for the category kinds only.
-  runScans: (body: { as_of: string; kind: ScanKind; tickers: string[]; category?: Category }) =>
+  runScans: (body: { as_of: string; kind: ScanKind; category?: Category }) =>
     post<Job>("/api/scans/run", body),
-  runPipeline: (body: { as_of: string; tickers: string[]; regime_symbol: string }) =>
+  // The upward and downward category scans at `category`, RegimeBot, then the router on those baskets.
+  runPipeline: (body: { as_of: string; regime_symbol: string; category?: Category }) =>
     post<Job>("/api/pipeline/run", body),
   runRegime: (body: { as_of: string; symbol: string }) => post<Job>("/api/regime/run", body),
-  runRouter: (body: { as_of: string }) => post<Job>("/api/router/run", body),
+  runRouter: (body: { as_of: string; category?: Category }) => post<Job>("/api/router/run", body),
   runBot: (body: { as_of: string; bot: "up" | "down" | "side"; symbol: string }) =>
     post<Job>("/api/bots/run", body),
   runResearch: (body: { as_of: string; ticker: string; analysts: string[]; confirm: true }) =>

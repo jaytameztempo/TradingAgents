@@ -1,9 +1,14 @@
-"""Route both scan baskets by a market regime built from the SPY and QQQ labels for the same date.
+"""Route the category scan baskets by a market regime built from the SPY and QQQ labels for the same date.
+
+The baskets are the category scans' (run_category_scan): ``SCAN-UP Category N``
+for the upward side and ``SCAN-DOWN Category N`` for the downward side, at one
+category N (1, 2 or 3; default 1). Baskets of any other scan or category,
+including the retired five-name trend scans, are ignored.
 
 The market label combines the saved RegimeBot labels; it never recomputes them:
 
-- both UP: UP. UPBot is allowed for the upward-scan passers; DOWNBot is blocked.
-- both DOWN: DOWN. DOWNBot is allowed for the breakdown-scan passers; UPBot is blocked.
+- both UP: UP. UPBot is allowed for the SCAN-UP passers; DOWNBot is blocked.
+- both DOWN: DOWN. DOWNBot is allowed for the SCAN-DOWN passers; UPBot is blocked.
 - anything else (one label missing, the two disagree, or either is SIDE): SIDE.
   Both trend bots are blocked; passers from either scan are routed to SIDEBot.
 
@@ -38,8 +43,23 @@ from extensions.regime.regime_bot import (
     load_label,
 )
 from extensions.scans.basket import TickerBasket, default_basket_dir, load_basket
-from extensions.scans.breakdown_short_candidates import SCAN_NAME as DOWN_SCAN_NAME
-from extensions.scans.upward_trend_momentum import SCAN_NAME as UP_SCAN_NAME
+
+CATEGORIES = (1, 2, 3)
+DEFAULT_CATEGORY = 1
+
+
+# The category scans' basket names (scan_up_category.scan_name, scan_down_category.scan_name), spelled out here so
+# the router does not import the scans; a test keeps them equal.
+def up_scan_name(category: int) -> str:
+    return f"SCAN-UP Category {category}"
+
+
+def down_scan_name(category: int) -> str:
+    return f"SCAN-DOWN Category {category}"
+
+
+UP_SCAN_NAME = up_scan_name(DEFAULT_CATEGORY)
+DOWN_SCAN_NAME = down_scan_name(DEFAULT_CATEGORY)
 
 SERIES = "ALL"
 REGIME_SYMBOL = "SPY"
@@ -67,7 +87,7 @@ class RouteDecision:
     tradeable: list[str]
     blocked: list[str]
     reason: str
-    basket_file: str | None  # the upward-scan basket
+    basket_file: str | None  # the SCAN-UP basket
     regime_file: str | None  # the SPY label
     schema_version: int = SCHEMA_VERSION
     down_allowed: bool = False
@@ -76,6 +96,7 @@ class RouteDecision:
     down_basket_file: str | None = None
     regime_labels: dict[str, str | None] = field(default_factory=dict)
     regime_files: dict[str, str | None] = field(default_factory=dict)
+    category: int | None = None  # the category whose baskets were routed; None on routes from before categories
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -145,13 +166,17 @@ def route(
     up: FoundBasket | None = None,
     down: FoundBasket | None = None,
     created_at: datetime | None = None,
+    category: int = DEFAULT_CATEGORY,
 ) -> RouteDecision:
     """Decide which trend bot, if any, may run, and on which names.
 
     ``labels`` maps each regime symbol to its (file, label), or None when that
     symbol has no label for the date. ``up`` and ``down`` are (file, basket)
-    for the upward and breakdown scans, or None when that scan has no basket.
+    for the SCAN-UP and SCAN-DOWN baskets of ``category``, or None when that
+    scan has no basket.
     """
+    _check_category(category)
+    up_name, down_name = up_scan_name(category), down_scan_name(category)
     for symbol, found in labels.items():
         if found is None:
             continue
@@ -159,7 +184,7 @@ def route(
             raise ValueError(f"the {symbol} label file is for {found[1].symbol}")
         if found[1].as_of != as_of:
             raise ValueError(f"the route is for {as_of} but the {symbol} regime label is for {found[1].as_of}")
-    for scan_name, found in ((UP_SCAN_NAME, up), (DOWN_SCAN_NAME, down)):
+    for scan_name, found in ((up_name, up), (down_name, down)):
         if found is not None and found[1].as_of != as_of:
             raise ValueError(f"{scan_name} basket is for {found[1].as_of} but the route is for {as_of}")
     if all(found is None for found in labels.values()):
@@ -171,13 +196,13 @@ def route(
     down_passed = down[1].tickers if down is not None else []
 
     if label == UP:
-        _require(up, UP_SCAN_NAME, as_of, market, label)
+        _require(up, up_name, as_of, market, label)
         tradeable, blocked = up_passed, []
-        action = "UPBot is allowed for the upward-scan passers; DOWNBot is blocked"
+        action = f"UPBot is allowed for the {up_name} passers; DOWNBot is blocked"
     elif label == DOWN:
-        _require(down, DOWN_SCAN_NAME, as_of, market, label)
+        _require(down, down_name, as_of, market, label)
         tradeable, blocked = down_passed, []
-        action = "DOWNBot is allowed for the breakdown-scan passers; UPBot is blocked"
+        action = f"DOWNBot is allowed for the {down_name} passers; UPBot is blocked"
     else:
         tradeable, blocked = [], list(dict.fromkeys(up_passed + down_passed))
         action = "UPBot and DOWNBot are blocked; passed names are routed to SIDEBot only"
@@ -201,19 +226,28 @@ def route(
         regime_file=files.get(REGIME_SYMBOL),
         regime_labels={s: found[1].label if found else None for s, found in labels.items()},
         regime_files=files,
+        category=category,
     )
 
 
 def route_for_date(
-    as_of: date, basket_dir: str | Path | None = None, regime_dir: str | Path | None = None
+    as_of: date, basket_dir: str | Path | None = None, regime_dir: str | Path | None = None,
+    category: int = DEFAULT_CATEGORY,
 ) -> RouteDecision:
-    """Load each symbol's latest label and each scan's latest basket for as_of, and route them."""
+    """Load each symbol's latest label and the latest SCAN-UP / SCAN-DOWN basket of ``category`` for as_of,
+    and route them."""
+    _check_category(category)
     regimes = Path(regime_dir) if regime_dir is not None else default_regime_dir()
     baskets = Path(basket_dir) if basket_dir is not None else default_basket_dir()
     labels = {symbol: _newest_label(as_of, regimes, symbol) for symbol in REGIME_SYMBOLS}
-    up = _newest_basket(as_of, baskets, UP_SCAN_NAME)
-    down = _newest_basket(as_of, baskets, DOWN_SCAN_NAME)
-    return route(as_of, labels, up, down)
+    up = _newest_basket(as_of, baskets, up_scan_name(category))
+    down = _newest_basket(as_of, baskets, down_scan_name(category))
+    return route(as_of, labels, up, down, category=category)
+
+
+def _check_category(category: int) -> None:
+    if category not in CATEGORIES:
+        raise ValueError(f"category must be one of {', '.join(map(str, CATEGORIES))}, not {category!r}")
 
 
 def default_route_dir() -> Path:
