@@ -504,3 +504,64 @@ No step in this list places an order.
 ## 12. Defaults
 
 Strong financials on UP, DOWN, and `SCAN-LongSidewaysChannel`. Losing and weak financials on `SCAN-ShortSidewaysChannel`. Dollar volume >= $20M. Price >= $10. ATR% 2–8. ADX >= 25 for UP and DOWN, ADX <= 20 for both channel scans. Pivot structure required, plus two quality checks. Analyst, P/E, and sector off. P/E is never applied to the short channel scan. Top 15 per basket. Sector cap 30%. Earnings blackout 3 sessions.
+
+## 13. Categories
+
+Separate from the four scans above, each regime has a category scan at three strictness levels. Category 1 is the strictest (smallest baskets), 2 is balanced, 3 is the loosest (largest baskets). The existing scans, the router, and the playbooks are unchanged and do not read category baskets.
+
+```
+python -m extensions.scripts.run_category_scan --scan up|down|side --as-of YYYY-MM-DD [--category 1|2|3]
+```
+
+`--category` defaults to 1. Every threshold lives in `extensions/scans/categories.py`. The scans (`scan_up_category`, `scan_down_category`, `scan_side_category`) only apply the parameters they are given, so a caller picks a category by number.
+
+**Reused, not rebuilt.** Candidates are the universe report's liquidity survivors behind the newest financials report for the date. Financial groups are that report's STRONG and WEAK passes, plus NEUTRAL: names the STRONG pass removed at a metric gate that are not WEAK survivors. shortable and easy_to_borrow come from the asset snapshot behind the universe report. Bars are split-adjusted SIP daily bars dated on or before as_of. Indicators are RegimeBot's SMA and ADX(14) and the swings module's ATR(14), RSI(14), and ZigZag (5% reversal, confirmed on close).
+
+**Definitions.**
+- RS rank: the percentile (0–100) of the 63-session return across the candidates.
+- Strength vs SPY: that return minus SPY's. Missing SPY bars fail SCANUP and SCANDOWN closed.
+- SMA50 rising: above its value 20 bars ago.
+- The 20-day average volume: the 20 sessions before the as-of bar.
+- Declining volume: the 5-session average below that average.
+- Ranges are inclusive, and MA orderings are strict.
+
+**SCANUP** (STRONG only)
+
+| Rule | Cat 1 | Cat 2 | Cat 3 |
+| --- | --- | --- | --- |
+| MA | close > SMA50 > SMA200, SMA50 rising | close > SMA50 > SMA200 | close > SMA50 |
+| ADX | >= 25 | >= 20 | >= 15 |
+| RS | rank >= 80 or strength vs SPY > 0 | rank >= 60 | off |
+| Pullback below last ZigZag high | 5–15%, declining volume | 3–20% | off |
+| RSI | 40–55 | 35–60 | 30–70 |
+| Proximity | <= 1 ATR of SMA20 or the last swing low | off | <= 2 ATR of SMA20 or SMA50 |
+
+**SCANDOWN** (STRONG only)
+
+| Rule | Cat 1 | Cat 2 | Cat 3 |
+| --- | --- | --- | --- |
+| MA | close < SMA50 < SMA200 | close < SMA50 < SMA200 | close < SMA50 |
+| ADX | >= 25 | >= 20 | >= 15 |
+| RS | rank <= 20 or strength vs SPY < 0 | rank <= 40 | off |
+| Structure | failed rally (below) | close below last swing high or SMA20 | close below SMA20 or SMA50 |
+| RSI | 45–60 | 40–70 | 30–75 |
+| Borrow | shortable and easy_to_borrow | easy_to_borrow | shortable or easy_to_borrow |
+
+Failed rally: a bar in the 5 sessions before as-of reached SMA20 or broken support (high at or above it) on volume below the 20-day average. The as-of bar then closed back below that level on at least 1.5x the average. Broken support is the latest confirmed swing low that a close fell below before the rally bar.
+
+**SCANSIDE** (one run, a long and a short basket; channel lines as in 4.3, 60-session window)
+
+| Rule | Cat 1 | Cat 2 | Cat 3 |
+| --- | --- | --- | --- |
+| ADX | <= 20 | <= 25 | <= 30 |
+| Height | 8–22% | 6–25% | 5–30% |
+| Touches each side | >= 2 | >= 2 | >= 1 |
+| ATR from the line | 0–0.6 | 0–1.0 | -1.5 to 1.5 |
+| RSI long / short | 35–48 / 52–65 | 30–50 / 50–70 | 25–55 / 45–75 |
+| As-of volume | below 1.0x average | below 1.2x | off |
+| Long financials | STRONG | STRONG or NEUTRAL | off |
+| Short financials and borrow | WEAK, easy_to_borrow | easy_to_borrow | shortable or easy_to_borrow |
+
+The pivot confirmation (4.3, 4.4) and the TTM Squeeze are not part of any category. They stay later, optional confirmation steps.
+
+**Output.** Each run writes `TickerBasket` JSON (schema 1, as the trend scans) to `~/.tradingagents/baskets`, never overwriting a file. The names are `SCAN-UP Category N`, `SCAN-DOWN Category N`, `SCAN-SIDE Long Category N`, and `SCAN-SIDE Short Category N`. Every candidate is either a member or a rejection with every failed rule. `parameters` records the category, regime, side, the full rule table, the input reports, and warnings. The score only orders the basket: strength vs SPY for UP, its negative for DOWN, closeness to the line for SIDE. These names match neither the router's scan names nor the paper ticket and UI file prefixes, so nothing routes a category basket yet. Nothing here places an order.
