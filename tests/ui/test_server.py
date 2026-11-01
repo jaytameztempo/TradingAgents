@@ -34,6 +34,8 @@ def _route(label: str, created_at: str) -> dict:
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv(paths.HOME_ENV, str(tmp_path))
     monkeypatch.delenv("TRADINGAGENTS_RESULTS_DIR", raising=False)
+    # AS_OF already has its scan inputs, so a scan for it starts the scan steps only (see input_steps).
+    _write(tmp_path / "scanbot" / f"financials_{AS_OF}_20261001T000000Z.json", {"as_of": AS_OF})
     _write(tmp_path / "regimes" / f"regime_SPY_{AS_OF}_20261001T000000Z.json",
            {"symbol": "SPY", "as_of": AS_OF, "created_at": "2026-10-01T00:00:00+00:00", "label": "SIDE",
             "reasons": ["ADX 10.7 is under 20"], "metrics": {"adx_14": 10.7}, "schema_version": 1})
@@ -119,7 +121,24 @@ def test_bots_run_as_scripts_and_a_regime_mismatch_is_blocked(home, client):
     assert plans[0]["fields"]["regime"] == "SIDE (SPY)"
 
     stream = client.get(f"/api/jobs/{side['id']}/stream").text
-    assert "event: line" in stream and "event: done" in stream
+    assert "event: line" in stream and "event: done" in stream and "event: steps" in stream
+
+
+@pytest.mark.unit
+def test_a_job_records_when_each_step_started_and_finished(home, client):
+    """The job log's step counter and timers read these; the step that failed stops the rest, which never start."""
+    job = jobs.runner.start("test", [jobs.Step("run_router", ["--as-of", "not-a-date"]),
+                                     jobs.Step("run_router", ["--as-of", AS_OF])])
+    jobs.wait_for(job)
+    first, second = job.summary()["steps"]
+    assert first["started_at"] and first["finished_at"] and first["started_at"] <= first["finished_at"]
+    assert first["exit_code"] == 2 and second["started_at"] is None and second["finished_at"] is None
+    assert job.summary()["current_step"] is None
+
+    running = jobs.Job(id="x", kind="k", group=None, steps=[jobs.Step("run_router", []), jobs.Step("run_router", [])])
+    running.steps[0].started_at = running.steps[0].finished_at = "2026-11-01T00:00:00+00:00"
+    running.steps[1].started_at = "2026-11-01T00:00:05+00:00"
+    assert running.summary()["current_step"] == 1
 
 
 class FakeTradingClient:
@@ -248,6 +267,33 @@ def test_category_kinds_start_run_category_scan_with_the_category(home, client, 
         ["--scan", scan, "--as-of", AS_OF, "--category", str(category), "--report-dir", scanbot, "--out-dir", baskets]
         for scan in scans
     ]  # no ticker list: category scans read the financials report
+
+
+NEW_DATE = "2026-10-30"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kind, scans", [
+    ("cat_all", ["run_category_scan"] * 3), ("sideways", ["run_scanbot_long_channel", "run_scanbot_short_channel"]),
+])
+def test_a_date_without_inputs_builds_the_universe_and_financials_first(home, client, monkeypatch, kind, scans):
+    started = _capture_steps(monkeypatch)
+    assert client.post("/api/scans/run", json={"as_of": NEW_DATE, "kind": kind}).status_code == 200
+    assert [s.script for s in started] == ["run_scanbot_universe", "run_scanbot_financials", *scans]
+    scanbot = str(paths.scanbot_dir())
+    assert started[0].args == ["--as-of", NEW_DATE, "--assets-dir", str(paths.data_home() / "assets"),
+                               "--out-dir", scanbot]
+    assert started[1].args == ["--as-of", NEW_DATE, "--report-dir", scanbot, "--out-dir", scanbot]
+    assert {"run_scanbot_universe", "run_scanbot_financials"} <= jobs.SCRIPTS
+
+
+@pytest.mark.unit
+def test_a_date_with_a_universe_report_only_needs_the_financials_step(home, client, monkeypatch):
+    _write(paths.scanbot_dir() / f"universe_{NEW_DATE}_20261031T000000Z.json", {"as_of": NEW_DATE})
+    started = _capture_steps(monkeypatch)
+    assert client.post("/api/pipeline/run", json={"as_of": NEW_DATE}).status_code == 200
+    assert [s.script for s in started] == ["run_scanbot_financials", "run_category_scan", "run_category_scan",
+                                           "run_regime_bot", "run_router"]
 
 
 @pytest.mark.unit

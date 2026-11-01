@@ -33,12 +33,18 @@ def get_job(job_id: str) -> dict:
 
 @router.get("/{job_id}/stream")
 async def stream_job(job_id: str) -> StreamingResponse:
-    """Each output line as an SSE "line" event, then one "done" event with the job summary."""
+    """Each output line as an SSE "line" event, a "steps" event with the job summary whenever a step starts or
+    finishes (for the step counter and timers), then one "done" event with the job summary."""
     job = _job(job_id)
 
     async def events():
         sent = 0
+        step_state = None
         while True:
+            state = [(s.started_at, s.finished_at) for s in job.steps]
+            if state != step_state:
+                step_state = state
+                yield f"event: steps\ndata: {json.dumps(job.summary())}\n\n"
             lines = job.lines
             while sent < len(lines):
                 yield f"event: line\ndata: {json.dumps(lines[sent])}\n\n"

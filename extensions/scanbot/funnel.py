@@ -157,8 +157,12 @@ def run_funnel(
     cache_dir: str | Path | None = None,
     created_at: datetime | None = None,
     now: datetime | None = None,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> FunnelReport:
-    """Run every universe and liquidity gate for as_of. Bars failures raise; quote failures skip the spread gate."""
+    """Run every universe and liquidity gate for as_of. Bars failures raise; quote failures skip the spread gate.
+
+    ``progress(what, done, total)``, when given, is told after each bars chunk ("bars", symbols fetched) and each
+    spread sampling window ("spread windows", windows sampled). It only reports; it changes nothing."""
     if preset not in PRESETS:
         raise ValueError(f"unknown preset {preset!r}; choose from {', '.join(PRESETS)}")
     thresholds = PRESETS[preset]
@@ -179,7 +183,8 @@ def run_funnel(
         sessions = recent_sessions(calendar, as_of, SESSION_WINDOW)
     except ValueError as exc:
         raise CalendarError(str(exc)) from exc
-    bars = _fetch_in_chunks(bars_fetcher, symbols, start, as_of, cache_dir)
+    bars = _fetch_in_chunks(bars_fetcher, symbols, start, as_of, cache_dir,
+                            progress=(lambda done, total: progress("bars", done, total)) if progress else None)
     bars = bars[bars["date"] <= pd.Timestamp(as_of)]
 
     symbols = counter.apply("liquidity", "history", symbols, lambda s: gate_history(s, bars, sessions))
@@ -202,10 +207,11 @@ def run_funnel(
     try:
         if symbols and not windows:
             raise _NoWindows("no sampling window has closed yet for the spread sessions")
-        per_window = [
-            window_spreads(_quotes_in_chunks(quotes_fetcher, symbols, window_start, window_end))
-            for window_start, window_end in windows
-        ] if symbols else []
+        per_window = []
+        for i, (window_start, window_end) in enumerate(windows if symbols else [], start=1):
+            per_window.append(window_spreads(_quotes_in_chunks(quotes_fetcher, symbols, window_start, window_end)))
+            if progress:
+                progress("spread windows", i, len(windows))
         spreads = combine_windows(per_window)
     except (*DATA_ERRORS, _NoWindows) as exc:
         spread_error = f"{type(exc).__name__}: {exc}"
@@ -263,11 +269,13 @@ def run_funnel(
     )
 
 
-def _fetch_in_chunks(bars_fetcher, symbols, start, end, cache_dir) -> pd.DataFrame:
-    frames = [
-        bars_fetcher(symbols[i:i + BAR_CHUNK], start, end, feed=FEED, cache_dir=cache_dir)
-        for i in range(0, len(symbols), BAR_CHUNK)
-    ]
+def _fetch_in_chunks(bars_fetcher, symbols, start, end, cache_dir, progress=None) -> pd.DataFrame:
+    """Bars for symbols, BAR_CHUNK at a time. ``progress(done, total)``, when given, is told after each chunk."""
+    frames = []
+    for i in range(0, len(symbols), BAR_CHUNK):
+        frames.append(bars_fetcher(symbols[i:i + BAR_CHUNK], start, end, feed=FEED, cache_dir=cache_dir))
+        if progress:
+            progress(min(i + BAR_CHUNK, len(symbols)), len(symbols))
     frames = [f for f in frames if not f.empty]
     if not frames:
         return pd.DataFrame({"symbol": [], "date": pd.to_datetime([]), "close": [], "volume": []})

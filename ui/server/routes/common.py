@@ -56,6 +56,23 @@ def start(kind: str, steps: list[jobs.Step], group: str | None = None) -> dict:
     return job.summary()
 
 
+def input_steps(as_of: str) -> list[jobs.Step]:
+    """The SCANBot inputs every scan reads, for a date that does not have them yet: the universe report
+    (liquidity survivors and the asset snapshot behind them) and then the financials report on it. A date that
+    already has a financials report needs nothing; one with a universe report but no financials needs only the
+    financials step. Both steps read Alpaca and SEC EDGAR data only."""
+    folder = paths.scanbot_dir()
+    if any(folder.glob(f"financials_{as_of}_*.json")):
+        return []
+    steps = []
+    if not any(folder.glob(f"universe_{as_of}_*.json")):
+        steps.append(jobs.Step("run_scanbot_universe", ["--as-of", as_of, "--assets-dir", str(paths.data_home() / "assets"),
+                                                        "--out-dir", str(folder)]))
+    steps.append(jobs.Step("run_scanbot_financials", ["--as-of", as_of, "--report-dir", str(folder),
+                                                      "--out-dir", str(folder)]))
+    return steps
+
+
 # Sideways channel scans read the newest financials report for the date (from
 # run_scanbot_financials) and scan its survivors, so they take no ticker list.
 CHANNEL_SCRIPTS = {"long_side": "run_scanbot_long_channel", "short_side": "run_scanbot_short_channel"}

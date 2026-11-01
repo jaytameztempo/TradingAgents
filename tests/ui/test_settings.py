@@ -290,9 +290,11 @@ def test_a_weekend_scan_fires_and_scans_friday(home):
     sched.tick()
     assert len(started) == 1
     _, steps, _ = started[0]
-    assert {s.script for s in steps} == {"run_category_scan"}
-    assert [s.args[:6] for s in steps] == [["--scan", scan, "--as-of", "2026-10-16", "--category", "3"]
-                                           for scan in ("up", "down", "side")]
+    # 2026-10-16 has no scan inputs yet, so the universe and financials steps come first.
+    assert [s.script for s in steps] == ["run_scanbot_universe", "run_scanbot_financials", *["run_category_scan"] * 3]
+    assert all(s.args[:2] == ["--as-of", "2026-10-16"] for s in steps[:2])
+    assert [s.args[:6] for s in steps[2:]] == [["--scan", scan, "--as-of", "2026-10-16", "--category", "3"]
+                                               for scan in ("up", "down", "side")]
     assert "category 3" in sched.status()["events"][0]["detail"]
     status = sched.status()
     assert status["next_scan"].startswith("2026-10-18T10:00") and status["next_scan_as_of"] == "2026-10-16"
@@ -301,6 +303,8 @@ def test_a_weekend_scan_fires_and_scans_friday(home):
 @pytest.mark.unit
 def test_a_schedule_saved_with_the_retired_scans_run_starts_the_category_scans(home):
     _save(automation={"enabled": True, "days": ["sat"], "times": ["10:00"], "run": "scans"})
+    (home / "scanbot").mkdir()
+    (home / "scanbot" / "financials_2026-10-16_20261017T000000Z.json").write_text("{}")  # inputs already built
     sched, started = _scheduler(Clock(datetime(2026, 10, 17, 14, 1, tzinfo=UTC)))
     sched.tick()
     (_, steps, _), = started

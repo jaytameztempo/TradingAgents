@@ -28,9 +28,12 @@ from pathlib import Path
 
 import requests
 
+from extensions.tls import use_system_trust_store
 from tradingagents.dataflows.errors import VendorUnavailableError
 from tradingagents.dataflows.files import replace_file
 from tradingagents.dataflows.vendors import sec_edgar
+
+use_system_trust_store()  # before any SEC request; see extensions/tls.py
 
 CACHE_VERSION = 1
 REUSE_DAYS = 7

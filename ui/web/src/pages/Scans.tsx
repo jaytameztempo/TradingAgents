@@ -66,8 +66,9 @@ export default function Scans() {
           </button>
         </div>
         <p className="muted">
-          Fetches daily bars from Alpaca (paper keys, read-only) and reads the newest financials report for the date, so
-          run <code>run_scanbot_financials</code> for that date first.
+          Fetches daily bars from Alpaca (paper keys, read-only) and reads the newest financials report for the date.
+          If the date has none yet, the run builds it first (universe, then SEC financials), which takes a few
+          minutes; later runs for that date reuse it.
           {isCategory
             ? <> Category scans scan that report's whole liquidity universe (STRONG names for upward and downward) and
                 write category baskets to ~/.tradingagents/baskets, shown under the Category baskets tab.</>

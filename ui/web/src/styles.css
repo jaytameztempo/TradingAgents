@@ -201,6 +201,15 @@ label.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; 
 .status-ok { color: var(--good-text); }
 .status-failed { color: var(--critical-text); }
 .status-blocked { color: var(--warning-text); }
+.joblog-progress { display: grid; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.progress-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.progress { flex: 1; min-width: 160px; max-width: 480px; height: 8px; border-radius: 4px; background: var(--grid); overflow: hidden; }
+.progress-fill { height: 100%; background: var(--accent); transition: width 0.4s ease; }
+.joblog-steps { margin: 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; }
+.joblog-steps .step-current { font-weight: 600; }
+.joblog-steps .step-pending { color: var(--muted); }
+.joblog-steps .step-done { color: var(--good-text); }
+.joblog-steps .step-failed { color: var(--critical-text); }
 .joblog-lines { margin: 0; padding: 10px; max-height: 260px; overflow: auto; font-size: 12px; white-space: pre-wrap; background: var(--surface); }
 
 /* markdown */

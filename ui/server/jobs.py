@@ -25,6 +25,8 @@ SCRIPTS = frozenset({
     "fetch_bars",
     # run_upward_trend_scan and run_breakdown_scan (the five-name trend scans) are retired: the category scans
     # replace them, and the UI and scheduler no longer start them.
+    "run_scanbot_universe",  # the scans' inputs, run first when a date has none; read market and SEC data only
+    "run_scanbot_financials",
     "run_scanbot_long_channel",
     "run_scanbot_short_channel",
     "run_category_scan",  # SCANUP / SCANDOWN / SCANSIDE at category 1, 2 or 3; writes baskets only
@@ -62,6 +64,8 @@ class Step:
     script: str
     args: list[str]
     exit_code: int | None = None
+    started_at: str | None = None  # set by the runner, for the job log's step and elapsed-time display
+    finished_at: str | None = None
 
     def __post_init__(self) -> None:
         if self.script not in SCRIPTS and self.script not in SCHEDULER_ONLY:
@@ -92,6 +96,11 @@ class Job:
     def done(self) -> bool:
         return self.status not in ("queued", "running")
 
+    @property
+    def current_step(self) -> int | None:
+        """Index of the step running now, or None when none is."""
+        return next((i for i, s in enumerate(self.steps) if s.started_at and not s.finished_at), None)
+
     def summary(self) -> dict:
         return {
             "id": self.id,
@@ -99,7 +108,9 @@ class Job:
             "status": self.status,
             "exit_code": self.exit_code,
             "exit_meaning": EXIT_MEANINGS.get(self.exit_code) if self.exit_code is not None else None,
-            "steps": [{"script": s.script, "args": s.args, "exit_code": s.exit_code} for s in self.steps],
+            "steps": [{"script": s.script, "args": s.args, "exit_code": s.exit_code,
+                       "started_at": s.started_at, "finished_at": s.finished_at} for s in self.steps],
+            "current_step": self.current_step,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
         }
@@ -137,6 +148,7 @@ class JobRunner:
         env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
         code = 0
         for step in job.steps:
+            step.started_at = datetime.now(UTC).isoformat()
             job.lines.append(f"$ python -m {step.module} {' '.join(step.args)}")
             try:
                 proc = subprocess.Popen(
@@ -151,6 +163,7 @@ class JobRunner:
                 job.lines.append(f"error: could not start: {exc}")
                 code = 1
             step.exit_code = code
+            step.finished_at = datetime.now(UTC).isoformat()
             job.lines.append(f"[exit {code}: {EXIT_MEANINGS.get(code, 'error')}]")
             if code != 0:
                 break

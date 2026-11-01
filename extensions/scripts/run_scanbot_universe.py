@@ -42,6 +42,12 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _progress(what: str, done: int, total: int) -> None:
+    """One line per bars chunk and per spread window, as "  <what> <done>/<total>" (the financials step's form,
+    which the UI's job log turns into a progress bar)."""
+    print(f"  {what} {done}/{total}", file=sys.stderr, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -71,7 +77,8 @@ def main(argv: list[str] | None = None) -> int:
 
     load_dotenv(find_dotenv(usecwd=True))
     try:
-        report = funnel.run_funnel(as_of, assets, fetched_at, source, args.preset, cache_dir=args.cache_dir)
+        report = funnel.run_funnel(as_of, assets, fetched_at, source, args.preset, cache_dir=args.cache_dir,
+                                   progress=_progress)
     except (MissingAlpacaKeys, CalendarError, *DATA_ERRORS) as exc:
         print(f"error: {exc}; no report written", file=sys.stderr)
         return EXIT_FAILED

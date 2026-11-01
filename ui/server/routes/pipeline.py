@@ -154,14 +154,15 @@ class BotRun(BaseModel):
 
 @router.post("/scans/run")
 def run_scans(body: ScanRun) -> dict:
+    as_of = common.iso_date(body.as_of)
     if body.kind in CATEGORY_KINDS:
         category = common.category(body.category)
-        steps = common.category_scan_steps(common.iso_date(body.as_of), CATEGORY_KINDS[body.kind], category)
-        return common.start(f"scan:{body.kind}:{category}", steps)
+        steps = common.category_scan_steps(as_of, CATEGORY_KINDS[body.kind], category)
+        return common.start(f"scan:{body.kind}:{category}", [*common.input_steps(as_of), *steps])
     channel = SCAN_KINDS.get(body.kind)
     if channel is None:
         raise common.bad_request(f"kind must be one of {', '.join([*SCAN_KINDS, *CATEGORY_KINDS])}")
-    return common.start(f"scan:{body.kind}", common.channel_scan_steps(common.iso_date(body.as_of), channel))
+    return common.start(f"scan:{body.kind}", [*common.input_steps(as_of), *common.channel_scan_steps(as_of, channel)])
 
 
 @router.post("/pipeline/run")
@@ -170,6 +171,7 @@ def run_pipeline(body: PipelineRun) -> dict:
     stopping at the first failure."""
     as_of, category = common.iso_date(body.as_of), common.category(body.category)
     steps = [
+        *common.input_steps(as_of),
         *common.category_scan_steps(as_of, ("up", "down"), category),
         common.regime_step(as_of, common.ticker(body.regime_symbol)),
         common.router_step(as_of, category),

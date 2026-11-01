@@ -6,6 +6,7 @@ Fake fetchers stand in for Alpaca; no test reaches the network.
 
 import ast
 import json
+import re
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -469,6 +470,27 @@ def test_cli_prints_every_gate_and_writes_the_report(tmp_path, fake_funnel, caps
     assert "survivors: 1  (spread_method sampled)" in out
     (path,) = (tmp_path / "out").glob("universe_*.json")
     assert load_report(path).survivors == ["GOOD"]
+
+
+@pytest.mark.unit
+def test_progress_is_reported_per_bars_chunk_and_spread_window_and_changes_nothing():
+    seen = []
+    with_progress = run_funnel(
+        AS_OF, ASSETS, FETCHED, "assets.json", "DEFAULT", bars_fetcher=FakeBars(), quotes_fetcher=FakeQuotes(),
+        created_at=CREATED, now=NOW, progress=lambda what, done, total: seen.append((what, done, total)),
+    )
+    bars = [s for s in seen if s[0] == "bars"]
+    windows = [s for s in seen if s[0] == "spread windows"]
+    assert bars and bars[-1][1] == bars[-1][2]  # the last chunk reports every symbol fetched
+    assert windows == [("spread windows", i, len(windows)) for i in range(1, len(windows) + 1)]
+    assert with_progress.to_dict() == _run().to_dict()
+
+
+@pytest.mark.unit
+def test_cli_prints_progress_lines_the_job_log_can_read(tmp_path, fake_funnel, capsys):
+    cli.main(["--as-of", "2026-09-30", "--assets-file", str(_snapshot(tmp_path)), "--out-dir", str(tmp_path / "out")])
+    err = capsys.readouterr().err
+    assert re.search(r"^  bars \d+/\d+$", err, re.M) and re.search(r"^  spread windows \d+/\d+$", err, re.M)
 
 
 @pytest.mark.unit

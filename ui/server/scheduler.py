@@ -183,7 +183,7 @@ class Scheduler:
             steps = [jobs.Step("run_daily", ["--as-of", as_of])]
             what = settings.AUTOMATION_RUNS[run]
         else:
-            steps = common.category_scan_steps(as_of, common.CATEGORY_SCANS, category)
+            steps = [*common.input_steps(as_of), *common.category_scan_steps(as_of, common.CATEGORY_SCANS, category)]
             what = f"{settings.AUTOMATION_RUNS[run]}, category {category}"
         try:
             job = self._start(f"scheduled:{run}", steps, "pipeline")

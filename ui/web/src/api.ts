@@ -366,9 +366,18 @@ export interface Job {
   status: "queued" | "running" | "ok" | "failed" | "blocked";
   exit_code: number | null;
   exit_meaning: string | null;
-  steps: { script: string; args: string[]; exit_code: number | null }[];
+  steps: JobStep[];
+  current_step?: number | null; // index of the step running now
   created_at: string;
   finished_at: string | null;
+}
+
+export interface JobStep {
+  script: string;
+  args: string[];
+  exit_code: number | null;
+  started_at?: string | null;
+  finished_at?: string | null;
 }
 
 export const api = {
