@@ -3,9 +3,11 @@
 A local web screen for this fork: Dashboard, Scans, Research, Strategy and Trade.
 It runs the scripts in `extensions/scripts`, reads the JSON and Markdown they
 write under `~/.tradingagents`, and reads the Alpaca **paper** account.
-It does not change upstream `cli/` or `tradingagents/`, and it **places no orders**:
-Liquidate and Close all Positions are shown but disabled, and the server has no
-endpoint that sends anything to the broker (see `tests/ui/test_no_orders.py`).
+It does not change upstream `cli/` or `tradingagents/`, and the server **never talks to
+the broker to place orders itself**: Liquidate and Close all Positions are shown but
+disabled, and no endpoint calls an Alpaca order method (see `tests/ui/test_no_orders.py`).
+Paper orders go out only through `paper_orders.sender`, started as a job by the
+scheduler's auto-send or by a confirmed Send on a Trade page paper ticket.
 
 ## Run
 
@@ -29,6 +31,11 @@ Development with hot reload: run `python -m ui.server --reload` and, in
   TradingAgents reports with plain `json` (newest `created_at` wins, as in the router).
 - `ui/server/broker.py` is the only module that imports `alpaca.trading`; its
   `ReadOnlyBroker` exposes account, portfolio history, positions and orders, nothing else.
+- Trade page order entry: Order… on a "To trade" row writes a manual paper ticket
+  (`ui/server/manual_tickets.py`, in `~/.tradingagents/tickets/manual/`), using symbol, side and
+  date from the queued row. Preview runs `paper_orders.sender --manual <name>` (a dry run);
+  a confirmed Send adds `--send`. The entry is a limit DAY order. Running Send again after it
+  fills places the OCO exit: target, and a stop the same distance from the actual fill.
 
 ## HTTPS behind antivirus
 

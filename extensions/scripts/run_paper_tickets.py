@@ -28,15 +28,28 @@ The basket gets the lesser of 23% of the series' original buying power and the
 buying power read now. The original buying power is the one read on the
 series' first run, kept in ~/.tradingagents/tickets/series.json unless
 --series-file is set; when the file is missing, or --new-series is given, the
-buying power read now is recorded there and used. If the allocation is under 5%
-of equity, no tickets are written. Otherwise each of the N allowed names with
+buying power read now is recorded there and used. When ADX(14) on the as-of
+daily bar is under 15 for both SPY and QQQ, the allocation is multiplied by 0.7.
+If the allocation is under 5% of equity, no tickets are written. Otherwise each of the N allowed names with
 usable levels gets allocation / N and floor(that / limit entry) shares. When
 the basket's total stop-risk is over 8% of equity, every name's quantity is
 scaled down by the same factor (rounded down) until it fits; a name left with
 no share is skipped. Names in the
-earnings blackout are listed as skipped with the earnings date. The TTM
-Squeeze gate is not run and no market data is read. If the market label is
-not SIDE, nothing is read from the account and nothing is written. No orders.
+earnings blackout are listed as skipped with the earnings date.
+
+Before sizing, each channel member must pass the confirmation filters
+(``extensions.status.confirmation``) on its daily bars: a daily TTM Squeeze
+release in the trade's direction on the as-of session or the one before, or
+RSI(14) <= 45 (long) / >= 55 (short); and the as-of session's volume at most its
+20-session average. A name that fails is listed as skipped with the reason
+("awaiting squeeze release or RSI extreme", "volume not light"). Whether the
+last 4-hour bar sits within 0.5 ATR of its own 4-hour line is printed and
+recorded, never filtered on. The bars are read on that SIDE day only, through
+paper_orders.session_bars (HTTPS GET to data.alpaca.markets, paper keys only, no
+Alpaca package): SIP daily bars for the names, SPY and QQQ, and IEX 30-minute
+bars for the names, rolled into regular-session 4-hour bars. If the market
+label is not SIDE, nothing is read from the account or the market-data API and
+nothing is written. No orders.
 """
 
 from __future__ import annotations
@@ -45,11 +58,18 @@ import argparse
 import os
 import sys
 from collections.abc import Callable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from extensions.status import squeeze_gate
+from extensions.status.confirmation import (
+    DAILY_LOOKBACK_DAYS,
+    FOUR_HOUR_LOOKBACK_DAYS,
+    INDEXES,
+    MarketData,
+)
 from extensions.status.paper_tickets import (
     Account,
     TicketInputError,
@@ -59,6 +79,7 @@ from extensions.status.paper_tickets import (
     save_tickets,
     tickets_for_date,
 )
+from paper_orders.session_bars import BARS_PATH, DATA_URL, BarsReadFailed, data_reader
 from paper_orders.snapshot import ACCOUNT_PATH, PAPER_URL, NotPaperKey, ReadFailed, paper_reader
 
 EXIT_OK, EXIT_BAD_INPUT = 0, 2
@@ -75,6 +96,20 @@ def read_paper_account() -> Account:
     return account_from_alpaca(raw, datetime.now(UTC), f"GET {PAPER_URL}{ACCOUNT_PATH}")
 
 
+def read_market_data(as_of: date, symbols: list[str]) -> MarketData:
+    """Daily bars for the names and the indexes, and 4-hour bars for the names, from the market-data API. Read-only."""
+    load_dotenv(REPO_ROOT / ".env")
+    names = [s for s in symbols if s not in INDEXES]
+    try:
+        reader = data_reader(os.environ)
+        daily = reader.bars_daily(symbols, as_of - timedelta(days=DAILY_LOOKBACK_DAYS), as_of)
+        thirty = reader.bars_30min(names, as_of - timedelta(days=FOUR_HOUR_LOOKBACK_DAYS), as_of)
+    except (NotPaperKey, BarsReadFailed) as exc:
+        raise TicketInputError(f"cannot read bars for the confirmation filters: {exc}") from exc
+    return MarketData(daily, squeeze_gate.roll_session_bars(thirty, "4h"), f"GET {DATA_URL}{BARS_PATH} (1Day sip, "
+                      f"30Min iex rolled to regular-session 4h)")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Paper-order tickets for the allowed SIDE names (no orders).")
     parser.add_argument("--as-of", required=True, help="the date to ticket, YYYY-MM-DD")
@@ -89,7 +124,8 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None, read_account: Callable[[], Account] = read_paper_account) -> int:
+def main(argv: list[str] | None = None, read_account: Callable[[], Account] = read_paper_account,
+         read_market: Callable[[date, list[str]], MarketData] = read_market_data) -> int:
     try:
         refuse_trading_client()
     except TradingClientLoaded as exc:
@@ -103,7 +139,7 @@ def main(argv: list[str] | None = None, read_account: Callable[[], Account] = re
         return EXIT_BAD_INPUT
     try:
         result = tickets_for_date(as_of, args.status_dir, args.handoff_dir, read_account, args.scan_dir,
-                                  args.series_file, args.new_series)
+                                  args.series_file, args.new_series, read_market)
     except TicketInputError as exc:
         print(f"error: {exc}; nothing written", file=sys.stderr)
         return EXIT_BAD_INPUT
@@ -115,8 +151,12 @@ def main(argv: list[str] | None = None, read_account: Callable[[], Account] = re
               f"(read {rules['account_read_at']})")
         recorded = " (recorded on this run)" if rules.get("series_recorded_this_run") else ""
         print(f"  series: original buying power ${rules['original_buying_power']:,.2f}{recorded}")
+        adx = ", ".join(f"{sym} {value:.1f}" for sym, value in (rules["index_adx_14"] or {}).items())
+        calm = (f"x {rules['calm_scale']:g} (both under 15)" if rules["calm_scale"] != 1 else "no scale")
+        print(f"  index ADX(14): {adx}: {calm}")
         print(f"  allocation ${rules['basket_allocation']:,.2f} (lesser of "
-              f"{rules['basket_pct_of_original_buying_power']:.0%} of original buying power and buying power), "
+              f"{rules['basket_pct_of_original_buying_power']:.0%} of original buying power and buying power"
+              f"{', ' + calm if rules['calm_scale'] != 1 else ''}), "
               f"floor ${rules['allocation_floor']:,.2f} ({rules['floor_pct_of_equity']:.0%} of equity)")
         if rules["name_notional_limit"] is not None:
             print(f"  N = {rules['names_n']}: ${rules['name_notional_limit']:,.2f} a name (allocation / N)")
@@ -134,6 +174,12 @@ def main(argv: list[str] | None = None, read_account: Callable[[], Account] = re
         print(f"       channel {t.line} {t.channel_level}; stop: clustered swing {swing} {t.stop_swing} "
               f"({t.stop_swing_date}) {sign} {rules['stop_atr_beyond_swing']:g} x ATR {t.atr_14:.4f} = {t.stop_calculated:.4f}, "
               f"snapped to {t.stop:.2f}")
+        conf = t.confirmation or {}
+        flag = conf.get("four_hour") or {}
+        near = {True: "near", False: "not near", None: "not measured"}[flag.get("near")]
+        print(f"       confirmed by {' + '.join(conf.get('triggers') or [])}: RSI(14) {conf.get('rsi_14')}, volume "
+              f"{conf.get('volume') or 0:,.0f} vs 20-session average {conf.get('volume_avg_20') or 0:,.0f}; "
+              f"4-hour {flag.get('line')}: {near} (recorded only)")
     if result.tickets:
         print(f"  book: notional ${result.total_notional:,.2f} of buying power ${rules['buying_power']:,.2f}, "
               f"stop-risk ${result.total_risk:,.2f}")

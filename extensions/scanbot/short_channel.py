@@ -2,8 +2,10 @@
 
 Each WEAK survivor is checked on split-adjusted SIP daily bars dated on or
 before as_of. The channel is the same as the long scan's (SCANBot.md 4.3, 4.4):
-confirmed ZigZag swings whose extreme bar is inside the last 60 sessions,
-resistance the median of the swing highs, support the median of the swing lows.
+of the confirmed ZigZag swings whose extreme bar is inside the last 60 sessions,
+resistance is the higher of the last two swing highs and support the lower of
+the last two swing lows (``long_channel.channel_lines``). Touches still count
+every swing of its kind in the 60 sessions.
 
 A name passes only if all of these hold:
 
@@ -13,8 +15,8 @@ A name passes only if all of these hold:
 - ADX(14) <= 20 on the as-of bar
 - channel height, (resistance - support) / close, is 8% to 22%
 - at least two support touches and two resistance touches in 60 sessions
-- close is inside 0.6 ATR(14) below resistance, and not through resistance by
-  more than 0.25 ATR
+- close is at or below resistance and at most 0.6 ATR(14) below it (inclusive);
+  any close above resistance fails
 - it passes at least one pivot confirmation (``pivot_confirm``): a daily
   close reclaim of resistance (tagged, then closed back below) in the last 5
   sessions, or a 4-hour lower high after the daily pivot on regular-session
@@ -28,7 +30,9 @@ and recorded for every measured name, but they are not required here. So is
 the last 120 sessions (or all the bars, when there are fewer), the lowest one
 above resistance that has another swing high in that window within 1 ATR(14)
 of it and is no more than 3 ATR(14) above resistance, which the paper tickets
-use for the stop; no rule here reads it. This step builds no
+use for the stop; no rule here reads it. Each call records the at-resistance
+band (``at_resistance_band``) and the swings that set each line
+(``channel_line_swings``) for the paper tickets to read. This step builds no
 ranking, score or TickerBasket. Nothing here places an order.
 """
 
@@ -50,9 +54,13 @@ from extensions.scanbot import pivot_confirm
 from extensions.scanbot.financials import WEAK, FinancialsReport
 from extensions.scanbot.funnel import FEED, _fetch_in_chunks, default_report_dir
 from extensions.scanbot.long_channel import (
+    _EDGE,
+    BAND_ATR_MAX,
+    BAND_ATR_MIN,
     CHANNEL_LOOKBACK,
     CHANNEL_MAX_HEIGHT_PCT,
     CHANNEL_MIN_HEIGHT_PCT,
+    LINE_SWINGS,
     MIN_BARS,
     MIN_TOUCHES,
     SIDE_ADX_MAX,
@@ -65,6 +73,9 @@ from extensions.scanbot.long_channel import (
     _recorded_trend_metrics,
     _round,
     _touch,
+    band_record,
+    channel_lines,
+    line_swings_record,
     stop_swing,
 )
 from extensions.scanbot.pivot import (
@@ -83,6 +94,7 @@ SCAN_NAME = "SCAN-ShortSidewaysChannel"
 MODE = "SHORT_SIDE"
 PIVOT_SIDE = "SHORT"
 
+# The scan's old at-resistance window. The scan no longer uses it; side_confirm_4h and side_handoff still read it.
 PIVOT_ATR_MAX = 0.6
 BREAK_ATR_MAX = 0.25
 
@@ -103,7 +115,7 @@ TOO_FEW_RESISTANCE = "resistance_touches_under_2"
 HEIGHT_TOO_SMALL = "height_under_8pct"
 HEIGHT_TOO_LARGE = "height_over_22pct"
 TOO_FAR_BELOW_RESISTANCE = "close_over_0.6atr_below_resistance"
-THROUGH_RESISTANCE = "close_over_0.25atr_through_resistance"
+THROUGH_RESISTANCE = "close_above_resistance"
 NO_PIVOT_CONFIRMATION = "no_pivot_confirmation"
 REASONS = (
     NOT_SHORTABLE, NOT_EASY_TO_BORROW, NO_BARS, SHORT_HISTORY, ADX_ABOVE_MAX, TOO_FEW_SUPPORT,
@@ -142,13 +154,14 @@ POLICY = {
     "channel_lookback_sessions": CHANNEL_LOOKBACK,
     "channel_height_pct": [CHANNEL_MIN_HEIGHT_PCT, CHANNEL_MAX_HEIGHT_PCT],
     "channel_height_base": "close",
-    "channel_lines": "median of confirmed swing highs / lows with the extreme inside the lookback",
+    "channel_lines": "support: the lower of the last two confirmed swing lows; resistance: the higher of the last "
+                     "two confirmed swing highs; extremes inside the lookback",
+    "channel_line_swings": LINE_SWINGS,
     "swing_method": "zigzag_high_low_confirmed_on_close",
     "swing_reversal_pct": SWING_REVERSAL_PCT,
     "min_touches_each_side": MIN_TOUCHES,
     "atr_period": ATR_PERIOD,
-    "pivot_atr_max_below_resistance": PIVOT_ATR_MAX,
-    "break_atr_max_above_resistance": BREAK_ATR_MAX,
+    "at_resistance_band_atr": [BAND_ATR_MIN, BAND_ATR_MAX],
     "min_bars": MIN_BARS,
     **pivot_confirm.rules(PIVOT_SIDE),
     "recorded_not_required": ["sma50_slope", "sma_tangle", "quality_checks", "stop_swing_high"],
@@ -219,12 +232,12 @@ def check_channel(
             codes.append(HEIGHT_TOO_LARGE)
             detail.append(f"channel height {height_pct:.2f}% is over {CHANNEL_MAX_HEIGHT_PCT:g}%")
     if distance_atr is not None:
-        if distance_atr < -PIVOT_ATR_MAX:
+        if distance_atr < -BAND_ATR_MAX - _EDGE:
             codes.append(TOO_FAR_BELOW_RESISTANCE)
-            detail.append(f"close is {-distance_atr:.2f} ATR below resistance, over {PIVOT_ATR_MAX:g}")
-        if distance_atr > BREAK_ATR_MAX:
+            detail.append(f"close is {-distance_atr:.2f} ATR below resistance, over {BAND_ATR_MAX:g}")
+        if distance_atr > -BAND_ATR_MIN + _EDGE:
             codes.append(THROUGH_RESISTANCE)
-            detail.append(f"close is {distance_atr:.2f} ATR through resistance, over {BREAK_ATR_MAX:g}")
+            detail.append(f"close is {distance_atr:.2f} ATR above resistance")
     return codes, detail
 
 
@@ -281,8 +294,7 @@ def classify_short_channel(
     swings = [s for s in all_swings if s.index >= first_in_window]
     highs = [s for s in swings if s.kind == SWING_HIGH]
     lows = [s for s in swings if s.kind == SWING_LOW]
-    resistance = float(np.median([s.price for s in highs])) if highs else None
-    support = float(np.median([s.price for s in lows])) if lows else None
+    support, resistance, low_pair, high_pair = channel_lines(swings)
     height_pct = 100 * (resistance - support) / last_close if highs and lows else None
     distance_atr = (last_close - resistance) / atr if resistance is not None and np.isfinite(atr) and atr > 0 else None
 
@@ -312,7 +324,9 @@ def classify_short_channel(
         "height_pct": _round(height_pct),
         "support_touches": [_touch(s, bars) for s in lows],
         "resistance_touches": [_touch(s, bars) for s in highs],
+        "channel_line_swings": line_swings_record(low_pair, high_pair, bars),
         "distance_to_resistance_atr": _round(distance_atr),
+        "at_resistance_band": band_record(resistance, atr, PIVOT_SIDE),
         "stop_swing_high": stop_swing(bars, all_swings, SWING_HIGH, resistance, atr),
         "pivot_confirmation": pivot_confirm.recorded(bars, swings, resistance, PIVOT_SIDE),
         **_recorded_trend_metrics(close),

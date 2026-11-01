@@ -194,12 +194,11 @@ Quality, at least two:
 
 ### 4.3 Low pivot — `SCAN-LongSidewaysChannel`
 
-Profitable, strong-financial companies only. The channel is the median of the touch highs and the median of the touch lows over 60 sessions. Width must be 8% to 22%.
+Profitable, strong-financial companies only. The channel lines come from the last two confirmed ZigZag swings (5% reversal) of each kind whose extreme bar is inside the last 60 sessions: support is the lower of the last two swing lows, resistance the higher of the last two swing highs. Touches still count every swing of its kind in the 60 sessions (at least two each side). Width must be 8% to 22%. Each call records the swings that set each line (`channel_line_swings`) and the at-line band in ATR and in price (`at_support_band`).
 
 Structure, all required:
 
-- Close is inside 0.6 ATR of channel support.
-- Close is not through support by more than 0.25 ATR.
+- Close is at or above support and at most 0.6 ATR above it (both edges inclusive). Any close below support fails; there is no penetration allowance.
 - ADX is still <= 20 on the as-of bar.
 - Financial gate in section 3.2, strong side, has already passed.
 
@@ -209,7 +208,7 @@ Pivot confirmation, at least one, on bars dated on or before as_of (`extensions/
 - Close reclaim (daily bars): a daily low at or below support in the last 5 sessions, and the as-of close strictly above support. A reclaim that has since been lost fails.
 - 4-hour higher low (regular-session 4-hour bars, 09:30–13:30 and 13:30–16:00, fetched for structure passes only): on bars from the pivot day, take the lowest 4-hour low L (latest bar on ties). A higher low is a later bar q with low[q] > L, low[q] < low[q−1] and low[q] <= low[q+1], after a bar between them traded above the L bar's high. The bar after q must exist. The latest such q must not have been undercut by any later low.
 
-The scan does not run the TTM Squeeze gate, and neither do the paper tickets. The gate code stays in `extensions/status/squeeze_gate.py` but nothing calls it.
+The scan does not run the TTM Squeeze. Confirmation happens in the paper ticket step (`extensions/status/confirmation.py`), so a name can sit in this basket for days before it is ticketed: a daily TTM Squeeze release in the trade's direction on the as-of session or the one before, or RSI(14) <= 45 (long) / >= 55 (short), and the as-of session's volume at most its 20-session average. The 4-hour/1-hour squeeze gate in `extensions/status/squeeze_gate.py` is not called.
 
 Quality, at least two: RSI(14) 35–48, volume SMA(5) below the 20-day average, lower wick at least 40% of that bar's range, no close below support in the last 3 sessions.
 
@@ -217,12 +216,11 @@ Quality, at least two: RSI(14) 35–48, volume SMA(5) below the 20-day average, 
 
 ### 4.4 High pivot — `SCAN-ShortSidewaysChannel`
 
-Losing, weak-financial companies only. Same channel definition as the long scan.
+Losing, weak-financial companies only. Same channel definition as the long scan (the last two swings of each kind); the band and line swings are recorded as `at_resistance_band` and `channel_line_swings`.
 
 Structure, all required:
 
-- Close is inside 0.6 ATR of channel resistance.
-- Close is not through resistance by more than 0.25 ATR.
+- Close is at or below resistance and at most 0.6 ATR below it (both edges inclusive). Any close above resistance fails.
 - ADX is still <= 20.
 - `easy_to_borrow` is true on the as-of snapshot.
 - Financial gate in section 3.2, weak side, has already passed.
@@ -233,7 +231,7 @@ Pivot confirmation, at least one, as in 4.3 and mirrored:
 - Close reclaim: a daily high at or above resistance in the last 5 sessions, and the as-of close strictly below resistance.
 - 4-hour lower high: after the highest 4-hour high H from the pivot day, a bar traded below the H bar's low, then a bar q with high[q] < H, high[q] > high[q−1] and high[q] >= high[q+1], not exceeded by any later high.
 
-The scan does not run the TTM Squeeze gate, and neither do the paper tickets.
+The scan does not run the TTM Squeeze; the paper tickets confirm as in 4.3, mirrored.
 
 Quality, at least two: RSI(14) 52–65, volume SMA(5) below the 20-day average, upper wick at least 40% of that bar's range, no close above resistance in the last 3 sessions.
 

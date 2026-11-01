@@ -1,6 +1,6 @@
 """SCAN-LongSidewaysChannel keeps STRONG names with ADX <= 20, an 8-22% channel with two touches
-on each side in 60 sessions, a close within 0.6 ATR above support and no more than 0.25 ATR
-through it, and a pivot confirmation (a daily close reclaim or a 4-hour higher low). It does not
+on each side in 60 sessions, a close from 0 to 0.6 ATR above support (never below it), and a pivot
+confirmation (a daily close reclaim or a 4-hour higher low). It does not
 run the TTM Squeeze gate. It ignores bars after as_of, counts every name once, and never
 overwrites. No network.
 """
@@ -30,9 +30,10 @@ from extensions.scanbot.long_channel import (
     load_report,
     run_long_channel,
     save_report,
+    channel_lines,
     stop_swing,
 )
-from extensions.scanbot.pivot import SWING_LOW, Swing
+from extensions.scanbot.pivot import SWING_HIGH, SWING_LOW, Swing
 from extensions.scripts import run_scanbot_long_channel as cli
 from tests.extensions.test_pivot_confirm import HIGHER_LOWS, four_hour_frame
 
@@ -57,7 +58,7 @@ WIDE = _triangle(260, hi=130.0)
 BROKEN = _triangle(259) + [97.0]
 RISING = [100 + 0.5 * i for i in range(260)]
 # At support, but the last daily low at support (2026-09-22) is 6 sessions back: no close reclaim.
-NO_RECLAIM = _triangle(254, half=6) + [101.0, 100.4, 100.9, 100.3, 100.8, 100.3]
+NO_RECLAIM = _triangle(254, half=6) + [101.0, 100.4, 100.9, 100.3, 100.8, 100.2]
 
 
 def _frame(symbol, closes, end=AS_OF):
@@ -70,7 +71,7 @@ def _frame(symbol, closes, end=AS_OF):
 
 
 def _check(**overrides):
-    numbers = dict(adx=15.0, support_touches=2, resistance_touches=2, height_pct=12.0, distance_atr=0.3)
+    numbers = dict(adx=15.0, support_touches=2, resistance_touches=2, height_pct=12.0, distance_atr=0.2)
     numbers.update(overrides)
     return check_channel(**numbers)[0]
 
@@ -98,10 +99,15 @@ def test_two_touches_each_side_are_required():
     assert _check(support_touches=1, resistance_touches=0) == [TOO_FEW_SUPPORT, TOO_FEW_RESISTANCE]
 
 
-def test_pivot_band_is_0_6_above_and_0_25_through():
-    assert _check(distance_atr=0.6) == [] and _check(distance_atr=-0.25) == []
+def test_the_band_is_0_to_0_6_atr_above_support_inclusive():
+    assert _check(distance_atr=0.0) == [] and _check(distance_atr=0.6) == []
+    assert _check(distance_atr=0.4) == [] and _check(distance_atr=0.5) == []  # past the old 0.4 limit, inside 0.6
     assert _check(distance_atr=0.61) == [TOO_FAR_ABOVE_SUPPORT]
-    assert _check(distance_atr=-0.26) == [THROUGH_SUPPORT]
+
+
+def test_any_close_below_support_fails():
+    assert _check(distance_atr=-0.01) == [THROUGH_SUPPORT]
+    assert _check(distance_atr=-0.25) == [THROUGH_SUPPORT]  # the old 0.25 ATR allowance is gone
 
 
 # --- bars --------------------------------------------------------------------
@@ -112,12 +118,13 @@ def test_range_at_support_passes_on_bars():
     m = call.metrics
     assert m["adx_14"] <= 20 and 8 <= m["height_pct"] <= 22
     assert len(m["support_touches"]) >= 2 and len(m["resistance_touches"]) >= 2
-    assert -0.25 <= m["distance_to_support_atr"] <= 0.6
+    assert 0 <= m["distance_to_support_atr"] <= 0.6
+    assert m["at_support_band"] == {"atr_min": 0.0, "atr_max": 0.6, "low": 99.5, "high": round(99.5 + 0.6 * 1.7, 4)}
 
 
 def test_failures_on_bars_carry_the_right_reason():
     assert classify_long_channel(_frame("A", MID_CHANNEL)).reasons == [TOO_FAR_ABOVE_SUPPORT]
-    assert classify_long_channel(_frame("A", NARROW)).reasons == [HEIGHT_TOO_SMALL]
+    assert HEIGHT_TOO_SMALL in classify_long_channel(_frame("A", NARROW)).reasons
     assert classify_long_channel(_frame("A", WIDE)).reasons == [HEIGHT_TOO_LARGE]
     assert THROUGH_SUPPORT in classify_long_channel(_frame("A", BROKEN)).reasons
     trend = classify_long_channel(_frame("A", RISING))
@@ -373,3 +380,45 @@ def test_cli_picks_the_newest_financials_report_and_writes(tmp_path, monkeypatch
 
 def test_cli_without_a_financials_report_is_bad_input(tmp_path):
     assert cli.main(["--as-of", "2026-09-30", "--report-dir", str(tmp_path)]) == cli.EXIT_BAD_INPUT
+
+
+# --- the channel lines: the last two swings ----------------------------------
+
+def test_lines_come_from_the_last_two_swings_of_each_kind():
+    """Lows 99 (oldest), 95, 97: the median would be 97, the last two set support at the lower, 95. Highs 104
+    (oldest), 110, 108: the median would be 108, the last two set resistance at the higher, 110."""
+    swings = [Swing(SWING_LOW, 5, 99.0, 8), Swing(SWING_HIGH, 10, 104.0, 13), Swing(SWING_LOW, 20, 95.0, 23),
+              Swing(SWING_HIGH, 30, 110.0, 33), Swing(SWING_LOW, 40, 97.0, 43), Swing(SWING_HIGH, 50, 108.0, 53)]
+    support, resistance, low_pair, high_pair = channel_lines(swings)
+    assert (support, resistance) == (95.0, 110.0)
+    assert [s.index for s in low_pair] == [20, 40] and [s.index for s in high_pair] == [30, 50]
+
+
+def test_one_swing_sets_its_line_and_none_leaves_it_unset():
+    assert channel_lines([Swing(SWING_LOW, 5, 99.0, 8)])[:2] == (99.0, None)
+    assert channel_lines([])[:2] == (None, None)
+
+
+def test_an_older_deeper_low_in_the_window_does_not_move_support():
+    """A 14-bar cycle puts four confirmed swing lows in the 60 sessions, at -57, -43, -29 and -15 (the trough on
+    the last bar is not confirmed yet). Deepening -43 leaves support at the last two (99.5); deepening -29, one of
+    the last two, moves support down to it (97.5) where the median of the four would have stayed at 99.5."""
+    base = _triangle(260, half=7)
+    older = list(base)
+    older[-43] = 98.0
+    call = classify_long_channel(_frame("A", older))
+    assert call.metrics["support"] == 99.5 and call.passed
+    recent = list(base)
+    recent[-29] = 98.0
+    frame = _frame("A", recent)
+    m = classify_long_channel(frame).metrics
+    assert m["support"] == 97.5
+    assert [t["date"] for t in m["channel_line_swings"]["support"]] == [
+        frame["date"].iloc[-29].date().isoformat(), frame["date"].iloc[-15].date().isoformat()]
+    assert len(m["support_touches"]) == 4  # touches still count every swing low in the 60 sessions
+
+
+def test_the_report_records_the_band_and_the_line_swings():
+    m = classify_long_channel(_frame("A", AT_SUPPORT)).metrics
+    assert len(m["channel_line_swings"]["support"]) == 2 and len(m["channel_line_swings"]["resistance"]) == 2
+    assert m["at_support_band"]["low"] == m["support"]

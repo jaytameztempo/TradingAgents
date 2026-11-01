@@ -209,12 +209,16 @@ def test_auto_send_with_no_recent_tickets_sends_nothing(home):
     assert started == [] and sched.status()["events"][0]["outcome"] == "skipped"
 
 
-# --- only the scheduler can start the sender ------------------------------------------------
+# --- only the scheduler and the manual ticket send start the sender -------------------------
 
 @pytest.mark.unit
-def test_no_route_can_start_the_sender():
+def test_no_route_but_the_manual_ticket_send_can_start_the_sender():
     for path in (UI_ROOT / "server" / "routes").glob("*.py"):
         text = path.read_text(encoding="utf-8")
+        if path.name == "trade.py":
+            # One ticket by name, never a whole day's file.
+            assert '["--manual", name' in text and "--as-of" not in text
+            continue
         assert not re.search(r"SENDER|paper_orders\.sender|paper_orders_sender|SCHEDULER_ONLY", text), path.name
     assert jobs.SENDER not in jobs.SCRIPTS
 

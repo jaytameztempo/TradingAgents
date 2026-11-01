@@ -36,17 +36,18 @@ SCRIPTS = frozenset({
     "run_daily",  # the 13-step daily SIDE pipeline; it writes paper tickets but never sends an order
 })
 
-# The paper order sender. Only the in-app scheduler starts it (ui/server/scheduler.py), and only when
-# auto-send is switched on in Settings; no HTTP route can. The sender itself checks the trading window,
-# paper keys and the paper URL, and never sends a client order ID twice.
+# The paper order sender. Two places start it: the in-app scheduler (ui/server/scheduler.py), only when
+# auto-send is switched on in Settings, and the Trade page's manual ticket route (ui/server/routes/trade.py),
+# which only ever passes --manual <one ticket> and adds --send only on a confirmed request. The sender
+# itself checks the trading window, paper keys and the paper URL, and never sends a client order ID twice.
 SENDER = "paper_orders_sender"
 SCHEDULER_ONLY = {SENDER: "paper_orders.sender"}
 
 # Exit codes shared by the extension scripts.
 EXIT_MEANINGS = {0: "ok", 1: "failed", 2: "bad input", 3: "regime mismatch: bot blocked"}
 
-# Jobs in the same group may not run at the same time (one research run, one pipeline).
-EXCLUSIVE_GROUPS = frozenset({"research", "pipeline"})
+# Jobs in the same group may not run at the same time (one research run, one pipeline, one sender).
+EXCLUSIVE_GROUPS = frozenset({"research", "pipeline", "sender"})
 
 MAX_JOBS_KEPT = 100
 

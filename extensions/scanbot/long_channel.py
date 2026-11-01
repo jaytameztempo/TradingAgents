@@ -2,9 +2,11 @@
 
 Each STRONG survivor is checked on split-adjusted SIP daily bars dated on or
 before as_of. Swings come from the pivot step's ZigZag (5% reversal, confirmed
-on close, no lookahead). The channel uses the confirmed swings whose extreme
-bar is inside the last 60 sessions: resistance is the median of the swing
-highs, support the median of the swing lows (SCANBot.md 4.3).
+on close, no lookahead). The channel lines use the last two confirmed swings
+of each kind whose extreme bar is inside the last 60 sessions: support is the
+lower of the last two swing lows, resistance the higher of the last two swing
+highs (``channel_lines``; SCANBot.md 4.3). Touches still count every swing of
+its kind in the 60 sessions.
 
 A name passes only if all of these hold:
 
@@ -12,8 +14,8 @@ A name passes only if all of these hold:
 - ADX(14) <= 20 on the as-of bar
 - channel height, (resistance - support) / close, is 8% to 22%
 - at least two support touches and two resistance touches in 60 sessions
-- close is inside 0.6 ATR(14) above support, and not through support by
-  more than 0.25 ATR
+- close is at or above support and at most 0.6 ATR(14) above it (inclusive);
+  any close below support fails
 - it passes at least one pivot confirmation (``pivot_confirm``): a daily
   close reclaim of support in the last 5 sessions, or a 4-hour higher low
   after the daily pivot on regular-session 4-hour bars, which are fetched for
@@ -28,7 +30,9 @@ and recorded for every measured name, but they are not required here. So is
 the last 120 sessions (or all the bars, when there are fewer), the highest one
 below support that has another swing low in that window within 1 ATR(14) of
 it and is no more than 3 ATR(14) below support, which the paper tickets use
-for the stop; no rule here reads it. This
+for the stop; no rule here reads it. Each call records the at-support band
+(``at_support_band``) and the swings that set each line (``channel_line_swings``)
+for the paper tickets to read. This
 step builds no short channel scan, ranking, score or TickerBasket. Nothing
 here places an order.
 """
@@ -67,6 +71,7 @@ from extensions.scanbot.pivot import (
     wilder_rsi,
     zigzag_swings,
 )
+from extensions.scanbot.swings import LINE_SWINGS, channel_lines
 from extensions.status import squeeze_gate
 
 REPORT_VERSION = 1
@@ -78,6 +83,8 @@ SIDE_ADX_MAX = ADX_SIDE_BELOW  # 20; the scan allows ADX equal to it
 CHANNEL_LOOKBACK = 60
 CHANNEL_MIN_HEIGHT_PCT, CHANNEL_MAX_HEIGHT_PCT = 8.0, 22.0
 MIN_TOUCHES = 2
+BAND_ATR_MIN, BAND_ATR_MAX = 0.0, 0.6  # close - support, in ATR(14), both inclusive
+# The scan's old at-support window. The scan no longer uses it; side_confirm_4h and side_handoff still read it.
 PIVOT_ATR_MAX = 0.6
 BREAK_ATR_MAX = 0.25
 MIN_BARS = CHANNEL_LOOKBACK
@@ -103,7 +110,7 @@ TOO_FEW_RESISTANCE = "resistance_touches_under_2"
 HEIGHT_TOO_SMALL = "height_under_8pct"
 HEIGHT_TOO_LARGE = "height_over_22pct"
 TOO_FAR_ABOVE_SUPPORT = "close_over_0.6atr_above_support"
-THROUGH_SUPPORT = "close_over_0.25atr_through_support"
+THROUGH_SUPPORT = "close_below_support"
 NO_PIVOT_CONFIRMATION = "no_pivot_confirmation"
 REASONS = (
     NO_BARS, SHORT_HISTORY, ADX_ABOVE_MAX, TOO_FEW_SUPPORT, TOO_FEW_RESISTANCE,
@@ -149,13 +156,14 @@ POLICY = {
     "channel_lookback_sessions": CHANNEL_LOOKBACK,
     "channel_height_pct": [CHANNEL_MIN_HEIGHT_PCT, CHANNEL_MAX_HEIGHT_PCT],
     "channel_height_base": "close",
-    "channel_lines": "median of confirmed swing highs / lows with the extreme inside the lookback",
+    "channel_lines": "support: the lower of the last two confirmed swing lows; resistance: the higher of the last "
+                     "two confirmed swing highs; extremes inside the lookback",
+    "channel_line_swings": LINE_SWINGS,
     "swing_method": "zigzag_high_low_confirmed_on_close",
     "swing_reversal_pct": SWING_REVERSAL_PCT,
     "min_touches_each_side": MIN_TOUCHES,
     "atr_period": ATR_PERIOD,
-    "pivot_atr_max_above_support": PIVOT_ATR_MAX,
-    "break_atr_max_below_support": BREAK_ATR_MAX,
+    "at_support_band_atr": [BAND_ATR_MIN, BAND_ATR_MAX],
     "min_bars": MIN_BARS,
     **pivot_confirm.rules(PIVOT_SIDE),
     "recorded_not_required": ["sma50_slope", "sma_tangle", "quality_checks", "stop_swing_low"],
@@ -213,13 +221,32 @@ def check_channel(
             codes.append(HEIGHT_TOO_LARGE)
             detail.append(f"channel height {height_pct:.2f}% is over {CHANNEL_MAX_HEIGHT_PCT:g}%")
     if distance_atr is not None:
-        if distance_atr > PIVOT_ATR_MAX:
+        if distance_atr > BAND_ATR_MAX + _EDGE:
             codes.append(TOO_FAR_ABOVE_SUPPORT)
-            detail.append(f"close is {distance_atr:.2f} ATR above support, over {PIVOT_ATR_MAX:g}")
-        if distance_atr < -BREAK_ATR_MAX:
+            detail.append(f"close is {distance_atr:.2f} ATR above support, over {BAND_ATR_MAX:g}")
+        if distance_atr < BAND_ATR_MIN - _EDGE:
             codes.append(THROUGH_SUPPORT)
-            detail.append(f"close is {-distance_atr:.2f} ATR through support, over {BREAK_ATR_MAX:g}")
+            detail.append(f"close is {-distance_atr:.2f} ATR below support")
     return codes, detail
+
+
+_EDGE = 1e-9  # the band edges are inclusive, with room for float noise
+
+
+def line_swings_record(low_pair: list, high_pair: list, bars: pd.DataFrame) -> dict:
+    return {"support": [_touch(s, bars) for s in low_pair], "resistance": [_touch(s, bars) for s in high_pair]}
+
+
+def band_record(line: float | None, atr: float, side: str) -> dict:
+    """The at-line band in ATR and in price: above support for a long, below resistance for a short."""
+    out = {"atr_min": BAND_ATR_MIN, "atr_max": BAND_ATR_MAX, "low": None, "high": None}
+    if line is None or not np.isfinite(atr) or atr <= 0:
+        return out
+    if side == PIVOT_SIDE:
+        out.update(low=_round(line + BAND_ATR_MIN * atr), high=_round(line + BAND_ATR_MAX * atr))
+    else:
+        out.update(low=_round(line - BAND_ATR_MAX * atr), high=_round(line - BAND_ATR_MIN * atr))
+    return out
 
 
 def quality_checks(bars: pd.DataFrame, support: float | None, atr: float) -> tuple[dict[str, bool | None], dict]:
@@ -268,8 +295,7 @@ def classify_long_channel(bars: pd.DataFrame) -> ChannelCall:
     swings = [s for s in all_swings if s.index >= first_in_window]
     highs = [s for s in swings if s.kind == SWING_HIGH]
     lows = [s for s in swings if s.kind == SWING_LOW]
-    resistance = float(np.median([s.price for s in highs])) if highs else None
-    support = float(np.median([s.price for s in lows])) if lows else None
+    support, resistance, low_pair, high_pair = channel_lines(swings)
     height_pct = 100 * (resistance - support) / last_close if highs and lows else None
     distance_atr = (last_close - support) / atr if support is not None and np.isfinite(atr) and atr > 0 else None
 
@@ -296,7 +322,9 @@ def classify_long_channel(bars: pd.DataFrame) -> ChannelCall:
         "height_pct": _round(height_pct),
         "support_touches": [_touch(s, bars) for s in lows],
         "resistance_touches": [_touch(s, bars) for s in highs],
+        "channel_line_swings": line_swings_record(low_pair, high_pair, bars),
         "distance_to_support_atr": _round(distance_atr),
+        "at_support_band": band_record(support, atr, PIVOT_SIDE),
         "stop_swing_low": stop_swing(bars, all_swings, SWING_LOW, support, atr),
         "pivot_confirmation": pivot_confirm.recorded(bars, swings, support, PIVOT_SIDE),
         **_recorded_trend_metrics(close),

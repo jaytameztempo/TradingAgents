@@ -1,4 +1,8 @@
-"""The UI can read the paper account but has no way to place, change, cancel or close an order."""
+"""The UI can read the paper account but has no way to place, change, cancel or close an order itself.
+
+Its one order path is starting paper_orders.sender as a job: from the scheduler, or from the Trade page's
+confirmed manual ticket send, which names one ticket file. The sender does its own paper checks.
+"""
 
 import ast
 import re
@@ -68,3 +72,12 @@ def test_live_keys_are_refused():
         broker.ReadOnlyBroker(env={"ALPACA_API_KEY": "AKLIVE123", "ALPACA_SECRET_KEY": "s"})
     with pytest.raises(broker.MissingAlpacaKeys):
         broker.ReadOnlyBroker(env={})
+
+
+@pytest.mark.unit
+def test_only_the_scheduler_and_the_manual_ticket_route_start_the_sender():
+    starters = sorted(path.relative_to(UI).as_posix() for path in UI.rglob("*.py")
+                      if "jobs.SENDER" in path.read_text(encoding="utf-8"))
+    assert starters == ["server/routes/trade.py", "server/scheduler.py"]
+    sender_routes = {p: set(ops) for p, ops in app.openapi()["paths"].items() if p.startswith("/api/trade")}
+    assert sender_routes["/api/trade/manual/{name}/send"] == {"post"}

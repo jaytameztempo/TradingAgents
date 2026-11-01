@@ -6,8 +6,10 @@ the channel report's support (long) or resistance (short), the stop the report's
 account at ticket time (a fake here). The basket gets the lesser of 23% of the series' original buying power (recorded
 in series.json on the first run) and buying power now; under 5% of equity there are no tickets. Each of the N allowed
 names with usable levels gets allocation / N and floor(that / entry) shares; when the basket's stop-risk is over 8%
-of equity every quantity is scaled down by the same factor. Blackout names are listed as skipped with the reason. The
-TTM Squeeze gate is not run.
+of equity every quantity is scaled down by the same factor. Blackout names are listed as skipped with the reason.
+Before sizing, each channel member must pass the daily confirmation filters (a squeeze release or RSI extreme, and
+light volume); when SPY and QQQ ADX(14) are both under 15 the allocation is x 0.7; the 4-hour flag is recorded only.
+The 4-hour/1-hour TTM Squeeze gate is not run. Bars are fakes built here.
 No label but SIDE writes anything. Alpaca's trading client is refused. No network, no orders.
 """
 
@@ -18,10 +20,13 @@ import types
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from extensions.scripts import run_paper_tickets as cli
-from extensions.status import squeeze_gate
+from extensions.status import confirmation, squeeze_gate
+from extensions.status.confirmation import MarketData
 from extensions.status.paper_tickets import (
     STOP_SWING,
     STOP_SWING_RULE,
@@ -62,6 +67,61 @@ ACCOUNT = Account(equity=20000.0, buying_power=20000.0, read_at=CREATED, source=
 # VST swing low 136.10 - 4.6929 = 131.4071 -> 130.99; WID 10.00 - 8.00 = 2.00 -> 1.99; SHO swing high 51.00 + 2.00
 # = 53.00 -> 53.01. Entries stay at the channel level: VST 138.45, WID 10.00, SHO 50.00.
 LEVELS = {"VST": VST, "WID": WIDE, "OUT": WIDE, "SHO": SHORTY}
+
+
+# Daily bars: a steady fall reads RSI(14) 0 (a long's trigger), a steady rise 100 (a short's); a chop reads about 52,
+# neither. Constant volume is never heavy (the last session equals its average). The trending index reads ADX 100.
+BARS = 120
+FALLING = [100 - 0.1 * i for i in range(BARS)]
+RISING = [50 + 0.1 * i for i in range(BARS)]
+CHOP = [100 + (0.6 if i % 2 else -0.6) for i in range(BARS)]
+TREND = [400 + 2.0 * i for i in range(BARS)]
+# Quiet closes, then two sessions up: the daily squeeze releases bullish on as_of (RSI far above 45).
+RELEASE = [100 + 0.02 * np.sin(i) for i in range(BARS - 2)] + [101.5, 103.0]
+FOUR_HOUR_COLUMNS = ["symbol", "timestamp", "date", "open", "high", "low", "close", "volume"]
+
+
+def _daily(symbol, closes, last_volume=None, spread=0.5):
+    closes = np.asarray(closes, dtype=float)
+    volume = np.full(len(closes), 1_000_000.0)
+    if last_volume is not None:
+        volume[-1] = last_volume
+    return pd.DataFrame({"symbol": symbol, "date": pd.bdate_range(end=pd.Timestamp(AS_OF), periods=len(closes)),
+                         "open": closes, "high": closes + spread, "low": closes - spread, "close": closes,
+                         "volume": volume})
+
+
+def _four_hour(symbol, closes):
+    """Regular-session 4-hour bars, two a session (09:30 and 13:30), ending on as_of."""
+    days = pd.bdate_range(end=pd.Timestamp(AS_OF), periods=(len(closes) + 1) // 2)
+    stamps = [d + pd.Timedelta(hours=h, minutes=30) for d in days for h in (9, 13)][-len(closes):]
+    closes = np.asarray(closes, dtype=float)
+    return pd.DataFrame({"symbol": symbol, "timestamp": stamps, "date": [t.normalize() for t in stamps],
+                         "open": closes, "high": closes + 0.5, "low": closes - 0.5, "close": closes, "volume": 1000.0})
+
+
+def _market(sides, daily=None, index=TREND, four_hour=None):
+    """Bars where every name confirms (falling for a long, rising for a short) unless daily overrides it, and both
+    indexes trend (no scale). four_hour: symbol -> 4-hour closes."""
+    frames = [_daily(s, FALLING if side == "long" else RISING) for s, side in sides.items() if s not in (daily or {})]
+    frames += list((daily or {}).values()) + [_daily(sym, index) for sym in confirmation.INDEXES]
+    fours = [_four_hour(s, c) for s, c in (four_hour or {}).items()]
+    return MarketData(pd.concat(frames, ignore_index=True),
+                      pd.concat(fours, ignore_index=True) if fours else pd.DataFrame(columns=FOUR_HOUR_COLUMNS),
+                      "fake bars")
+
+
+def _read_market(sides=None, **kwargs):
+    """A read_market for tickets_for_date that records the symbols it was asked for."""
+    sides = sides or {s: n["side"] for s, n in _handoff()["names"].items()}
+    asked = []
+
+    def read(as_of, symbols):
+        asked.append((as_of, list(symbols)))
+        return _market({s: sides[s] for s in symbols if s in sides}, **kwargs)
+
+    read.asked = asked
+    return read
 
 
 def _swing(price, window=120):
@@ -145,11 +205,15 @@ def _build_longs(spec):
                   handoff=_handoff(names), channels=channels)
 
 
-def _build(status=None, blackout=None, handoff=None, account=ACCOUNT, channels=None, original_buying_power=None):
+def _build(status=None, blackout=None, handoff=None, account=ACCOUNT, channels=None, original_buying_power=None,
+           market=None):
+    handoff = handoff or _handoff()
+    if market is None:
+        market = _market({s: n["side"] for s, n in handoff["names"].items()})
     return build_tickets(AS_OF, (Path(STATUS_NAME), status or _status()), (Path(BLACKOUT_NAME), blackout or _blackout()),
-                         (Path(HANDOFF_NAME), handoff or _handoff()), account, created_at=CREATED,
+                         (Path(HANDOFF_NAME), handoff), account, created_at=CREATED,
                          channels=channels if channels is not None else _channels(),
-                         original_buying_power=original_buying_power)
+                         original_buying_power=original_buying_power, market=market)
 
 
 def _write(folder, name, data):
@@ -169,11 +233,11 @@ def _write_day(tmp_path, status=None):
             str(tmp_path / "series.json")]
 
 
-def _day(tmp_path, account=ACCOUNT, **kwargs):
+def _day(tmp_path, account=ACCOUNT, read_market=None, **kwargs):
     """tickets_for_date over a written day, its series file in tmp_path."""
     _write_day(tmp_path)
     return tickets_for_date(AS_OF, tmp_path / "status", tmp_path / "handoffs", lambda: account, tmp_path / "scanbot",
-                            tmp_path / "series.json", **kwargs)
+                            tmp_path / "series.json", read_market=read_market or _read_market(), **kwargs)
 
 
 @pytest.fixture
@@ -445,7 +509,7 @@ def test_the_first_run_records_the_series_and_later_runs_use_it(tmp_path):
     assert first.sources["series"] == str(tmp_path / "series.json")
     later = tickets_for_date(AS_OF, tmp_path / "status", tmp_path / "handoffs",
                              lambda: Account(equity=40000.0, buying_power=40000.0, read_at=CREATED, source="fake"),
-                             tmp_path / "scanbot", tmp_path / "series.json")
+                             tmp_path / "scanbot", tmp_path / "series.json", read_market=_read_market())
     assert later.rules["series_recorded_this_run"] is False
     assert later.rules["original_buying_power"] == 20000.0 and later.rules["basket_allocation"] == 4600.0
     assert load_series(tmp_path / "series.json")["original_buying_power"] == 20000.0
@@ -656,7 +720,7 @@ def test_the_day_tickets_only_members_of_the_newest_confirmed_report(tmp_path):
            _report({s: LEVELS[s] for s in ("VST", "WID", "OUT")}, failed=("WID",),
                    created_at="2026-10-08T20:00:00+00:00"))
     result = tickets_for_date(AS_OF, tmp_path / "status", tmp_path / "handoffs", lambda: ACCOUNT, tmp_path / "scanbot",
-                              tmp_path / "series.json")
+                              tmp_path / "series.json", read_market=_read_market())
     assert [t.symbol for t in result.tickets] == ["VST", "SHO"]
     assert "not a member of the newest confirmed long channel report" in result.skipped["WID"]
     assert result.sources["long_channel_report"].endswith("long_channel_2026-09-30_20261008T200000Z.json")
@@ -698,18 +762,17 @@ def test_a_member_with_no_channel_levels_is_skipped_and_not_counted_in_n():
 
 
 @pytest.mark.unit
-def test_the_ticket_gate_never_calls_the_squeeze_gate_and_reports_no_squeeze(monkeypatch, tmp_path):
-    """Every allowed name with usable levels is ticketed; the squeeze gate is not called and nothing in the report
-    names it."""
+def test_the_ticket_gate_never_calls_the_4h_1h_squeeze_gate(monkeypatch, tmp_path):
+    """Every allowed, confirmed name with usable levels is ticketed; the 4-hour/1-hour squeeze gate is not called.
+    The confirmation reads the squeeze on daily bars only."""
     def never(*args, **kwargs):
-        raise AssertionError("the squeeze gate was called")
+        raise AssertionError("the 4h/1h squeeze gate was called")
 
     monkeypatch.setattr(squeeze_gate, "squeeze_gates", never)
-    monkeypatch.setattr(squeeze_gate, "rules", never)
+    monkeypatch.setattr(squeeze_gate, "read_squeeze", never)
     result = _day(tmp_path)
     assert [t.symbol for t in result.tickets] == ["VST", "SHO", "WID"] and list(result.skipped) == ["OUT"]
-    data = result.to_dict()
-    assert "squeeze" not in json.dumps([data["tickets"], data["rules"], data["skipped"], data["warnings"]]).lower()
+    assert "daily bars" in result.rules["squeeze"]
 
 
 @pytest.mark.unit
@@ -748,8 +811,8 @@ def test_save_writes_json_and_never_overwrites(tmp_path):
     assert path.name == "paper_tickets_2026-09-30_20261008T120000Z.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["orders_placed"] is False and data["paper"] is True and data["as_of"] == "2026-09-30"
-    assert data["ticket_version"] == TICKET_VERSION == 12
-    assert "squeeze" not in data["tickets"][0]
+    assert data["ticket_version"] == TICKET_VERSION == 13
+    assert data["tickets"][0]["confirmation"]["triggers"] == ["rsi"]
     first = data["tickets"][0]
     assert (first["entry"], first["channel_level"], first["atr_14"], first["stop_swing"], first["stop_swing_date"],
             first["stop_calculated"], first["stop"], first["stop_offset"]) == (
@@ -766,10 +829,12 @@ def test_save_writes_json_and_never_overwrites(tmp_path):
 @pytest.mark.unit
 def test_cli_prints_and_writes(tmp_path, capsys, restore_meta_path):
     out_dir = tmp_path / "out"
-    code = cli.main(_write_day(tmp_path) + ["--out-dir", str(out_dir)], read_account=lambda: ACCOUNT)
+    code = cli.main(_write_day(tmp_path) + ["--out-dir", str(out_dir)], read_account=lambda: ACCOUNT,
+                    read_market=_read_market())
     assert code == cli.EXIT_OK
     printed = capsys.readouterr().out
-    assert "squeeze" not in printed.lower()
+    assert "index ADX(14): SPY 100.0, QQQ 100.0: no scale" in printed
+    assert "confirmed by rsi: RSI(14) 0.0" in printed and "4-hour support: not measured (recorded only)" in printed
     assert "VST" in printed and "no order placed" in printed
     assert "equity $20,000.00, buying power $20,000.00" in printed
     assert "series: original buying power $20,000.00 (recorded on this run)" in printed
@@ -805,7 +870,8 @@ def test_cli_writes_nothing_when_the_account_cannot_be_read(tmp_path, capsys, re
         raise TicketInputError("cannot read the Alpaca paper account: HTTP 403")
 
     out_dir = tmp_path / "out"
-    code = cli.main(_write_day(tmp_path) + ["--out-dir", str(out_dir)], read_account=fail)
+    code = cli.main(_write_day(tmp_path) + ["--out-dir", str(out_dir)], read_account=fail,
+                    read_market=_read_market())
     assert code == cli.EXIT_BAD_INPUT and not out_dir.exists()
     assert "HTTP 403" in capsys.readouterr().err
 
@@ -877,3 +943,154 @@ def test_paper_tickets_load_no_alpaca_and_refuse_the_trading_client():
         [sys.executable, "-B", "-c", code], cwd=REPO_ROOT, capture_output=True, text=True, check=True
     )
     assert result.stdout.split("\n")[:2] == ["[]", "refused"]
+
+
+
+# --- confirmation (the TRADE Bot layer) -------------------------------------------------------
+
+def _longs_market(**daily):
+    """The default VST/WID/SHO market with some daily bars replaced: symbol -> daily frame."""
+    return _market({"VST": "long", "WID": "long", "OUT": "long", "SHO": "short"}, daily=daily)
+
+
+@pytest.mark.unit
+def test_a_name_that_passes_confirmation_is_ticketed_with_its_read():
+    """VST confirms on a daily squeeze release (RSI far above 45), SHO and WID on their RSI; volume is light for all."""
+    result = _build(market=_longs_market(VST=_daily("VST", RELEASE, spread=0.3)))
+    assert [t.symbol for t in result.tickets] == ["VST", "SHO", "WID"]
+    vst = result.tickets[0].confirmation
+    assert vst["passed"] and vst["triggers"] == ["squeeze_release"] and vst["rsi_14"] > 45
+    assert vst["squeeze"]["fire_date"] == "2026-09-30" and vst["volume"] <= vst["volume_avg_20"]
+    assert result.tickets[1].confirmation["triggers"] == ["rsi"] and result.tickets[1].confirmation["rsi_14"] == 100.0
+    assert set(result.confirmations) == {"VST", "WID", "SHO"}  # OUT never got past the blackout
+
+
+@pytest.mark.unit
+def test_a_name_with_no_squeeze_release_and_no_rsi_extreme_is_skipped_and_not_counted_in_n():
+    result = _build(market=_longs_market(WID=_daily("WID", CHOP), SHO=_daily("SHO", CHOP)))
+    assert [t.symbol for t in result.tickets] == ["VST"]
+    assert result.skipped["WID"].startswith("awaiting squeeze release or RSI extreme")
+    assert "needs <= 45" in result.skipped["WID"] and "needs >= 55" in result.skipped["SHO"]
+    assert result.rules["names_n"] == 1 and result.rules["name_notional_limit"] == 4600.0
+    assert result.confirmations["WID"]["passed"] is False  # recorded though skipped
+
+
+@pytest.mark.unit
+def test_a_name_on_heavy_volume_is_skipped():
+    result = _build(market=_longs_market(WID=_daily("WID", FALLING, last_volume=1_500_000)))
+    assert "WID" not in [t.symbol for t in result.tickets]
+    assert result.skipped["WID"].startswith("volume not light")
+    assert result.confirmations["WID"]["triggers"] == ["rsi"]  # the trigger fired; the volume held it back
+
+
+@pytest.mark.unit
+def test_volume_at_its_average_is_light():
+    """The last session at exactly its 20-session average passes (at most, inclusive)."""
+    result = _build(market=_longs_market(WID=_daily("WID", FALLING, last_volume=1_000_000)))
+    assert "WID" in [t.symbol for t in result.tickets]
+
+
+@pytest.mark.unit
+def test_a_name_with_no_bar_on_the_as_of_date_is_skipped():
+    stale = _daily("WID", FALLING).iloc[:-1]
+    result = _build(market=_longs_market(WID=stale))
+    assert result.skipped["WID"].startswith("no daily bar on the as-of date")
+
+
+@pytest.mark.unit
+def test_spy_and_qqq_adx_both_under_15_scale_the_basket_by_0_7():
+    """$4,600 x 0.7 = $3,220 over N = 3: $1,073.33 a name. Both readings are recorded."""
+    calm = _build(market=_market({"VST": "long", "WID": "long", "SHO": "short"}, index=CHOP))
+    rules = calm.rules
+    assert rules["calm_scale"] == 0.7 and all(v < 15 for v in rules["index_adx_14"].values())
+    assert set(rules["index_adx_14"]) == {"SPY", "QQQ"}
+    assert rules["basket_allocation_before_calm_scale"] == 4600.0 and rules["basket_allocation"] == 3220.0
+    assert rules["name_notional_limit"] == 1073.33
+    trending = _build()
+    assert trending.rules["calm_scale"] == 1.0 and trending.rules["basket_allocation"] == 4600.0
+
+
+@pytest.mark.unit
+def test_one_calm_index_is_not_enough():
+    frames = _market({"VST": "long", "WID": "long", "SHO": "short"})
+    daily = frames.daily[frames.daily["symbol"] != "QQQ"]
+    market = MarketData(pd.concat([daily, _daily("QQQ", CHOP)], ignore_index=True), frames.four_hour, "fake")
+    assert _build(market=market).rules["calm_scale"] == 1.0
+
+
+@pytest.mark.unit
+def test_the_scaled_allocation_must_still_clear_the_5_pct_floor():
+    """Equity $20,000, buying power $5,000: $1,150 is over the $1,000 floor, but x 0.7 = $805 is under it."""
+    poor = Account(equity=20000.0, buying_power=5000.0, read_at=CREATED, source="fake", status="ACTIVE")
+    assert _build(account=poor, original_buying_power=5000.0).tickets
+    calm = _build(account=poor, original_buying_power=5000.0,
+                  market=_market({"VST": "long", "WID": "long", "SHO": "short"}, index=CHOP))
+    assert calm.tickets == [] and "x 0.7 for SPY and QQQ ADX under 15" in calm.no_ticket_reason
+
+
+@pytest.mark.unit
+def test_a_missing_index_reading_stops_the_run():
+    frames = _market({"VST": "long", "WID": "long", "SHO": "short"})
+    market = MarketData(frames.daily[frames.daily["symbol"] != "SPY"], frames.four_hour, "fake")
+    with pytest.raises(TicketInputError, match="no ADX\\(14\\) on a 2026-09-30 daily bar for SPY"):
+        _build(market=market)
+
+
+@pytest.mark.unit
+def test_a_side_day_without_bars_stops():
+    with pytest.raises(TicketInputError, match="needs daily and 4-hour bars"):
+        build_tickets(AS_OF, (Path(STATUS_NAME), _status()), (Path(BLACKOUT_NAME), _blackout()),
+                      (Path(HANDOFF_NAME), _handoff()), ACCOUNT, created_at=CREATED, channels=_channels())
+
+
+# A 4-hour range 100 to 112 that turns every 10 bars: on a trough the last close is 0.5 above the 99.5 support
+# (well inside 0.5 ATR); five bars later it is mid-range, far from it.
+FOUR_AT_SUPPORT = [100 + 1.2 * (k if k <= 10 else 20 - k) for k in ((i - 159) % 20 for i in range(160))]
+FOUR_MID_RANGE = FOUR_AT_SUPPORT[5:] + [106.0 + 1.2 * k for k in range(1, 6)]
+
+
+@pytest.mark.unit
+def test_the_4_hour_flag_is_recorded_and_never_filters():
+    near = _build(market=_market({"VST": "long", "WID": "long", "SHO": "short"},
+                                 four_hour={"VST": FOUR_AT_SUPPORT, "WID": FOUR_MID_RANGE}))
+    assert [t.symbol for t in near.tickets] == ["VST", "SHO", "WID"]  # nobody is dropped on the flag
+    by = {t.symbol: t.confirmation["four_hour"] for t in near.tickets}
+    assert by["VST"]["near"] is True and by["VST"]["level"] == 99.5 and abs(by["VST"]["distance_atr"]) <= 0.5
+    assert len(by["VST"]["swings"]) == 2
+    assert by["WID"]["near"] is False and by["WID"]["distance_atr"] > 0.5
+    assert by["SHO"]["near"] is None and by["SHO"]["line"] == "resistance"  # no 4-hour bars: not measured
+
+
+@pytest.mark.unit
+def test_tickets_for_date_reads_bars_for_the_allowed_names_and_the_indexes(tmp_path):
+    read = _read_market()
+    _day(tmp_path, read_market=read)
+    assert read.asked == [(AS_OF, ["VST", "WID", "SHO", "SPY", "QQQ"])]
+
+
+@pytest.mark.unit
+def test_the_runner_reads_daily_and_4_hour_bars_over_the_data_url(monkeypatch):
+    calls = []
+
+    class Reader:
+        def bars_daily(self, symbols, start, end):
+            calls.append(("daily", list(symbols), start, end))
+            return _daily("VST", FALLING)
+
+        def bars_30min(self, symbols, start, end):
+            calls.append(("30min", list(symbols), start, end))
+            return pd.DataFrame(columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"]).astype(
+                {"timestamp": "datetime64[ns]"})
+
+    monkeypatch.setattr(cli, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "data_reader", lambda env: Reader())
+    market = cli.read_market_data(AS_OF, ["VST", "SPY", "QQQ"])
+    assert calls[0] == ("daily", ["VST", "SPY", "QQQ"], date(2025, 8, 26), AS_OF)
+    assert calls[1][:2] == ("30min", ["VST"]) and market.four_hour.empty
+
+
+@pytest.mark.unit
+def test_the_daily_lookback_matches_the_scans():
+    from extensions.regime.regime_bot import LOOKBACK_CALENDAR_DAYS
+
+    assert confirmation.DAILY_LOOKBACK_DAYS == LOOKBACK_CALENDAR_DAYS

@@ -1,5 +1,6 @@
 // Typed client for the local FastAPI server. Every broker call here is a GET;
-// the UI has no request that places, changes, cancels or closes an order.
+// the UI has no request that places, changes, cancels or closes an order itself.
+// sendManualTicket starts paper_orders.sender on one manual ticket; the sender does the paper checks.
 
 export class ApiError extends Error {
   constructor(public status: number, public code: string | null, message: string) {
@@ -60,6 +61,37 @@ export interface QueueItem {
   regime_source?: string | null;
   verdict?: "ALLOWED" | "BLOCKED" | "NO_REGIME";
   reason?: string;
+}
+
+// --- manual paper tickets (Trade page order entry) ------------------------------------
+
+export interface ManualTicket {
+  name: string;
+  id: string;
+  as_of: string;
+  created_at: string | null;
+  source: { queue_item?: string; scan?: string; scan_file?: string; kind?: ScanSource };
+  symbol: string;
+  side: "long" | "short";
+  order_side: "buy" | "sell";
+  quantity: number;
+  entry: number;
+  stop: number;
+  stop_offset: number;
+  target: number;
+  risk_dollars: number;
+  notional: number;
+  reward_risk: number;
+  sends: { job_id: string; at: string }[];
+  error?: string;
+}
+
+export interface NewManualTicket {
+  item_id: string;
+  entry: number;
+  stop: number;
+  target: number;
+  quantity: number;
 }
 
 // --- settings ------------------------------------------------------------------------
@@ -342,6 +374,12 @@ export const api = {
     post<{ queue: QueueName; added: string[]; already_queued: string[] }>(`/api/queues/${queue}`, body),
   removeQueued: (queue: QueueName, id: string) => del<{ removed: boolean }>(`/api/queues/${queue}/${id}`),
   trashScan: (body: { kind: ScanSource; file: string; ticker?: string }) => post<unknown>("/api/scans/trash", body),
+  manualTickets: () => get<ManualTicket[]>("/api/trade/manual"),
+  createManualTicket: (body: NewManualTicket) => post<ManualTicket>("/api/trade/manual", body),
+  deleteManualTicket: (name: string) => del<{ deleted: string }>(`/api/trade/manual/${encodeURIComponent(name)}`),
+  // send: false is a dry run. send: true needs confirm: true, and starts the sender with --send.
+  sendManualTicket: (name: string, body: { send: false } | { send: true; confirm: true }) =>
+    post<Job>(`/api/trade/manual/${encodeURIComponent(name)}/send`, body),
   channelScans: (side: "long" | "short") => get<Artifact<ChannelReport>[]>(`/api/channel-scans?side=${side}`),
   regimes: () => get<Artifact<Regime>[]>("/api/regimes"),
   routes: () => get<Artifact<Route>[]>("/api/routes"),

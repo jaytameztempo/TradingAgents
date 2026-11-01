@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, QueueItem, QueueName } from "../api";
 import { dateTime, num } from "../format";
 import { useJob } from "../useJob";
+import { OrderEntryDialog } from "./OrderEntry";
 import { Ticker } from "./Ticker";
 import { Card, Column, DataTable, Dialog, ErrorBox, JobLog, RegimeBadge } from "./ui";
 
@@ -120,6 +121,7 @@ export function StrategyQueue() {
 // --- Trade page ------------------------------------------------------------------------
 
 export function TradeQueue() {
+  const [item, setItem] = useState<QueueItem | null>(null);
   const cols = baseCols("trade");
   const m = (i: QueueItem, k: string) => i.metrics?.[k] ?? null;
   const price = (v: number | null) => (v == null ? "—" : v.toFixed(2));
@@ -132,9 +134,19 @@ export function TradeQueue() {
     {
       key: "trend", label: "SMA 50 / 200", align: "right",
       render: (i) => (m(i, "sma_50") != null ? `${num(m(i, "sma_50"))} / ${num(m(i, "sma_200"))}` : "—"),
+    },
+    {
+      key: "order", label: "", render: (i) => (
+        <span title={i.as_of ? "Write a paper ticket for this ticker" : "This row has no scan date"}>
+          <button className="btn btn-sm btn-primary" disabled={!i.as_of} onClick={() => setItem(i)}>Order…</button>
+        </span>
+      ),
     });
   return (
-    <QueueCard title="To trade" queue="trade" columns={cols} empty="Nothing queued. Use Send to → Trade on the Scans page."
-               hint="Sent from the Scans page for trade execution. Order entry from this queue is not built yet; no order is sent from here." />
+    <>
+      <QueueCard title="To trade" queue="trade" columns={cols} empty="Nothing queued. Use Send to → Trade on the Scans page."
+                 hint="Sent from the Scans page. Order… writes a paper ticket below; nothing is sent until you send that ticket." />
+      <OrderEntryDialog item={item} onClose={() => setItem(null)} />
+    </>
   );
 }

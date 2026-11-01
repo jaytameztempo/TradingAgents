@@ -45,7 +45,7 @@ export default function App() {
               ⚡ Paper auto-send on
             </NavLink>
           ) : (
-            <NavLink to="/settings" className="badge badge-locked" title="No order is sent; paper auto-send is off in Settings">
+            <NavLink to="/settings" className="badge badge-locked" title="Paper auto-send is off in Settings; orders go out only from a confirmed ticket Send on the Trade page">
               🔒 Auto-send off
             </NavLink>
           )}

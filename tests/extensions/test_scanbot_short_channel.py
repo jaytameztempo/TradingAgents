@@ -36,7 +36,8 @@ from extensions.scanbot.short_channel import (
     save_report,
     stop_swing,
 )
-from extensions.scanbot.pivot import SWING_HIGH, Swing
+from extensions.scanbot.long_channel import channel_lines
+from extensions.scanbot.pivot import SWING_HIGH, SWING_LOW, Swing
 from extensions.scripts import run_scanbot_short_channel as cli
 from tests.extensions.test_pivot_confirm import HIGHER_LOWS, SHORT, four_hour_frame
 
@@ -64,7 +65,7 @@ WIDE = _triangle(260, hi=130.0, end_phase=10)
 BROKEN = AT_RESISTANCE[:-1] + [116.0]
 RISING = [100 + 0.5 * i for i in range(260)]
 # At resistance, but the last daily high at resistance (2026-09-22) is 6 sessions back: no close reclaim.
-NO_RECLAIM = _triangle(254, half=6, end_phase=6) + [111.0, 111.6, 111.1, 111.7, 111.2, 111.7]
+NO_RECLAIM = _triangle(254, half=6, end_phase=6) + [111.0, 111.6, 111.1, 111.7, 111.2, 111.8]
 
 
 def _frame(symbol, closes, end=AS_OF):
@@ -108,10 +109,15 @@ def test_two_touches_each_side_are_required():
     assert _check(resistance_touches=1) == [TOO_FEW_RESISTANCE]
 
 
-def test_pivot_band_is_0_6_below_and_0_25_through():
-    assert _check(distance_atr=-0.6) == [] and _check(distance_atr=0.25) == []
+def test_the_band_is_0_to_0_6_atr_below_resistance_inclusive():
+    assert _check(distance_atr=0.0) == [] and _check(distance_atr=-0.6) == []
+    assert _check(distance_atr=-0.4) == [] and _check(distance_atr=-0.5) == []  # past the old 0.4 limit, inside 0.6
     assert _check(distance_atr=-0.61) == [TOO_FAR_BELOW_RESISTANCE]
-    assert _check(distance_atr=0.26) == [THROUGH_RESISTANCE]
+
+
+def test_any_close_above_resistance_fails():
+    assert _check(distance_atr=0.01) == [THROUGH_RESISTANCE]
+    assert _check(distance_atr=0.25) == [THROUGH_RESISTANCE]  # the old 0.25 ATR allowance is gone
 
 
 def test_both_borrow_flags_must_be_true():
@@ -135,13 +141,15 @@ def test_range_at_resistance_passes_on_bars():
     m = call.metrics
     assert m["adx_14"] <= 20 and 8 <= m["height_pct"] <= 22
     assert len(m["support_touches"]) >= 2 and len(m["resistance_touches"]) >= 2
-    assert -0.6 <= m["distance_to_resistance_atr"] <= 0.25
+    assert -0.6 <= m["distance_to_resistance_atr"] <= 0
+    band = m["at_resistance_band"]
+    assert (band["atr_min"], band["atr_max"], band["high"]) == (0.0, 0.6, m["resistance"])
 
 
 def test_failures_on_bars_carry_the_right_reason():
     assert _classify(AT_SUPPORT).reasons == [TOO_FAR_BELOW_RESISTANCE]
     assert _classify(MID_CHANNEL).reasons == [TOO_FAR_BELOW_RESISTANCE]
-    assert _classify(NARROW).reasons == [HEIGHT_TOO_SMALL]
+    assert HEIGHT_TOO_SMALL in _classify(NARROW).reasons
     assert _classify(WIDE).reasons == [HEIGHT_TOO_LARGE]
     assert THROUGH_RESISTANCE in _classify(BROKEN).reasons
     trend = _classify(RISING)
@@ -385,3 +393,30 @@ def test_cli_picks_the_newest_financials_report_and_writes(tmp_path, monkeypatch
 
 def test_cli_without_a_financials_report_is_bad_input(tmp_path):
     assert cli.main(["--as-of", "2026-09-30", "--report-dir", str(tmp_path)]) == cli.EXIT_BAD_INPUT
+
+
+# --- the channel lines: the last two swings ----------------------------------
+
+def test_lines_come_from_the_last_two_swings_like_the_long_scan():
+    swings = [Swing(SWING_HIGH, 5, 104.0, 8), Swing(SWING_LOW, 10, 99.0, 13), Swing(SWING_HIGH, 20, 110.0, 23),
+              Swing(SWING_LOW, 30, 95.0, 33), Swing(SWING_HIGH, 40, 108.0, 43), Swing(SWING_LOW, 50, 97.0, 53)]
+    assert channel_lines(swings)[:2] == (95.0, 110.0)
+
+
+def test_an_older_higher_high_in_the_window_does_not_move_resistance():
+    """A 14-bar cycle puts four confirmed swing highs in the 60 sessions, at -57, -43, -29 and -15. Raising -43
+    leaves resistance at the last two (112.5); raising -29 moves it up to that high (114.5) where the median of the
+    four would have stayed at 112.5."""
+    base = _triangle(260, half=7, end_phase=7)
+    older = list(base)
+    older[-43] = 114.0
+    call = _classify(older)
+    assert call.metrics["resistance"] == 112.5 and call.passed
+    recent = list(base)
+    recent[-29] = 114.0
+    frame = _frame("A", recent)
+    m = _classify(recent).metrics
+    assert m["resistance"] == 114.5
+    assert [t["date"] for t in m["channel_line_swings"]["resistance"]] == [
+        frame["date"].iloc[-29].date().isoformat(), frame["date"].iloc[-15].date().isoformat()]
+    assert len(m["resistance_touches"]) == 4

@@ -4,6 +4,7 @@ Run from the TradingAgents folder:
 
     python -m paper_orders.sender --as-of 2026-09-30           # print the orders, send nothing
     python -m paper_orders.sender --as-of 2026-09-30 --send    # send them to Alpaca paper
+    python -m paper_orders.sender --manual manual_ticket_2026-09-30_VST_0123456789ab.json --send
 
 It loads the newest ``paper_tickets_<as_of>_*.json`` (by the created_at inside
 each file) from ~/.tradingagents/tickets/ unless --ticket-dir is set, and sends
@@ -29,12 +30,18 @@ Paper only:
   and its base URL is checked against Alpaca's paper URL before any request.
 
 Each entry carries a client order ID, ``pt-<as_of>-<SYMBOL>-<buy|sell>``, and
-each exit ``pt-<as_of>-<SYMBOL>-exit``. Before sending either, the paper
+each exit ``pt-<as_of>-<SYMBOL>-exit``; a manual ticket's IDs start ``mt-<as_of>-<file id>``
+instead. Before sending either, the paper
 account is asked for that ID; if an order already has it, its status is printed
 and nothing is sent, so a second run never double-sends.
 A --send outside the operator's trading window (``paper_orders.trade_window``, set on the UI's Settings
 page) sends nothing; with no window saved, nothing is gated. A dry run is allowed at any time.
 The ticket files, scans, router and bots are not touched.
+
+A manual ticket (``--manual NAME``) is one operator-written ticket in ``<ticket dir>/manual/``,
+named ``manual_ticket_<as_of>_<SYMBOL>_<id>.json`` (the UI's Trade page writes these). It gets the
+same per-ticket checks, entry and exits as the daily file, but needs no SIDE market label, so trend
+names can be sent too.
 """
 
 from __future__ import annotations
@@ -42,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -68,6 +76,9 @@ ORDER_SIDE = {LONG: "buy", SHORT: "sell"}
 FINAL = {"filled", "rejected", "canceled", "expired", "done_for_day", "replaced"}
 EXIT_OK, EXIT_BAD_INPUT, EXIT_ORDER_PROBLEM = 0, 2, 3
 PROBLEMS = {"rejected", "lookup_failed", "exit_rejected", "exit_refused", "exit_lookup_failed"}
+MANUAL_DIR = "manual"
+MANUAL_VERSION = 1
+MANUAL_FILE = re.compile(r"^manual_ticket_(\d{4}-\d{2}-\d{2})_([A-Z]{1,5}(?:[.-][A-Z]{1,2})?)_([0-9a-f]{12})\.json$")
 
 
 class TicketFileError(RuntimeError):
@@ -117,36 +128,78 @@ def _check_file(as_of: date, path: Path, data: dict) -> None:
         raise bad("has no tickets")
     seen = set()
     for t in tickets:
-        symbol = t.get("symbol")
-        try:
-            if validate_ticker(symbol) != symbol:
-                raise ValueError("not upper-case and trimmed")
-        except ValueError as exc:
-            raise bad(f"ticket symbol {symbol!r}: {exc}") from exc
-        if symbol in seen:
-            raise bad(f"{symbol} is ticketed twice")
-        seen.add(symbol)
-        if t.get("paper") is not True:
-            raise bad(f"{symbol} is not marked paper")
-        side = t.get("side")
-        if side not in ORDER_SIDE or t.get("order_side") != ORDER_SIDE[side]:
-            raise bad(f"{symbol} has side {side!r} and order side {t.get('order_side')!r}")
-        qty = t.get("quantity")
-        if not isinstance(qty, int) or isinstance(qty, bool) or qty < 1:
-            raise bad(f"{symbol} has quantity {qty!r}, not a whole number of at least 1")
-        entry, stop, target, offset = t.get("entry"), t.get("stop"), t.get("target"), t.get("stop_offset")
-        if not all(_is_price(v) for v in (entry, stop, target, offset)):
-            raise bad(f"{symbol} has entry {entry!r}, stop {stop!r}, target {target!r}, stop_offset {offset!r}")
-        sign = 1 if side == LONG else -1
-        if not sign * (entry - stop) > 0 or not sign * (target - entry) > 0:
-            raise bad(f"{symbol} {side}: stop {stop} and target {target} are not on either side of entry {entry}")
-        try:
-            planned = stop_for_fill(side, offset, entry)
-        except ValueError as exc:
-            raise bad(f"{symbol}: {exc}") from exc
-        if planned != stop:
-            raise bad(f"{symbol}: stop {stop} is not stop_offset {offset} from entry {entry} ({planned})")
+        _check_ticket(t, bad)
+        if t["symbol"] in seen:
+            raise bad(f"{t['symbol']} is ticketed twice")
+        seen.add(t["symbol"])
 
+
+def _check_ticket(t: dict, bad: Callable[[str], TicketFileError]) -> None:
+    """One ticket: a plain symbol, paper, a long buy or short sell, a whole quantity, and its prices in order."""
+    symbol = t.get("symbol")
+    try:
+        if validate_ticker(symbol) != symbol:
+            raise ValueError("not upper-case and trimmed")
+    except ValueError as exc:
+        raise bad(f"ticket symbol {symbol!r}: {exc}") from exc
+    if t.get("paper") is not True:
+        raise bad(f"{symbol} is not marked paper")
+    side = t.get("side")
+    if side not in ORDER_SIDE or t.get("order_side") != ORDER_SIDE[side]:
+        raise bad(f"{symbol} has side {side!r} and order side {t.get('order_side')!r}")
+    qty = t.get("quantity")
+    if not isinstance(qty, int) or isinstance(qty, bool) or qty < 1:
+        raise bad(f"{symbol} has quantity {qty!r}, not a whole number of at least 1")
+    entry, stop, target, offset = t.get("entry"), t.get("stop"), t.get("target"), t.get("stop_offset")
+    if not all(_is_price(v) for v in (entry, stop, target, offset)):
+        raise bad(f"{symbol} has entry {entry!r}, stop {stop!r}, target {target!r}, stop_offset {offset!r}")
+    sign = 1 if side == LONG else -1
+    if not sign * (entry - stop) > 0 or not sign * (target - entry) > 0:
+        raise bad(f"{symbol} {side}: stop {stop} and target {target} are not on either side of entry {entry}")
+    try:
+        planned = stop_for_fill(side, offset, entry)
+    except ValueError as exc:
+        raise bad(f"{symbol}: {exc}") from exc
+    if planned != stop:
+        raise bad(f"{symbol}: stop {stop} is not stop_offset {offset} from entry {entry} ({planned})")
+
+
+def load_manual(name: str, ticket_dir: str | Path | None = None) -> tuple[Path, dict]:
+    """One manual ticket file by name, from the manual folder only, checked like a daily ticket."""
+    m = MANUAL_FILE.fullmatch(name or "")
+    if not m:
+        raise TicketFileError(f"{name!r} is not a manual ticket file name (manual_ticket_<as_of>_<SYMBOL>_<id>.json)")
+    path = (Path(ticket_dir) if ticket_dir is not None else default_ticket_dir()) / MANUAL_DIR / name
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise TicketFileError(f"cannot read manual ticket {path}: {exc}") from exc
+
+    def bad(why: str) -> TicketFileError:
+        return TicketFileError(f"manual ticket {name}: {why}")
+
+    if not isinstance(data, dict) or data.get("kind") != "manual":
+        raise bad("is not marked kind manual")
+    if data.get("manual_version") != MANUAL_VERSION:
+        raise bad(f"has unsupported manual_version {data.get('manual_version')!r}")
+    if data.get("as_of") != m[1] or data.get("id") != m[3]:
+        raise bad(f"has as_of {data.get('as_of')!r} and id {data.get('id')!r}, not the {m[1]} and {m[3]} in its name")
+    if data.get("paper") is not True:
+        raise bad("is not marked paper")
+    if data.get("orders_placed") is not False:
+        raise bad("is not marked orders_placed false")
+    tickets = data.get("tickets")
+    if not isinstance(tickets, list) or len(tickets) != 1 or not isinstance(tickets[0], dict):
+        raise bad("must hold exactly one ticket")
+    _check_ticket(tickets[0], bad)
+    if tickets[0]["symbol"] != m[2]:
+        raise bad(f"ticket symbol {tickets[0]['symbol']} is not the {m[2]} in its name")
+    return path, data
+
+
+def manual_prefix(data: dict) -> str:
+    """The client order ID prefix for a manual ticket: its date and its own file id."""
+    return f"mt-{data['as_of']}-{data['id']}"
 
 def _is_price(v: Any) -> bool:
     return isinstance(v, int | float) and not isinstance(v, bool) and v > 0
@@ -154,17 +207,21 @@ def _is_price(v: Any) -> bool:
 
 # --- orders ------------------------------------------------------------------
 
-def client_order_id(as_of: date, ticket: dict) -> str:
-    """The entry's ID, the same on every run for one date, symbol and side."""
-    return f"pt-{as_of}-{ticket['symbol']}-{ticket['order_side']}"
+def _prefix(as_of: date, id_prefix: str | None) -> str:
+    return id_prefix or f"pt-{as_of}"
 
 
-def exit_order_id(as_of: date, ticket: dict) -> str:
-    """The exit pair's ID, the same on every run for one date and symbol."""
-    return f"pt-{as_of}-{ticket['symbol']}-exit"
+def client_order_id(as_of: date, ticket: dict, id_prefix: str | None = None) -> str:
+    """The entry's ID, the same on every run for one date (or manual ticket), symbol and side."""
+    return f"{_prefix(as_of, id_prefix)}-{ticket['symbol']}-{ticket['order_side']}"
 
 
-def entry_request(as_of: date, ticket: dict) -> LimitOrderRequest:
+def exit_order_id(as_of: date, ticket: dict, id_prefix: str | None = None) -> str:
+    """The exit pair's ID, the same on every run for one date (or manual ticket) and symbol."""
+    return f"{_prefix(as_of, id_prefix)}-{ticket['symbol']}-exit"
+
+
+def entry_request(as_of: date, ticket: dict, id_prefix: str | None = None) -> LimitOrderRequest:
     """One plain limit DAY order from one ticket, entry and size as written, nothing attached."""
     return LimitOrderRequest(
         symbol=ticket["symbol"],
@@ -173,7 +230,7 @@ def entry_request(as_of: date, ticket: dict) -> LimitOrderRequest:
         time_in_force=TimeInForce.DAY,
         limit_price=ticket["entry"],
         order_class=OrderClass.SIMPLE,
-        client_order_id=client_order_id(as_of, ticket),
+        client_order_id=client_order_id(as_of, ticket, id_prefix),
     )
 
 
@@ -207,7 +264,7 @@ def entry_fill(ticket: dict, order: dict) -> Fill | tuple[str, str]:
     return Fill(int(qty), price)
 
 
-def exit_request(as_of: date, ticket: dict, fill: Fill) -> LimitOrderRequest:
+def exit_request(as_of: date, ticket: dict, fill: Fill, id_prefix: str | None = None) -> LimitOrderRequest:
     """One OCO GTC exit for the filled shares: take-profit at the target, stop at stop_for_fill of the fill."""
     stop = stop_for_fill(ticket["side"], ticket["stop_offset"], fill.price)
     sign = 1 if ticket["side"] == LONG else -1
@@ -221,7 +278,7 @@ def exit_request(as_of: date, ticket: dict, fill: Fill) -> LimitOrderRequest:
         order_class=OrderClass.OCO,
         take_profit=TakeProfitRequest(limit_price=ticket["target"]),
         stop_loss=StopLossRequest(stop_price=stop),
-        client_order_id=exit_order_id(as_of, ticket),
+        client_order_id=exit_order_id(as_of, ticket, id_prefix),
     )
 
 
@@ -296,11 +353,11 @@ def _settle(client: Any, coid: str, order: dict, wait: float, sleep: Callable[[f
 
 
 def send_tickets(client: Any, as_of: date, tickets: list[dict], wait: float = 5.0,
-                 sleep: Callable[[float], None] = time.sleep) -> list[Outcome]:
+                 sleep: Callable[[float], None] = time.sleep, id_prefix: str | None = None) -> list[Outcome]:
     """Send each ticket's entry once. An entry whose client order ID is already on the account is not sent again."""
     outcomes = []
     for t in tickets:
-        coid = client_order_id(as_of, t)
+        coid = client_order_id(as_of, t, id_prefix)
         try:
             found = _existing(client, coid)
         except APIError as exc:
@@ -310,7 +367,7 @@ def send_tickets(client: Any, as_of: date, tickets: list[dict], wait: float = 5.
             outcomes.append(Outcome(t["symbol"], coid, "already_sent", order=found))
             continue
         try:
-            order = client.submit_order(entry_request(as_of, t))
+            order = client.submit_order(entry_request(as_of, t, id_prefix))
         except APIError as exc:
             outcomes.append(Outcome(t["symbol"], coid, "rejected", error=_error_text(exc)))
             continue
@@ -320,11 +377,11 @@ def send_tickets(client: Any, as_of: date, tickets: list[dict], wait: float = 5.
     return outcomes
 
 
-def place_exits(client: Any, as_of: date, tickets: list[dict]) -> list[Outcome]:
+def place_exits(client: Any, as_of: date, tickets: list[dict], id_prefix: str | None = None) -> list[Outcome]:
     """For each entry done filling, send its OCO exit once, the stop measured from the actual fill."""
     outcomes = []
     for t in tickets:
-        entry_id, coid = client_order_id(as_of, t), exit_order_id(as_of, t)
+        entry_id, coid = client_order_id(as_of, t, id_prefix), exit_order_id(as_of, t, id_prefix)
         try:
             entry = _existing(client, entry_id)
         except APIError as exc:
@@ -347,7 +404,7 @@ def place_exits(client: Any, as_of: date, tickets: list[dict]) -> list[Outcome]:
             outcomes.append(Outcome(t["symbol"], coid, "exit_already_sent", order=found, fill=fill))
             continue
         try:
-            req = exit_request(as_of, t, fill)
+            req = exit_request(as_of, t, fill, id_prefix)
         except ValueError as exc:
             outcomes.append(Outcome(t["symbol"], coid, "exit_refused", error=str(exc), fill=fill))
             continue
@@ -375,11 +432,11 @@ def _describe(order: dict) -> str:
     return text
 
 
-def _ticket_line(as_of: date, t: dict) -> str:
+def _ticket_line(as_of: date, t: dict, id_prefix: str | None = None) -> str:
     sign = "-" if t["side"] == LONG else "+"
     return (f"  {t['symbol']:<6}{t['side']:<6}{t['order_side']:<5}qty {t['quantity']:>6}  "
             f"limit {t['entry']:>9.2f}  then take-profit {t['target']:>9.2f}  "
-            f"stop fill {sign} {t['stop_offset']:.2f} ({t['stop']:.2f} at entry)  id {client_order_id(as_of, t)}")
+            f"stop fill {sign} {t['stop_offset']:.2f} ({t['stop']:.2f} at entry)  id {client_order_id(as_of, t, id_prefix)}")
 
 
 def _print_entries(outcomes: list[Outcome]) -> None:
@@ -417,7 +474,9 @@ def _print_exits(outcomes: list[Outcome]) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Send one date's paper tickets to Alpaca paper: limit DAY entries, then OCO exits from the fills.")
-    parser.add_argument("--as-of", required=True, help="the ticket date, YYYY-MM-DD")
+    which = parser.add_mutually_exclusive_group(required=True)
+    which.add_argument("--as-of", help="the ticket date, YYYY-MM-DD")
+    which.add_argument("--manual", metavar="NAME", help="one manual ticket file name from <ticket dir>/manual/")
     parser.add_argument("--ticket-dir", help="folder of ticket files (default: ~/.tradingagents/tickets)")
     parser.add_argument("--send", action="store_true", help="send to Alpaca paper; without it nothing is sent")
     parser.add_argument("--wait", type=float, default=5.0, help="seconds to watch each new order for a fill")
@@ -427,22 +486,29 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
          make_client: Callable[[Mapping[str, str]], Any] = paper_client, now: datetime | None = None) -> int:
     args = _parser().parse_args(argv)
+    id_prefix = None
+    if args.as_of is not None:
+        try:
+            as_of = date.fromisoformat(args.as_of)
+        except ValueError:
+            print(f"error: --as-of {args.as_of!r} is not YYYY-MM-DD", file=sys.stderr)
+            return EXIT_BAD_INPUT
     try:
-        as_of = date.fromisoformat(args.as_of)
-    except ValueError:
-        print(f"error: --as-of {args.as_of!r} is not YYYY-MM-DD", file=sys.stderr)
-        return EXIT_BAD_INPUT
-    try:
-        path, data = load_latest_tickets(as_of, args.ticket_dir)
+        if args.manual:
+            path, data = load_manual(args.manual, args.ticket_dir)
+            as_of, id_prefix = date.fromisoformat(data["as_of"]), manual_prefix(data)
+        else:
+            path, data = load_latest_tickets(as_of, args.ticket_dir)
     except TicketFileError as exc:
         print(f"error: {exc}; nothing sent", file=sys.stderr)
         return EXIT_BAD_INPUT
 
     tickets = data["tickets"]
-    print(f"paper tickets {path.name}: {len(tickets)} limit DAY entr{'y' if len(tickets) == 1 else 'ies'} "
+    what = "manual paper ticket" if args.manual else "paper tickets"
+    print(f"{what} {path.name}: {len(tickets)} limit DAY entr{'y' if len(tickets) == 1 else 'ies'} "
           f"for {as_of}; each exit is placed from the actual fill")
     for t in tickets:
-        print(_ticket_line(as_of, t))
+        print(_ticket_line(as_of, t, id_prefix))
     if not args.send:
         print("dry run: nothing sent (add --send to send to Alpaca paper)")
         return EXIT_OK
@@ -468,10 +534,10 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
         return EXIT_BAD_INPUT
 
     print(f"sending to Alpaca paper ({PAPER_URL})")
-    entries = send_tickets(client, as_of, tickets, wait=args.wait)
+    entries = send_tickets(client, as_of, tickets, wait=args.wait, id_prefix=id_prefix)
     print("entries:")
     _print_entries(entries)
-    exits = place_exits(client, as_of, tickets)
+    exits = place_exits(client, as_of, tickets, id_prefix)
     print("exits:")
     _print_exits(exits)
     problems = [o for o in entries + exits if o.action in PROBLEMS]

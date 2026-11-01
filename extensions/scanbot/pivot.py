@@ -39,18 +39,27 @@ from extensions.regime.indicators import sma
 from extensions.regime.regime_bot import FAST_WINDOW, LOOKBACK_CALENDAR_DAYS
 from extensions.scanbot.funnel import FEED, _fetch_in_chunks, default_report_dir
 from extensions.scanbot.trend import DOWN, UP, TrendReport
+from extensions.scanbot.swings import (  # noqa: F401  re-exported: callers import these from pivot
+    ATR_PERIOD,
+    RSI_PERIOD,
+    SWING_HIGH,
+    SWING_LOW,
+    SWING_REVERSAL_PCT,
+    Swing,
+    _wilder,
+    wilder_atr,
+    wilder_rsi,
+    zigzag_swings,
+)
 
 REPORT_VERSION = 1
 SIDES = (UP, DOWN)
-SWING_HIGH, SWING_LOW = "HIGH", "LOW"
 
-SWING_REVERSAL_PCT = 5.0
 IMPULSE_MIN_PCT, IMPULSE_MAX_PCT = 6.0, 35.0
 ZONE_MIN_PCT, ZONE_MAX_PCT = 35.0, 50.0
 LEG_MIN_SESSIONS, LEG_MAX_SESSIONS = 3, 15
 MIN_BARS = FAST_WINDOW
 
-ATR_PERIOD = RSI_PERIOD = 14
 SMA20_WINDOW = 20
 SMA20_SLOPE_SESSIONS = 5
 SMA20_ATR_MAX = 0.75
@@ -106,90 +115,6 @@ POLICY = {
     "close_location_sessions": CLOSE_LOCATION_SESSIONS,
     "lookback_calendar_days": LOOKBACK_CALENDAR_DAYS,
 }
-
-
-# --- indicators --------------------------------------------------------------
-
-def _wilder(values: np.ndarray, period: int) -> np.ndarray:
-    """Wilder's average: the first value is the mean of ``period`` values, then ``prev + (x - prev) / period``."""
-    out = np.full(len(values), np.nan)
-    if len(values) < period:
-        return out
-    current = values[:period].mean()
-    out[period - 1] = current
-    for i in range(period, len(values)):
-        current += (values[i] - current) / period
-        out[i] = current
-    return out
-
-
-def wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = ATR_PERIOD) -> pd.Series:
-    """Average true range. True range starts on the second bar; the first ATR is on bar ``period``."""
-    high, low, close = (s.to_numpy(dtype=float) for s in (high, low, close))
-    out = np.full(len(close), np.nan)
-    if len(close) > period:
-        prev = close[:-1]
-        true_range = np.maximum.reduce([high[1:] - low[1:], np.abs(high[1:] - prev), np.abs(low[1:] - prev)])
-        out[1:] = _wilder(true_range, period)
-    return pd.Series(out)
-
-
-def wilder_rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
-    """Relative strength index with Wilder's averages. No losses at all reads 100."""
-    close = close.to_numpy(dtype=float)
-    out = np.full(len(close), np.nan)
-    if len(close) > period:
-        change = np.diff(close)
-        gain, loss = _wilder(np.clip(change, 0, None), period), _wilder(np.clip(-change, 0, None), period)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            out[1:] = np.where(loss > 0, 100 - 100 / (1 + gain / loss), np.where(np.isnan(loss), np.nan, 100.0))
-    return pd.Series(out)
-
-
-# --- swings ------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class Swing:
-    kind: str  # SWING_HIGH or SWING_LOW
-    index: int  # bar of the extreme
-    price: float  # the high for a swing high, the low for a swing low
-    confirmed_index: int  # the bar whose close confirmed the reversal
-
-
-def zigzag_swings(high, low, close, reversal_pct: float = SWING_REVERSAL_PCT) -> list[Swing]:
-    """Alternating confirmed swings.
-
-    A swing high is the highest high since the last swing low. It is confirmed by
-    a later bar closing at least ``reversal_pct`` below it. A swing low is the
-    mirror. The extreme still forming at the end of the bars is not returned.
-    """
-    high, low, close = (np.asarray(x, dtype=float) for x in (high, low, close))
-    n = len(close)
-    if n == 0:
-        return []
-    down_factor, up_factor = 1 - reversal_pct / 100, 1 + reversal_pct / 100
-    swings: list[Swing] = []
-    hi_i = lo_i = 0
-    looking = None  # None until the first swing; then SWING_HIGH or SWING_LOW is the next one wanted
-    for i in range(1, n):
-        if looking in (None, SWING_HIGH) and high[i] > high[hi_i]:
-            hi_i = i
-        if looking in (None, SWING_LOW) and low[i] < low[lo_i]:
-            lo_i = i
-        top_confirmed = looking in (None, SWING_HIGH) and hi_i < i and close[i] <= high[hi_i] * down_factor
-        bottom_confirmed = looking in (None, SWING_LOW) and lo_i < i and close[i] >= low[lo_i] * up_factor
-        if looking is None and top_confirmed and bottom_confirmed:
-            # Both ends of the opening range reversed on one bar: the later extreme is the swing.
-            top_confirmed, bottom_confirmed = hi_i > lo_i, lo_i > hi_i
-        if top_confirmed:
-            swings.append(Swing(SWING_HIGH, hi_i, float(high[hi_i]), i))
-            lo_i = hi_i + 1 + int(np.argmin(low[hi_i + 1:i + 1]))
-            looking = SWING_LOW
-        elif bottom_confirmed:
-            swings.append(Swing(SWING_LOW, lo_i, float(low[lo_i]), i))
-            hi_i = lo_i + 1 + int(np.argmax(high[lo_i + 1:i + 1]))
-            looking = SWING_HIGH
-    return swings
 
 
 # --- one name ----------------------------------------------------------------

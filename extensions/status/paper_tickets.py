@@ -26,9 +26,18 @@ and used.
 Under any label but SIDE, or when the daily status blocks the channel names,
 there are no tickets: only the channel names have lines to ticket. Each name
 that survived the earnings blackout (4-hour confirmed names, long and short)
-is ticketed when it has usable levels; the TTM Squeeze gate (``squeeze_gate``)
-is not run here. N is the number of names that pass the blackout and have
-usable levels. Each ticket:
+and is a passing channel member must then pass the confirmation filters
+(``confirmation``) on its daily bars for the as-of session: a daily TTM Squeeze
+release in the trade's direction on that session or the one before, or RSI(14)
+<= 45 (long) / >= 55 (short); and that session's volume at most its 20-session
+average. A name that fails is skipped with the reason, and can be ticketed on a
+later day when its confirmation fires. Whether the last 4-hour bar sits within
+0.5 ATR of its own 4-hour support (long) or resistance (short) is recorded on
+each name, never filtered on. The 4-hour/1-hour squeeze gate (``squeeze_gate``'s
+``squeeze_gates``) is not run here. N is the number of names that pass the
+blackout and the confirmation and have usable levels. The caller reads the bars
+(daily for the names, SPY and QQQ; 4-hour for the names) and passes them in as
+``MarketData``. Each ticket:
 
 - entry: a limit at the channel level from the channel report, support from the
   long channel report for a long (limit buy), resistance from the short channel
@@ -56,19 +65,23 @@ usable levels. Each ticket:
   stop-risk scale below.
 
 The basket gets the lesser of ``BASKET_PCT`` (23%) of the series' original
-buying power and the buying power read now (``basket_allocation``). When that
-is under ``FLOOR_PCT`` (5%) of equity there are no tickets. Otherwise every
+buying power and the buying power read now (``basket_allocation``). When ADX(14)
+on the as-of daily bar is under 15 for both SPY and QQQ, that is multiplied by
+0.7 (``confirmation.calm_scale``); both readings are recorded, and a missing one
+stops the run. When the allocation is under ``FLOOR_PCT`` (5%) of equity there
+are no tickets. Otherwise every
 name gets the same dollars, allocation / N (``name_notional``). When the
 basket's total stop-risk is over ``BOOK_RISK_PCT`` (8%) of equity, every
 name's quantity is multiplied by the limit / the stop-risk and rounded down
 (``scale_to_book_risk``); a name left with no share is skipped. Size is not
 otherwise set by the stop distance. A name is skipped, with the reason, when it
 is in the earnings blackout, is not a member of the newest confirmed channel
-report, has no usable levels, or when not one share fits its dollars. Tickets
+report, fails confirmation, has no usable levels, or when not one share fits
+its dollars. Tickets
 are listed in rank order, long and short interleaved (long #1, short #1,
 long #2, ...).
 
-Every file is read with plain ``json``; no Alpaca or paper_orders module is
+Every file is read with plain ``json``, and no bar is read here; no Alpaca or paper_orders module is
 loaded here, and ``refuse_trading_client`` makes any later import of
 ``alpaca.trading`` fail.
 The scans, router, bots, daily status and blackout are not touched.
@@ -85,16 +98,20 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+from extensions.status import confirmation
+from extensions.status.confirmation import MarketData
 from extensions.status.daily_status import LONG, SHORT, SIDE, SIDES, default_handoff_dir, default_status_dir
 from extensions.status.earnings_blackout import BlackoutInputError, latest_daily_status
 
-TICKET_VERSION = 12  # 2: stop_offset from the fill; 3: equal risk a name; 4: snapped pivot -/+ 1 ATR stop, buying power / N;
+TICKET_VERSION = 13  # 2: stop_offset from the fill; 3: equal risk a name; 4: snapped pivot -/+ 1 ATR stop, buying power / N;
 # 5: entry and pivot are the channel report's support (long) or resistance (short); 6: 4h + 1h TTM Squeeze gate;
 # 7: the TTM Squeeze gate removed; 8: the newest pivot-confirmed channel report, members only;
 # 9: the stop is the 120-session swing extreme -/+ 1 ATR, not the channel level;
 # 10: the stop swing is the nearest clustered swing beyond the channel level in 120 sessions, not the extreme;
 # 11: a stop swing more than 3 ATR beyond the channel level is discarded;
-# 12: basket = min(23% of the series' original buying power, buying power) / N, 5% equity floor, 8% book stop-risk
+# 12: basket = min(23% of the series' original buying power, buying power) / N, 5% equity floor, 8% book stop-risk;
+# 13: daily confirmation filters (squeeze release or RSI extreme, light volume), 4-hour flag recorded, SPY/QQQ ADX < 15
+# scales the basket x 0.7
 BLACKOUT_REPORT_VERSION = 1
 CHANNEL_REPORT_VERSION = 1
 SERIES_VERSION = 1
@@ -391,6 +408,7 @@ class Ticket:
     earnings_result: str | None  # from the blackout: clear, flagged_kept, unknown_kept
     rank: int | None = None  # the handoff's rank within its side
     quantity_unscaled: int | None = None  # the quantity before the book stop-risk scale, when the scale applied
+    confirmation: dict | None = None  # the confirmation read that let it through, with the 4-hour flag (recorded only)
     paper: bool = True
 
 
@@ -439,7 +457,7 @@ def plan_ticket(symbol: str, side: str, line: float | None, atr: float | None, m
 
 
 def size_ticket(symbol: str, side: str, plan: dict, earnings_result: str | None = None, *, notional_limit: float,
-                rank: int | None = None) -> Ticket:
+                rank: int | None = None, confirmed: dict | None = None) -> Ticket:
     """A ticket of floor(notional limit / entry) whole shares. Raises ValueError when not one share fits."""
     risk_per_share = plan["risk_per_share"]
     quantity = math.floor(round(notional_limit / plan["entry"], 6))
@@ -457,6 +475,7 @@ def size_ticket(symbol: str, side: str, plan: dict, earnings_result: str | None 
         notional_limit_dollars=notional_limit,
         earnings_result=earnings_result,
         rank=rank,
+        confirmation=confirmed,
     )
 
 
@@ -520,15 +539,20 @@ def _rules(account: Account | None = None, n: int | None = None, notional_limit:
         "account_read_at": account.read_at.isoformat() if account else None,
         "original_buying_power": basket.get("original_buying_power"),
         "basket_pct_of_original_buying_power": BASKET_PCT,
+        "index_adx_14": basket.get("index_adx"),
+        "calm_scale": basket.get("calm_scale"),
+        "basket_allocation_before_calm_scale": basket.get("allocation_before_calm_scale"),
         "basket_allocation": basket.get("allocation"),
         "allocation": "the lesser of basket_pct_of_original_buying_power x original_buying_power (the buying power "
-                      "read on the series' first run) and buying power now, rounded down to the cent",
+                      "read on the series' first run) and buying power now, times calm_scale, rounded down to the "
+                      "cent",
         "floor_pct_of_equity": FLOOR_PCT,
         "allocation_floor": basket.get("floor"),
         "floor": "an allocation under floor_pct_of_equity x equity writes no tickets",
         "names_n": n,
-        "names": "the earnings blackout's allowed long and short names that are passing members of the channel report "
-                 "and have usable levels",
+        "names": "the earnings blackout's allowed long and short names that are passing members of the channel report, "
+                 "pass confirmation, and have usable levels",
+        **confirmation.rules(),
         "channel_report": f"the newest {{long|short}}_channel report for the date by the created_at inside the file; "
                           f"it must carry the {CONFIRMED_STAGE} stage, else no tickets",
         "name_notional": "the basket allocation / N, rounded down to the cent, the same for every name",
@@ -567,13 +591,14 @@ class PaperTickets:
     channel_names_blocked: bool
     tickets: list[Ticket]
     skipped: dict[str, str]  # symbol -> why it made no ticket (blackout, not a channel member, no usable levels, no
-    # share fits, or no share left after the book stop-risk scale)
+    # share fits, no share left after the book stop-risk scale, or awaiting confirmation)
     no_ticket_reason: str | None  # set when the day has no tickets at all
     sources: dict[str, str | None]
     total_notional: float = 0.0
     total_risk: float = 0.0
     rules: dict = field(default_factory=_rules)
     warnings: list[str] = field(default_factory=list)
+    confirmations: dict[str, dict] = field(default_factory=dict)  # every channel member's confirmation read
     paper: bool = True
     orders_placed: bool = False
     ticket_version: int = TICKET_VERSION
@@ -594,11 +619,13 @@ def build_tickets(
     created_at: datetime | None = None,
     channels: dict[str, tuple[Path, dict]] | None = None,
     original_buying_power: float | None = None,
+    market: MarketData | None = None,
 ) -> PaperTickets:
     """Tickets for the allowed names, sized from the account, entries and stops from the channel reports (channels:
-    side -> report, for each side with allowed names). Only passing members of a side's channel report are ticketed.
-    original_buying_power is the series' first buying power; None uses the account's buying power. Under any label
-    but SIDE the blackout, handoff, account and channel reports are not needed. Writes nothing."""
+    side -> report, for each side with allowed names). Only passing members of a side's channel report that pass
+    confirmation on market's bars are ticketed. original_buying_power is the series' first buying power; None uses
+    the account's buying power. Under any label but SIDE the blackout, handoff, account, channel reports and bars
+    are not needed. Writes nothing."""
     status_path, s = status
     label = s.get("market_label", "")
     created = created_at or datetime.now(UTC)
@@ -637,6 +664,14 @@ def build_tickets(
                             + list(b.get("warnings", [])))
     if account is None:
         raise TicketInputError("a SIDE day needs equity and buying power read from the paper account")
+    if market is None:
+        raise TicketInputError("a SIDE day needs daily and 4-hour bars for the confirmation filters")
+    readings = confirmation.index_adx(market.daily, as_of)
+    missing = [sym for sym, value in readings.items() if value is None]
+    if missing:
+        raise TicketInputError(f"no ADX(14) on a {as_of} daily bar for {', '.join(missing)}; the basket scale needs "
+                               f"both {' and '.join(confirmation.INDEXES)}")
+    sources["market_data"] = market.source
     channels = channels or {}
     ranked_from: list[str] = []
     for side in SIDES:
@@ -650,9 +685,11 @@ def build_tickets(
                                    f"membership and levels are from the newer {channels[side][0].name}")
     members = {side: channel_members(channels[side][1]) for side in channels}
 
-    # first the entries and stops: N is the allowed names that are channel members with usable levels
+    # first confirmation, then the entries and stops: N is the allowed names that are channel members, pass
+    # confirmation and have usable levels
     names = h.get("names", {})
-    plans: list[tuple[str, str, int | None, dict]] = []
+    plans: list[tuple[str, str, int | None, dict, dict]] = []
+    confirmations: dict[str, dict] = {}
     for symbol, side in _rank_order(b["allowed"], names):
         entry = names.get(symbol)
         if entry is None or entry.get("side") != side:
@@ -661,33 +698,41 @@ def build_tickets(
         if symbol not in members[side]:
             skipped[symbol] = f"not a member of the newest confirmed {side} channel report {channels[side][0].name}"
             continue
+        read = confirmation.confirm(symbol, side, market, as_of)
+        confirmations[symbol] = read.to_dict()
+        if not read.passed:
+            skipped[symbol] = "; ".join(read.reasons)
+            continue
         try:
             line, atr, swing = channel_levels(channels[side][1], symbol, side)
             plan = plan_ticket(symbol, side, line, atr, (entry.get("levels") or {}).get("midline"), swing)
         except ValueError as exc:
             skipped[symbol] = str(exc)
             continue
-        plans.append((symbol, side, entry.get("rank"), plan))
+        plans.append((symbol, side, entry.get("rank"), plan, confirmations[symbol]))
 
     # then the size: the basket allocation, unless under the floor, split equally, then held to the book stop-risk
     n = len(plans)
     original = original_buying_power if original_buying_power is not None else account.buying_power
-    basket = {"original_buying_power": original, "allocation": basket_allocation(original, account.buying_power),
+    before_scale, scale = basket_allocation(original, account.buying_power), confirmation.calm_scale(readings)
+    basket = {"original_buying_power": original, "index_adx": readings, "calm_scale": scale,
+              "allocation_before_calm_scale": before_scale, "allocation": _cents_down(before_scale * scale),
               "floor": allocation_floor(account.equity), "risk_limit": book_risk_limit(account.equity)}
     notional_limit = None
     tickets: list[Ticket] = []
     if basket["allocation"] < basket["floor"]:
+        calm = f", x {scale:g} for SPY and QQQ ADX under {confirmation.ADX_CALM_MAX:g}" if scale != 1 else ""
         no_ticket_reason = (f"allocation ${basket['allocation']:,.2f} (the lesser of {BASKET_PCT:.0%} of original "
-                            f"buying power ${original:,.2f} and buying power ${account.buying_power:,.2f}) is under "
+                            f"buying power ${original:,.2f} and buying power ${account.buying_power:,.2f}{calm}) is under "
                             f"the floor ${basket['floor']:,.2f} ({FLOOR_PCT:.0%} of equity ${account.equity:,.2f}); "
                             "no tickets")
     else:
         no_ticket_reason = "no allowed name made a ticket"
         notional_limit = name_notional(basket["allocation"], n) if n else None
-        for symbol, side, rank, plan in plans:
+        for symbol, side, rank, plan, confirmed in plans:
             try:
                 tickets.append(size_ticket(symbol, side, plan, (checks.get(symbol) or {}).get("result"),
-                                           notional_limit=notional_limit, rank=rank))
+                                           notional_limit=notional_limit, rank=rank, confirmed=confirmed))
             except ValueError as exc:
                 skipped[symbol] = str(exc)
         basket["risk_before_scale"] = round(sum(t.risk_dollars for t in tickets), 2)
@@ -714,6 +759,7 @@ def build_tickets(
         total_risk=total_risk,
         rules=_rules(account, n, notional_limit, basket),
         warnings=list(dict.fromkeys(warnings)),
+        confirmations=confirmations,
     )
 
 
@@ -725,10 +771,12 @@ def tickets_for_date(
     scan_dir: str | Path | None = None,
     series_file: str | Path | None = None,
     new_series: bool = False,
+    read_market: Callable[[date, list[str]], MarketData] | None = None,
 ) -> PaperTickets:
-    """Tickets from the saved files. read_account is called only on a SIDE day with allowed names, at ticket time;
-    that run also reads the series file (default ~/.tradingagents/tickets/series.json) and records the buying power
-    read now in it when it is missing or new_series is set."""
+    """Tickets from the saved files. read_account and read_market are called only on a SIDE day with allowed names,
+    at ticket time; read_market gets the date and the symbols to read (the allowed names, then SPY and QQQ). That run
+    also reads the series file (default ~/.tradingagents/tickets/series.json) and records the buying power read now
+    in it when it is missing or new_series is set."""
     try:
         status = latest_daily_status(as_of, status_dir)
     except BlackoutInputError as exc:
@@ -742,12 +790,16 @@ def tickets_for_date(
     if channels:
         if read_account is None:
             raise TicketInputError("a SIDE day needs equity and buying power read from the paper account")
+        if read_market is None:
+            raise TicketInputError("a SIDE day needs daily and 4-hour bars for the confirmation filters")
         account = read_account()
+        names = [sym for side in SIDES for sym in blackout[1]["allowed"][side]]
+        market = read_market(as_of, list(dict.fromkeys(names + list(confirmation.INDEXES))))
     else:
         return build_tickets(as_of, status, blackout, handoff, account, channels=channels)
     path, original, recorded = series_baseline(series_file, account, as_of, new_series)
     result = build_tickets(as_of, status, blackout, handoff, account, channels=channels,
-                           original_buying_power=original)
+                           original_buying_power=original, market=market)
     return replace(result, sources={**result.sources, "series": str(path)},
                    rules={**result.rules, "series_recorded_this_run": recorded})
 

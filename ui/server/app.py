@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from ui.server import paths
-from ui.server.routes import broker, jobs, pipeline, queues, research
+from ui.server.routes import broker, jobs, pipeline, queues, research, trade
 from ui.server.routes import settings as settings_routes
 from ui.server.scheduler import scheduler
 
@@ -31,14 +31,15 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="BATS local UI", docs_url="/api/docs", redoc_url=None, openapi_url="/api/openapi.json",
               lifespan=lifespan)
-for module in (pipeline, research, jobs, broker, settings_routes, queues):
+for module in (pipeline, research, jobs, broker, settings_routes, queues, trade):
     app.include_router(module.router)
 
 
 @app.get("/api/health")
 def health() -> dict:
     status = scheduler.status()
-    # orders_enabled: only the scheduler's paper auto-send can send orders; no route can.
+    # orders_enabled: the scheduler's paper auto-send is on. Apart from it, only a confirmed manual ticket
+    # send on the Trade page starts the paper sender; no route talks to the broker itself.
     return {"ok": True, "data_home": str(paths.data_home()), "orders_enabled": status["auto_send_enabled"],
             "scheduler_running": status["running"]}
 

@@ -239,3 +239,25 @@ def test_the_reader_takes_paper_keys_only_and_reports_failures():
 
     with pytest.raises(BarsReadFailed, match="connection refused"):
         data_reader(PAPER_ENV, opener=broken).bars_30min(["AAA"], AS_OF, AS_OF)
+
+
+@pytest.mark.unit
+def test_the_reader_gets_sip_daily_bars_dated_by_the_new_york_session():
+    """Daily bars for the paper tickets' confirmation filters: 1Day, SIP and split-adjusted as the channel scans read,
+    each dated by its New York session (Alpaca stamps a daily bar at New York midnight, in UTC)."""
+    body = {"bars": {"SPY": [{"t": "2026-09-29T04:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 10},
+                             {"t": "2026-09-30T04:00:00Z", "o": 1.5, "h": 2, "l": 1, "c": 1.8, "v": 5}]},
+            "next_page_token": None}
+    seen = []
+
+    def opener(req, timeout):
+        seen.append(req)
+        return _Resp(json.dumps(body).encode())
+
+    frame = data_reader(PAPER_ENV, opener=opener).bars_daily(["SPY"], date(2026, 9, 1), AS_OF)
+    query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(seen[0].full_url).query))
+    assert (query["timeframe"], query["feed"], query["adjustment"]) == ("1Day", "sip", "split")
+    assert [d.strftime("%Y-%m-%d") for d in frame["date"]] == ["2026-09-29", "2026-09-30"]
+    assert list(frame.columns) == ["symbol", "date", "open", "high", "low", "close", "volume"]
+    empty = data_reader(PAPER_ENV, opener=lambda req, timeout: _Resp(b'{"bars": {}}')).bars_daily(["X"], AS_OF, AS_OF)
+    assert empty.empty and "date" in empty.columns

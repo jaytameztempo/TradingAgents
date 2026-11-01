@@ -389,3 +389,122 @@ def test_a_send_on_a_market_holiday_sends_nothing(tmp_path, monkeypatch, capsys)
                        env=PAPER_ENV, make_client=lambda env: client, now=thanksgiving)
     assert code == sender.EXIT_BAD_INPUT and "market holiday" in capsys.readouterr().err
     assert client.submitted == []
+
+
+# --- manual tickets (the Trade page) --------------------------------------------
+
+MANUAL_ID = "0123456789ab"
+MANUAL_NAME = f"manual_ticket_2026-09-30_VST_{MANUAL_ID}.json"
+
+
+def _manual(ticket=None, **over) -> dict:
+    data = {"kind": "manual", "manual_version": sender.MANUAL_VERSION, "id": MANUAL_ID, "as_of": "2026-09-30",
+            "created_at": "2026-10-09T14:00:00+00:00", "paper": True, "orders_placed": False,
+            "tickets": [dict(ticket or VST)]}
+    data.update(over)
+    return data
+
+
+def _write_manual(ticket_dir: Path, data: dict, name: str = MANUAL_NAME) -> Path:
+    folder = ticket_dir / sender.MANUAL_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+@pytest.mark.unit
+def test_a_manual_ticket_loads_from_the_manual_folder_only(tmp_path):
+    path = _write_manual(tmp_path, _manual())
+    assert sender.load_manual(MANUAL_NAME, tmp_path)[0] == path
+    (tmp_path / MANUAL_NAME).write_text(json.dumps(_manual()), encoding="utf-8")
+    for name in ("../" + MANUAL_NAME, "paper_tickets_2026-09-30_20261009T003216Z.json", "manual_ticket_x.json"):
+        with pytest.raises(TicketFileError, match="not a manual ticket file name"):
+            sender.load_manual(name, tmp_path)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("over, ticket, match", [
+    ({"kind": "daily"}, None, "kind manual"),
+    ({"manual_version": 99}, None, "manual_version"),
+    ({"id": "ffffffffffff"}, None, "in its name"),
+    ({"paper": False}, None, "not marked paper"),
+    ({"orders_placed": True}, None, "orders_placed"),
+    ({}, {**VST, "symbol": "NRG"}, "not the VST in its name"),
+    ({}, {**VST, "stop": 140.0}, "not on either side"),
+    ({}, {**VST, "stop": 137.20}, "is not stop_offset"),
+    ({}, {**VST, "quantity": 0}, "quantity"),
+])
+def test_a_bad_manual_ticket_is_refused(tmp_path, over, ticket, match):
+    _write_manual(tmp_path, _manual(ticket, **over))
+    with pytest.raises(TicketFileError, match=match):
+        sender.load_manual(MANUAL_NAME, tmp_path)
+
+
+@pytest.mark.unit
+def test_a_manual_ticket_needs_no_side_label_and_holds_one_ticket(tmp_path):
+    _write_manual(tmp_path, _manual())  # no market_label at all
+    assert sender.load_manual(MANUAL_NAME, tmp_path)[1]["tickets"][0]["symbol"] == "VST"
+    _write_manual(tmp_path, {**_manual(), "tickets": [VST, VIR]})
+    with pytest.raises(TicketFileError, match="exactly one ticket"):
+        sender.load_manual(MANUAL_NAME, tmp_path)
+
+
+@pytest.mark.unit
+def test_manual_ids_carry_the_ticket_id_and_never_collide_with_the_daily_ids():
+    prefix = sender.manual_prefix(_manual())
+    assert client_order_id(AS_OF, VST, prefix) == f"mt-2026-09-30-{MANUAL_ID}-VST-buy"
+    assert exit_order_id(AS_OF, VST, prefix) == f"mt-2026-09-30-{MANUAL_ID}-VST-exit"
+    client = FakeClient()
+    send_tickets(client, AS_OF, [VST], wait=0)
+    (o,) = send_tickets(client, AS_OF, [VST], wait=0, id_prefix=prefix)
+    assert o.action == "sent" and len(client.submitted) == 2
+
+
+@pytest.mark.unit
+def test_the_cli_sends_a_manual_ticket_once_then_places_its_exit(tmp_path, capsys):
+    _write_manual(tmp_path, _manual())
+    client = FakeClient()
+    argv = ["--manual", MANUAL_NAME, "--ticket-dir", str(tmp_path), "--send", "--wait", "0"]
+    assert sender.main(argv, env=PAPER_ENV, make_client=lambda env: client) == sender.EXIT_OK
+    assert [r.client_order_id for r in client.submitted] == [f"mt-2026-09-30-{MANUAL_ID}-VST-buy"]
+    client.fill(f"mt-2026-09-30-{MANUAL_ID}-VST-buy", 36, 138.45)
+    assert sender.main(argv, env=PAPER_ENV, make_client=lambda env: client) == sender.EXIT_OK
+    out = capsys.readouterr().out
+    assert "manual paper ticket " + MANUAL_NAME in out and "not sent" in out
+    assert [r.client_order_id for r in client.exits()] == [f"mt-2026-09-30-{MANUAL_ID}-VST-exit"]
+
+
+@pytest.mark.unit
+def test_a_manual_dry_run_builds_no_client(tmp_path, capsys):
+    _write_manual(tmp_path, _manual())
+
+    def no_client(env):
+        raise AssertionError("a dry run must not build a client")
+
+    assert sender.main(["--manual", MANUAL_NAME, "--ticket-dir", str(tmp_path)], make_client=no_client) == 0
+    assert "nothing sent" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_manual_and_as_of_together_are_refused(tmp_path):
+    with pytest.raises(SystemExit):
+        sender.main(["--manual", MANUAL_NAME, "--as-of", "2026-09-30", "--ticket-dir", str(tmp_path)])
+
+
+@pytest.mark.unit
+def test_a_manual_send_outside_the_window_or_with_a_live_key_sends_nothing(tmp_path, monkeypatch, capsys):
+    _write_manual(tmp_path, _manual())
+    argv = ["--manual", MANUAL_NAME, "--ticket-dir", str(tmp_path), "--send"]
+    assert sender.main(argv, env={"ALPACA_API_KEY": "AKLIVE", "ALPACA_SECRET_KEY": "s"}) == sender.EXIT_BAD_INPUT
+    _window(tmp_path, monkeypatch)
+    client = FakeClient()
+    assert sender.main(argv, env=PAPER_ENV, make_client=lambda env: client, now=SATURDAY) == sender.EXIT_BAD_INPUT
+    assert client.submitted == [] and "outside the trading window" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+def test_the_daily_loader_never_sees_manual_tickets(tmp_path):
+    _write_manual(tmp_path, _manual())
+    with pytest.raises(TicketFileError, match="no ticket file"):
+        load_latest_tickets(AS_OF, tmp_path)
