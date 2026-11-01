@@ -34,6 +34,23 @@ def get_language_instruction() -> str:
     )
 
 
+def get_factual_tone_instruction() -> str:
+    """Evidence-first writing rules shared by the bull/bear researchers and the risk debaters.
+
+    Each keeps its own lens (upside, downside, reward, loss, balance), but states
+    sourced facts for a manager to weigh instead of arguing to win.
+    """
+    return (
+        " Write in a plain, factual register. Base every point on a specific figure or statement"
+        " from the reports above and say which report it comes from. Separate what the data shows"
+        " from your interpretation, and give likelihoods rather than certainties. Say when the data"
+        " is missing, mixed or stale. Where another analyst's point is supported by the data,"
+        " say so; where it is not, give the data that contradicts it. No rhetoric, superlatives,"
+        " exclamations or appeals to conviction, and do not try to win the argument: the goal is an"
+        " accurate record of the evidence for your side, for a manager to weigh."
+    )
+
+
 def opponent_argument_or_opening(text: str, opponent: str) -> str:
     """Opponent's latest argument, or an explicit opening marker when empty.
 

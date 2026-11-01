@@ -1,4 +1,5 @@
 from tradingagents.agents.context import (
+    get_factual_tone_instruction,
     get_instrument_context_from_state,
     get_language_instruction,
     opponent_argument_or_opening,
@@ -28,15 +29,15 @@ def create_bear_researcher(llm):
             else "Asset fundamentals report (may be unavailable for crypto)"
         )
 
-        prompt = f"""You are a Bear Analyst making the case against investing in the {target_label}. Your goal is to present a well-reasoned argument emphasizing risks, challenges, and negative indicators. Leverage the provided research and data to highlight potential downsides and counter bullish arguments effectively.
+        prompt = f"""You are the Bear Analyst. Your role is to set out the evidence against investing in the {target_label}: risks, challenges, and negative indicators, as the provided research shows them.
 
-Key points to focus on:
+Key points to cover:
 
-- Risks and Challenges: Highlight factors like market saturation, financial instability, or macroeconomic threats that could hinder the stock's performance.
-- Competitive Weaknesses: Emphasize vulnerabilities such as weaker market positioning, declining innovation, or threats from competitors.
-- Negative Indicators: Use evidence from financial data, market trends, or recent adverse news to support your position.
-- Bull Counterpoints: Critically analyze the bull argument with specific data and sound reasoning, exposing weaknesses or over-optimistic assumptions.
-- Engagement: Present your argument in a conversational style, directly engaging with the bull analyst's points and debating effectively rather than simply listing facts.
+- Risks and Challenges: Market saturation, financial instability, or macroeconomic factors the reports document that could weigh on the {target_label}.
+- Competitive Weaknesses: Market position, innovation, or competitive threats, where the reports give evidence for them.
+- Negative Indicators: Financial data, market trends, or recent adverse news, with the figures.
+- Bull Points: Respond to the bull analyst's points one by one: confirm, qualify, or contradict each with data, and acknowledge the ones the data supports.
+- Style: Plain prose that addresses the bull analyst's points directly.
 
 Resources available:
 
@@ -47,8 +48,8 @@ Latest world affairs news: {news_report}
 {fundamentals_label}: {fundamentals_report}
 Conversation history of the debate: {history}
 Last bull argument: {current_response}
-Use this information to deliver a compelling bear argument, refute the bull's claims, and engage in a dynamic debate that demonstrates the risks and weaknesses of investing in the {target_label}.
-""" + get_language_instruction()
+Use this information to give a factual assessment of the risks and weaknesses of investing in the {target_label} and a data-based response to the bull's points.
+""" + get_factual_tone_instruction() + get_language_instruction()
 
         response = llm.invoke(prompt)
 
