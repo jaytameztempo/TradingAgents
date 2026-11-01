@@ -10,7 +10,15 @@ from ui.server.routes import common
 
 router = APIRouter(prefix="/api", tags=["pipeline"])
 
-SCAN_PREFIXES = {"up": "scan-upward-trend-momentum", "down": "scan-breakdown-short-candidates"}
+TREND_PREFIXES = {"up": "scan-upward-trend-momentum", "down": "scan-breakdown-short-candidates"}
+# Category baskets are named {prefix}-{category}_{as_of}_{stamp}.json (run_category_scan).
+CATEGORY_PREFIXES = {
+    "up_cat": "scan-up-category",
+    "down_cat": "scan-down-category",
+    "side_long_cat": "scan-side-long-category",
+    "side_short_cat": "scan-side-short-category",
+}
+SCAN_PREFIXES = {**TREND_PREFIXES, **CATEGORY_PREFIXES}
 CHANNEL_PREFIXES = {"long": "long_channel", "short": "short_channel"}
 # Scan picker on the Scans page -> (trend scans, sideways channel scans).
 SCAN_KINDS = {
@@ -21,6 +29,13 @@ SCAN_KINDS = {
     "short_side": ((), ("short_side",)),
     "sideways": ((), ("long_side", "short_side")),
     "all": (("up", "down"), ("long_side", "short_side")),
+}
+# Category picks on the Scans page -> the run_category_scan scans they start, at the chosen category.
+CATEGORY_KINDS = {
+    "cat_up": ("up",),
+    "cat_down": ("down",),
+    "cat_side": ("side",),
+    "cat_all": common.CATEGORY_SCANS,
 }
 BOT_SCRIPTS = {"up": "run_up_bot", "down": "run_down_bot", "side": "run_side_bot"}
 
@@ -49,17 +64,21 @@ def summary(as_of: str | None = None) -> dict:
     return {
         "as_of": as_of,
         "regime": files.latest(paths.regimes_dir(), as_of),
-        "baskets": {k: files.latest(paths.baskets_dir(), as_of, p) for k, p in SCAN_PREFIXES.items()},
+        "baskets": {k: files.latest(paths.baskets_dir(), as_of, p) for k, p in TREND_PREFIXES.items()},
         "route": files.latest(paths.routes_dir(), as_of),
         "plans": [p for p in files.list_plans(paths.plans_dir()) if p["as_of"] == as_of],
     }
 
 
 @router.get("/baskets")
-def baskets(kind: str | None = None, as_of: str | None = None) -> list[dict]:
+def baskets(kind: str | None = None, as_of: str | None = None, category: int | None = None) -> list[dict]:
     if kind is not None and kind not in SCAN_PREFIXES:
-        raise common.bad_request("kind must be up or down")
+        raise common.bad_request(f"kind must be one of {', '.join(SCAN_PREFIXES)}")
     prefix = SCAN_PREFIXES[kind] if kind else None
+    if category is not None:
+        if kind not in CATEGORY_PREFIXES:
+            raise common.bad_request("category applies to category baskets only")
+        prefix = f"{prefix}-{common.category(category)}"
     return files.list_artifacts(paths.baskets_dir(), prefix, common.iso_date(as_of) if as_of else None)
 
 
@@ -109,8 +128,9 @@ def plans() -> list[dict]:
 
 class ScanRun(BaseModel):
     as_of: str
-    kind: str = "both"  # a key of SCAN_KINDS
+    kind: str = "both"  # a key of SCAN_KINDS or CATEGORY_KINDS
     tickers: list[str] = []
+    category: int = 1  # 1, 2 or 3; used by the CATEGORY_KINDS only
 
 
 class PipelineRun(BaseModel):
@@ -136,9 +156,13 @@ class BotRun(BaseModel):
 
 @router.post("/scans/run")
 def run_scans(body: ScanRun) -> dict:
+    if body.kind in CATEGORY_KINDS:
+        category = common.category(body.category)
+        steps = common.category_scan_steps(common.iso_date(body.as_of), CATEGORY_KINDS[body.kind], category)
+        return common.start(f"scan:{body.kind}:{category}", steps)
     kinds = SCAN_KINDS.get(body.kind)
     if kinds is None:
-        raise common.bad_request(f"kind must be one of {', '.join(SCAN_KINDS)}")
+        raise common.bad_request(f"kind must be one of {', '.join([*SCAN_KINDS, *CATEGORY_KINDS])}")
     trend, channel = kinds
     as_of, universe = common.iso_date(body.as_of), common.tickers(body.tickers)
     steps = [*(common.scan_steps(as_of, universe, trend) if trend else []),

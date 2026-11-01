@@ -42,7 +42,13 @@ const del = <T>(path: string) => request<T>(path, { method: "DELETE" });
 
 // --- queues (Scans page "Send to") ------------------------------------------------------
 
-export type ScanSource = "up" | "down" | "long" | "short";
+// Category baskets from run_category_scan: TickerBaskets, one kind per regime and side.
+export type CategoryBasketKind = "up_cat" | "down_cat" | "side_long_cat" | "side_short_cat";
+export type BasketKind = "up" | "down" | CategoryBasketKind;
+export type ScanSource = BasketKind | "long" | "short";
+export type Category = 1 | 2 | 3;
+export const CATEGORIES: Category[] = [1, 2, 3];
+export const CATEGORY_LABEL: Record<Category, string> = { 1: "1 · strictest", 2: "2 · balanced", 3: "3 · loosest" };
 export type QueueName = "research" | "strategy" | "trade";
 
 export interface QueueItem {
@@ -269,7 +275,9 @@ export interface ChannelReport {
   warnings?: string[];
 }
 
-export type ScanKind = "all" | "both" | "sideways" | "up" | "down" | "long_side" | "short_side";
+export type CategoryScanKind = "cat_up" | "cat_down" | "cat_side" | "cat_all";
+export type ScanKind = "all" | "both" | "sideways" | "up" | "down" | "long_side" | "short_side" | CategoryScanKind;
+export const CATEGORY_SCAN_KINDS: ScanKind[] = ["cat_up", "cat_down", "cat_side", "cat_all"];
 
 export interface Regime {
   symbol: string;
@@ -368,7 +376,13 @@ export const api = {
 
   dates: () => get<string[]>("/api/dates"),
   summary: (asOf?: string) => get<Summary>(`/api/summary${asOf ? `?as_of=${asOf}` : ""}`),
-  baskets: (kind?: "up" | "down") => get<Artifact<Basket>[]>(`/api/baskets${kind ? `?kind=${kind}` : ""}`),
+  baskets: (kind?: BasketKind, category?: Category) => {
+    const q = new URLSearchParams();
+    if (kind) q.set("kind", kind);
+    if (category) q.set("category", String(category));
+    const qs = q.toString();
+    return get<Artifact<Basket>[]>(`/api/baskets${qs ? `?${qs}` : ""}`);
+  },
   queues: () => get<Record<QueueName, QueueItem[]>>("/api/queues"),
   sendTo: (queue: QueueName, body: { kind: ScanSource; file: string; tickers: string[] }) =>
     post<{ queue: QueueName; added: string[]; already_queued: string[] }>(`/api/queues/${queue}`, body),
@@ -400,7 +414,8 @@ export const api = {
   saveKeys: (body: { set: Record<string, string>; clear: string[] }) =>
     put<{ ok: true; saved: string[]; cleared: string[] }>("/api/settings/keys", body),
 
-  runScans: (body: { as_of: string; kind: ScanKind; tickers: string[] }) =>
+  // category is read for the category kinds only.
+  runScans: (body: { as_of: string; kind: ScanKind; tickers: string[]; category?: Category }) =>
     post<Job>("/api/scans/run", body),
   runPipeline: (body: { as_of: string; tickers: string[]; regime_symbol: string }) =>
     post<Job>("/api/pipeline/run", body),

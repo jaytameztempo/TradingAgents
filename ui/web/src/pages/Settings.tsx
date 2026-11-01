@@ -1,6 +1,6 @@
 import { ReactNode, useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, Automation, ScanKind, SettingsData, Trading } from "../api";
+import { api, Automation, CATEGORIES, Category, CATEGORY_LABEL, ScanKind, SettingsData, Trading } from "../api";
 import { Card, Dialog, ErrorBox } from "../components/ui";
 import { dateTime } from "../format";
 import { DEFAULT_PREFS, Prefs, usePrefs } from "../prefs";
@@ -125,7 +125,8 @@ const STYLES: [string, string][] = [["1", "Candles"], ["0", "Bars (OHLC)"], ["9"
   ["2", "Line"], ["3", "Area"]];
 const SCANS: [ScanKind, string][] = [["all", "All four scans"], ["both", "Both trend scans"], ["sideways", "Both sideways scans"],
   ["up", "Upward trend momentum"], ["down", "Breakdown short candidates"], ["long_side", "Long sideways channel"],
-  ["short_side", "Short sideways channel"]];
+  ["short_side", "Short sideways channel"], ["cat_up", "Category: upward"], ["cat_down", "Category: downward"],
+  ["cat_side", "Category: sideways (long + short)"], ["cat_all", "Category: all three"]];
 
 function AppPrefs() {
   const { prefs, setPrefs, reset } = usePrefs();
@@ -160,6 +161,11 @@ function AppPrefs() {
       <Field label="Default scan" hint="Pre-selected on the Scans page.">
         <select value={prefs.defaultScan} onChange={(e) => set("defaultScan")(e.target.value as ScanKind)}>
           {SCANS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+        </select>
+      </Field>
+      <Field label="Default category" hint="Pre-selected for the category scans on the Scans page. Recurring scans do not use it.">
+        <select value={prefs.defaultCategory} onChange={(e) => set("defaultCategory")(Number(e.target.value) as Category)}>
+          {CATEGORIES.map((c) => <option key={c} value={c}>{CATEGORY_LABEL[c]}</option>)}
         </select>
       </Field>
       <Field label="Default trend-scan tickers" hint="Blank uses each scan's default universe.">

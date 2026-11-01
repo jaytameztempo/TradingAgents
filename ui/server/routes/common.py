@@ -8,6 +8,7 @@ from datetime import date
 from fastapi import HTTPException
 
 from ui.server import jobs, paths
+from ui.server.queues import CATEGORIES
 
 # The plain-US-ticker rule from extensions/market_data/alpaca_bars.py.
 _TICKER = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z]{1,2})?$")
@@ -74,6 +75,26 @@ def channel_scan_steps(as_of: str, which: tuple[str, ...] = ("long_side", "short
     folder = str(paths.scanbot_dir())
     return [
         jobs.Step(CHANNEL_SCRIPTS[w], ["--as-of", as_of, "--report-dir", folder, "--out-dir", folder])
+        for w in which
+    ]
+
+
+def category(value: int) -> int:
+    if value not in CATEGORIES:
+        raise bad_request(f"category must be one of {', '.join(map(str, CATEGORIES))}")
+    return value
+
+
+# Category scans (run_category_scan) also read the newest financials report for the date, so they take no
+# ticker list either. They write TickerBaskets to the UI's baskets folder, named apart from the trend scans.
+CATEGORY_SCANS = ("up", "down", "side")
+
+
+def category_scan_steps(as_of: str, which: tuple[str, ...], category: int) -> list[jobs.Step]:
+    return [
+        jobs.Step("run_category_scan", ["--scan", w, "--as-of", as_of, "--category", str(category),
+                                        "--report-dir", str(paths.scanbot_dir()),
+                                        "--out-dir", str(paths.baskets_dir())])
         for w in which
     ]
 

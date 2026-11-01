@@ -199,6 +199,80 @@ def test_scan_kinds_start_the_matching_scripts(home, client, monkeypatch, kind, 
             assert "NVDA" in step.args
 
 
+def _capture_steps(monkeypatch) -> list:
+    started = []
+
+    def fake_start(kind_name, steps, group=None):
+        started.extend(steps)
+        return jobs.Job(id="x", kind=kind_name, group=group, steps=steps)
+
+    monkeypatch.setattr(jobs.runner, "start", fake_start)
+    return started
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("kind", "scans"), [
+    ("cat_up", ["up"]), ("cat_down", ["down"]), ("cat_side", ["side"]), ("cat_all", ["up", "down", "side"]),
+])
+@pytest.mark.parametrize("category", [1, 2, 3])
+def test_category_kinds_start_run_category_scan_with_the_category(home, client, monkeypatch, kind, scans, category):
+    started = _capture_steps(monkeypatch)
+    body = {"as_of": AS_OF, "kind": kind, "tickers": ["NVDA"], "category": category}
+    assert client.post("/api/scans/run", json=body).status_code == 200
+    assert {s.script for s in started} == {"run_category_scan"} and "run_category_scan" in jobs.SCRIPTS
+    scanbot, baskets = str(paths.scanbot_dir()), str(paths.baskets_dir())
+    assert [s.args for s in started] == [
+        ["--scan", scan, "--as-of", AS_OF, "--category", str(category), "--report-dir", scanbot, "--out-dir", baskets]
+        for scan in scans
+    ]  # no ticker list: category scans read the financials report
+
+
+@pytest.mark.unit
+def test_category_defaults_to_1(home, client, monkeypatch):
+    started = _capture_steps(monkeypatch)
+    assert client.post("/api/scans/run", json={"as_of": AS_OF, "kind": "cat_up"}).status_code == 200
+    assert started[0].args[started[0].args.index("--category") + 1] == "1"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("category", [0, 4, -1, "x"])
+def test_bad_categories_are_refused(home, client, monkeypatch, category):
+    started = _capture_steps(monkeypatch)
+    resp = client.post("/api/scans/run", json={"as_of": AS_OF, "kind": "cat_side", "category": category})
+    assert resp.status_code in (400, 422) and started == []
+
+
+@pytest.mark.unit
+def test_old_kinds_ignore_the_category(home, client, monkeypatch):
+    started = _capture_steps(monkeypatch)
+    body = {"as_of": AS_OF, "kind": "both", "tickers": ["NVDA"], "category": 3}
+    assert client.post("/api/scans/run", json=body).status_code == 200
+    assert [s.script for s in started] == ["run_upward_trend_scan", "run_breakdown_scan"]
+    assert all("--category" not in s.args for s in started)
+
+
+@pytest.mark.unit
+def test_category_baskets_are_listed_by_kind_and_category(home, client):
+    def basket(name, scan_name):
+        _write(paths.baskets_dir() / name, {"scan_name": scan_name, "as_of": AS_OF,
+                                            "created_at": "2026-10-01T00:00:00+00:00", "members": [], "rejected": []})
+    basket(f"scan-up-category-1_{AS_OF}_20261001T000000Z.json", "SCAN-UP Category 1")
+    basket(f"scan-up-category-2_{AS_OF}_20261001T000000Z.json", "SCAN-UP Category 2")
+    basket(f"scan-side-long-category-2_{AS_OF}_20261001T000000Z.json", "SCAN-SIDE Long Category 2")
+    basket(f"scan-upward-trend-momentum_{AS_OF}_20261001T000000Z.json", "SCAN-Upward Trend Momentum")
+
+    def files(query):
+        return [e["file"].split("_")[0] for e in client.get(f"/api/baskets?{query}").json()]
+    assert sorted(files("kind=up_cat")) == ["scan-up-category-1", "scan-up-category-2"]
+    assert files("kind=up_cat&category=2") == ["scan-up-category-2"]
+    assert files("kind=side_long_cat&category=2") == ["scan-side-long-category-2"]
+    assert files("kind=up") == ["scan-upward-trend-momentum"]  # the old tab never shows category baskets
+    assert client.get("/api/baskets?kind=up_cat&category=4").status_code == 400
+    assert client.get("/api/baskets?kind=up&category=1").status_code == 400
+    summary = client.get(f"/api/summary?as_of={AS_OF}").json()
+    assert set(summary["baskets"]) == {"up", "down"}  # the dashboard summary is unchanged
+
+
 @pytest.mark.unit
 def test_unknown_scan_kind_is_refused(home, client):
     assert client.post("/api/scans/run", json={"as_of": AS_OF, "kind": "orders"}).status_code == 400

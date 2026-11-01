@@ -116,6 +116,57 @@ def test_trash_deletes_the_whole_file(home, client):
     assert client.post("/api/scans/trash", json={"kind": "long", "file": LONG_FILE}).status_code == 400
 
 
+CAT_UP_FILE = f"scan-up-category-2_{AS_OF}_20261010T000000Z.json"
+CAT_SHORT_FILE = f"scan-side-short-category-3_{AS_OF}_20261010T000000Z.json"
+
+
+@pytest.fixture
+def category_baskets(home):
+    _write(home / "baskets" / CAT_UP_FILE, {
+        "scan_name": "SCAN-UP Category 2", "as_of": AS_OF, "created_at": "2026-10-10T00:00:00+00:00",
+        "universe": ["NVDA", "AAPL"], "parameters": {"category": 2},
+        "members": [{"ticker": "NVDA", "score": 0.07, "metrics": {"close": 234.0, "sma_50": 218.3, "sma_200": 200.7}}],
+        "rejected": [{"ticker": "AAPL", "reason": "RSI 71.0 is outside 35-60"}], "schema_version": 1})
+    _write(home / "baskets" / CAT_SHORT_FILE, {
+        "scan_name": "SCAN-SIDE Short Category 3", "as_of": AS_OF, "created_at": "2026-10-10T00:00:00+00:00",
+        "universe": ["RIVN"], "parameters": {"category": 3},
+        "members": [{"ticker": "RIVN", "score": -0.2, "metrics": {"close": 12.0, "sma_50": 12.5, "sma_200": 13.0}}],
+        "rejected": [], "schema_version": 1})
+    return home
+
+
+@pytest.mark.unit
+def test_category_baskets_go_to_the_queues_with_their_side_and_regime(category_baskets, client):
+    client.post("/api/queues/strategy", json={"kind": "up_cat", "file": CAT_UP_FILE, "tickers": []})
+    client.post("/api/queues/strategy", json={"kind": "side_short_cat", "file": CAT_SHORT_FILE, "tickers": []})
+    items = {i["ticker"]: i for i in client.get("/api/queues").json()["strategy"]}
+    assert items["NVDA"]["side"] == "long" and items["NVDA"]["needs_regime"] == "UP"
+    assert items["NVDA"]["scan"] == "Category upward (Category 2)" and items["NVDA"]["metrics"]["close"] == 234.0
+    assert items["RIVN"]["side"] == "short" and items["RIVN"]["needs_regime"] == "SIDE"
+    assert {t: i["verdict"] for t, i in items.items()} == {"NVDA": "BLOCKED", "RIVN": "ALLOWED"}  # regime is SIDE
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("body", [
+    {"kind": "up_cat", "file": CAT_UP_FILE, "tickers": ["AAPL"]},  # rejected, not a member
+    {"kind": "down_cat", "file": CAT_UP_FILE, "tickers": []},  # wrong kind for the file
+    {"kind": "up", "file": CAT_UP_FILE, "tickers": []},  # the old kind does not take category files
+    {"kind": "up_cat", "file": UP_FILE, "tickers": []},  # nor the reverse
+    {"kind": "side_long_cat", "file": CAT_SHORT_FILE, "tickers": []},
+])
+def test_category_files_are_refused_under_the_wrong_kind(category_baskets, client, body):
+    assert client.post("/api/queues/trade", json=body).status_code == 400
+
+
+@pytest.mark.unit
+def test_trash_works_on_category_baskets(category_baskets, client):
+    resp = client.post("/api/scans/trash", json={"kind": "up_cat", "file": CAT_UP_FILE, "ticker": "NVDA"})
+    assert resp.status_code == 200
+    assert json.loads((category_baskets / "baskets" / CAT_UP_FILE).read_text())["members"] == []
+    assert client.post("/api/scans/trash", json={"kind": "side_short_cat", "file": CAT_SHORT_FILE}).status_code == 200
+    assert not (category_baskets / "baskets" / CAT_SHORT_FILE).exists()
+
+
 @pytest.mark.unit
 def test_trash_refuses_files_outside_the_scan_folders(home, client):
     _write(home / "settings.json", {})

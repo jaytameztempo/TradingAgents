@@ -1,6 +1,9 @@
 import { ReactNode, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { api, Artifact, Basket, BasketMember, ChannelCall, ChannelReport, defaultAsOf, parseTickers, ScanKind, ScanSource } from "../api";
+import {
+  api, Artifact, Basket, BasketKind, BasketMember, CATEGORIES, Category, CATEGORY_LABEL, CATEGORY_SCAN_KINDS,
+  CategoryBasketKind, ChannelCall, ChannelReport, defaultAsOf, parseTickers, ScanKind, ScanSource,
+} from "../api";
 import { SendTo } from "../components/SendTo";
 import { Card, Column, DataTable, Empty, ErrorBox, JobLog, Tabs } from "../components/ui";
 import { dateTime, num } from "../format";
@@ -8,12 +11,13 @@ import { useJob } from "../useJob";
 import { Ticker } from "../components/Ticker";
 import { usePrefs } from "../prefs";
 
-type Kind = "up" | "down" | "long" | "short";
+type Kind = "up" | "down" | "long" | "short" | "category";
 const KIND_LABEL: Record<Kind, string> = {
   up: "Upward trend momentum",
   down: "Breakdown short candidates",
   long: "Long sideways channel",
   short: "Short sideways channel",
+  category: "Category baskets",
 };
 
 const SCAN_OPTIONS: { value: ScanKind; label: string }[] = [
@@ -24,17 +28,23 @@ const SCAN_OPTIONS: { value: ScanKind; label: string }[] = [
   { value: "down", label: KIND_LABEL.down },
   { value: "long_side", label: KIND_LABEL.long },
   { value: "short_side", label: KIND_LABEL.short },
+  { value: "cat_up", label: "Category: upward" },
+  { value: "cat_down", label: "Category: downward" },
+  { value: "cat_side", label: "Category: sideways (long + short)" },
+  { value: "cat_all", label: "Category: all three" },
 ];
 // Kinds that run a trend scan, the only scans that take a ticker list.
 const USES_TICKERS: ScanKind[] = ["all", "both", "up", "down"];
-const USES_FINANCIALS: ScanKind[] = ["all", "sideways", "long_side", "short_side"];
+const USES_FINANCIALS: ScanKind[] = ["all", "sideways", "long_side", "short_side", ...CATEGORY_SCAN_KINDS];
 
 export default function Scans() {
   const [asOf, setAsOf] = useState(defaultAsOf());
   const { prefs } = usePrefs();
   const [which, setWhich] = useState<ScanKind>(prefs.defaultScan);
+  const [category, setCategory] = useState<Category>(prefs.defaultCategory);
   const [tickerText, setTickerText] = useState(prefs.defaultTickers);
   const runner = useJob();
+  const isCategory = CATEGORY_SCAN_KINDS.includes(which);
 
   return (
     <>
@@ -49,23 +59,37 @@ export default function Scans() {
               {SCAN_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
           </label>
+          {isCategory && (
+            <label className="field">Category
+              <select value={category} onChange={(e) => setCategory(Number(e.target.value) as Category)}>
+                {CATEGORIES.map((c) => <option key={c} value={c}>{CATEGORY_LABEL[c]}</option>)}
+              </select>
+            </label>
+          )}
           <label className="field" style={{ flex: 1, minWidth: 220 }}>
             {USES_TICKERS.includes(which)
               ? `Tickers for the trend scans (blank = default universe)${which === "all" ? "; sideways scans use the financials survivors" : ""}`
-              : "Tickers (sideways scans use the financials survivors)"}
+              : isCategory
+                ? "Tickers (category scans use the financials report's universe)"
+                : "Tickers (sideways scans use the financials survivors)"}
             <input value={tickerText} placeholder="SPY QQQ NVDA AAPL MSFT" disabled={!USES_TICKERS.includes(which)}
                    onChange={(e) => setTickerText(e.target.value)} />
           </label>
           <button className="btn btn-primary" disabled={runner.running}
                   onClick={() => runner.start(() => api.runScans({
                     as_of: asOf, kind: which, tickers: USES_TICKERS.includes(which) ? parseTickers(tickerText) : [],
+                    ...(isCategory ? { category } : {}),
                   }))}>
             {runner.running ? "Running…" : "Run"}
           </button>
         </div>
         <p className="muted">
           Fetches daily bars from Alpaca (paper keys, read-only). Trend scans write a basket to ~/.tradingagents/baskets.
-          {USES_FINANCIALS.includes(which) && (
+          {isCategory ? (
+            <> Category scans scan the universe behind the newest financials report for the date (STRONG names for
+              upward and downward), so run <code>run_scanbot_financials</code> for that date first; they write category
+              baskets to ~/.tradingagents/baskets, shown under the Category baskets tab.</>
+          ) : USES_FINANCIALS.includes(which) && (
             <> Sideways scans scan the STRONG (long) or WEAK (short) survivors of the newest financials report for the date,
               so run <code>run_scanbot_financials</code> for that date first; they write to ~/.tradingagents/scanbot.</>
           )}
@@ -78,16 +102,53 @@ export default function Scans() {
   );
 }
 
-const TABS: { id: Kind; label: string }[] = (["up", "down", "long", "short"] as Kind[]).map((id) => ({ id, label: KIND_LABEL[id] }));
+const TABS: { id: Kind; label: string }[] = (["up", "down", "long", "short", "category"] as Kind[])
+  .map((id) => ({ id, label: KIND_LABEL[id] }));
 
 function BasketBrowser() {
   const [kind, setKind] = useState<Kind>("up");
   return (
     <Card title={<Tabs value={kind} onChange={setKind} tabs={TABS} />}>
-      {kind === "up" || kind === "down"
-        ? <TrendBaskets key={kind} kind={kind} />
-        : <ChannelReports key={kind} side={kind} />}
+      {kind === "category"
+        ? <CategoryBaskets />
+        : kind === "up" || kind === "down"
+          ? <TrendBaskets key={kind} kind={kind} />
+          : <ChannelReports key={kind} side={kind} />}
     </Card>
+  );
+}
+
+const CATEGORY_BASKETS: { value: CategoryBasketKind; label: string }[] = [
+  { value: "up_cat", label: "Upward" },
+  { value: "down_cat", label: "Downward" },
+  { value: "side_long_cat", label: "Sideways long" },
+  { value: "side_short_cat", label: "Sideways short" },
+];
+
+function CategoryBaskets() {
+  const { prefs } = usePrefs();
+  const [kind, setKind] = useState<CategoryBasketKind>("up_cat");
+  const [category, setCategory] = useState<Category>(prefs.defaultCategory);
+  const baskets = useQuery({ queryKey: ["baskets", kind, category], queryFn: () => api.baskets(kind, category) });
+  return (
+    <>
+      <div className="form">
+        <label className="field">Scan
+          <select value={kind} onChange={(e) => setKind(e.target.value as CategoryBasketKind)}>
+            {CATEGORY_BASKETS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </label>
+        <label className="field">Category
+          <select value={category} onChange={(e) => setCategory(Number(e.target.value) as Category)}>
+            {CATEGORIES.map((c) => <option key={c} value={c}>{CATEGORY_LABEL[c]}</option>)}
+          </select>
+        </label>
+      </div>
+      <ErrorBox error={baskets.error} />
+      <ReportList key={`${kind}-${category}`} kind={kind} items={baskets.data ?? []} count={(b) => b.members.length}
+                  render={(b) => <BasketDetail basket={b} kind={kind} />}
+                  empty="No category baskets for this scan and category yet. Run a category scan above." />
+    </>
   );
 }
 
@@ -217,7 +278,7 @@ function ChannelDetail({ report, side }: { report: Artifact<ChannelReport>; side
   );
 }
 
-function BasketDetail({ basket, kind }: { basket: Artifact<Basket>; kind: "up" | "down" }) {
+function BasketDetail({ basket, kind }: { basket: Artifact<Basket>; kind: BasketKind }) {
   if (basket.error || !basket.data) return <ErrorBox error={basket.error ?? "unreadable basket"} />;
   const b = basket.data;
   const memberCols: Column<BasketMember>[] = [
@@ -232,7 +293,13 @@ function BasketDetail({ basket, kind }: { basket: Artifact<Basket>; kind: "up" |
   ];
   return (
     <div className="grid">
-      <div className="muted">{basket.file} · created {dateTime(b.created_at)}{b.universe ? ` · universe: ${b.universe.join(" ")}` : ""}</div>
+      <div className="muted">
+        {basket.file} · created {dateTime(b.created_at)}
+        {b.parameters?.category != null
+          ? ` · ${b.scan_name} · ${b.universe?.length ?? 0} scanned`
+          : b.universe ? ` · universe: ${b.universe.join(" ")}` : ""}
+      </div>
+      {(b.parameters?.warnings as string[] | undefined)?.map((w) => <div key={w} className="notice notice-warn">⚠ {w}</div>)}
       <h2>Passed ({b.members.length})</h2>
       <DataTable columns={memberCols} rows={b.members} rowKey={(m) => m.ticker} empty="No tickers passed this scan."
                  initialSort={{ key: "score", dir: "desc" }} />

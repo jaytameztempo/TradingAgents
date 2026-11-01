@@ -1,5 +1,5 @@
 import { createContext, ReactNode, useCallback, useContext, useEffect, useState } from "react";
-import type { ScanKind } from "./api";
+import type { Category, ScanKind } from "./api";
 
 /** App preferences, kept in this browser only (localStorage); nothing here reaches the server. */
 export interface Prefs {
@@ -8,6 +8,7 @@ export interface Prefs {
   chartInterval: string; // TradingView interval: 1, 5, 15, 30, 60, 240, D, W
   chartStyle: string; // TradingView style: 0 bars, 1 candles, 9 hollow candles, 8 Heikin Ashi, 2 line, 3 area
   defaultScan: ScanKind;
+  defaultCategory: Category; // pre-selected for the category scans; the scheduler never reads it
   defaultTickers: string;
   regimeSymbol: string;
 }
@@ -18,6 +19,7 @@ export const DEFAULT_PREFS: Prefs = {
   chartInterval: "D",
   chartStyle: "1",
   defaultScan: "all",
+  defaultCategory: 1,
   defaultTickers: "",
   regimeSymbol: "SPY",
 };

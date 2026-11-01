@@ -27,9 +27,20 @@ SCAN_KINDS = {
     "down": (paths.baskets_dir, "scan-breakdown-short-candidates", "short", "DOWN"),
     "long": (paths.scanbot_dir, "long_channel", "long", "SIDE"),
     "short": (paths.scanbot_dir, "short_channel", "short", "SIDE"),
+    # Category scans (run_category_scan): TickerBaskets named {prefix}-{category}_{as_of}_{stamp}.json.
+    "up_cat": (paths.baskets_dir, "scan-up-category", "long", "UP"),
+    "down_cat": (paths.baskets_dir, "scan-down-category", "short", "DOWN"),
+    "side_long_cat": (paths.baskets_dir, "scan-side-long-category", "long", "SIDE"),
+    "side_short_cat": (paths.baskets_dir, "scan-side-short-category", "short", "SIDE"),
 }
 SCAN_LABEL = {"up": "Upward trend momentum", "down": "Breakdown short candidates",
-              "long": "Long sideways channel", "short": "Short sideways channel"}
+              "long": "Long sideways channel", "short": "Short sideways channel",
+              "up_cat": "Category upward", "down_cat": "Category downward",
+              "side_long_cat": "Category sideways long", "side_short_cat": "Category sideways short"}
+CATEGORIES = (1, 2, 3)  # as extensions/scans/categories.py; not imported, so the server loads no scan code
+CATEGORY_KINDS = frozenset({"up_cat", "down_cat", "side_long_cat", "side_short_cat"})
+# Kinds whose files are TickerBaskets (members with metrics, plus rejected); the rest are channel reports.
+BASKET_KINDS = frozenset({"up", "down", *CATEGORY_KINDS})
 REMOVED_REASON = "removed_by_operator"
 _lock = threading.Lock()
 
@@ -63,12 +74,25 @@ def scan_file(kind: str, name: str) -> Path:
     if kind not in SCAN_KINDS:
         raise QueueError(f"unknown scan kind {kind!r}")
     folder_fn, prefix, _, _ = SCAN_KINDS[kind]
-    if not name.startswith(prefix + "_"):
+    if file_category(kind, name) is None:
         raise QueueError(f"{name} is not a {SCAN_LABEL[kind]} file")
     try:
         return files.safe_child(folder_fn(), name)
     except files.NotFound:
         raise QueueError(f"no such scan file: {name}") from None
+
+
+def file_category(kind: str, name: str) -> int | None:
+    """For a file of `kind`: its category (1-3) for a category kind, 0 for the other kinds, None if not that kind's."""
+    _, prefix, _, _ = SCAN_KINDS[kind]
+    if kind not in CATEGORY_KINDS:
+        return 0 if name.startswith(prefix + "_") else None
+    return next((c for c in CATEGORIES if name.startswith(f"{prefix}-{c}_")), None)
+
+
+def scan_label(kind: str, name: str) -> str:
+    category = file_category(kind, name)
+    return f"{SCAN_LABEL[kind]} (Category {category})" if category else SCAN_LABEL[kind]
 
 
 def _read_scan(path: Path) -> dict:
@@ -81,7 +105,7 @@ def _read_scan(path: Path) -> dict:
 def _members(kind: str, data: dict) -> dict[str, dict]:
     """ticker -> the small set of numbers a queued row shows."""
     out: dict[str, dict] = {}
-    if kind in ("up", "down"):
+    if kind in BASKET_KINDS:
         for m in data.get("members") or []:
             met = m.get("metrics") or {}
             out[m["ticker"]] = {"close": met.get("close"), "sma_50": met.get("sma_50"),
@@ -115,7 +139,7 @@ def send(queue: str, kind: str, name: str, tickers: list[str] | None) -> dict:
             if (t, as_of, kind) in have:
                 continue
             item = {"id": uuid.uuid4().hex[:12], "ticker": t, "as_of": as_of, "kind": kind,
-                    "scan": SCAN_LABEL[kind], "scan_file": name, "side": side, "needs_regime": regime,
+                    "scan": scan_label(kind, name), "scan_file": name, "side": side, "needs_regime": regime,
                     "metrics": members[t], "added_at": datetime.now(UTC).isoformat(timespec="seconds")}
             queues[queue].append(item)
             added.append(t)
@@ -190,7 +214,7 @@ def remove_ticker(kind: str, name: str, ticker: str) -> dict:
     """Remove one ticker from the scan file itself. A channel report also marks its call not passed."""
     path = scan_file(kind, name)
     data = _read_scan(path)
-    if kind in ("up", "down"):
+    if kind in BASKET_KINDS:
         members = data.get("members") or []
         rejected = data.get("rejected") or []
         kept = [m for m in members if m.get("ticker") != ticker]

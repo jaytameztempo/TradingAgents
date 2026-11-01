@@ -27,6 +27,7 @@ SCRIPTS = frozenset({
     "run_breakdown_scan",
     "run_scanbot_long_channel",
     "run_scanbot_short_channel",
+    "run_category_scan",  # SCANUP / SCANDOWN / SCANSIDE at category 1, 2 or 3; writes baskets only
     "run_regime_bot",
     "run_router",
     "run_side_bot",
