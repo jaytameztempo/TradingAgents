@@ -50,8 +50,10 @@ function QueueCard({ title, queue, columns, hint, empty }: {
 // --- Research page ---------------------------------------------------------------------
 
 const ROUTE_TEXT: Record<string, string> = {
-  ALLOWED: "✓ Routed: allowed", BLOCKED: "◆ Routed: blocked", NOT_ROUTED: "✕ Not in route", NO_ROUTE: "✕ No route for date",
+  ALLOWED: "✓ Routed: allowed", BLOCKED: "◆ Routed: blocked", NOT_ROUTED: "○ Not in route", NO_ROUTE: "○ No route for date",
 };
+
+const isRouted = (i: QueueItem) => i.route_status === "ALLOWED" || i.route_status === "BLOCKED";
 
 export function ResearchQueue() {
   const [item, setItem] = useState<QueueItem | null>(null);
@@ -65,14 +67,13 @@ export function ResearchQueue() {
         {ROUTE_TEXT[i.route_status ?? "NO_ROUTE"]}</span>,
     },
     {
-      key: "run", label: "", render: (i) => {
-        const routed = i.route_status === "ALLOWED" || i.route_status === "BLOCKED";
-        return (
-          <span title={routed ? "Run TradingAgents on this ticker" : "run_research needs the ticker in the route for its date; run the router first"}>
-            <button className="btn btn-sm btn-primary" disabled={!routed || runner.running} onClick={() => setItem(i)}>Research…</button>
-          </span>
-        );
-      },
+      key: "run", label: "", render: (i) => (
+        <span title={!i.as_of ? "This row has no scan date"
+                     : isRouted(i) ? "Run TradingAgents on this ticker"
+                     : "Not in a route: TradingAgents runs on it as a passer of its scan file"}>
+          <button className="btn btn-sm btn-primary" disabled={!i.as_of || runner.running} onClick={() => setItem(i)}>Research…</button>
+        </span>
+      ),
     });
   return (
     <>
@@ -83,9 +84,13 @@ export function ResearchQueue() {
               actions={<button className="btn btn-primary" disabled={!analysts.length} onClick={() => {
                 const i = item!;
                 setItem(null);
-                runner.start(() => api.runResearch({ as_of: i.as_of!, ticker: i.ticker, analysts, confirm: true }));
+                const scan = isRouted(i) ? {} : { scan_kind: i.kind, scan_file: i.scan_file };
+                runner.start(() => api.runResearch({ as_of: i.as_of!, ticker: i.ticker, analysts, confirm: true, ...scan }));
               }}>Run</button>}>
-        {item && <p><strong>{item.ticker}</strong> as of <strong>{item.as_of}</strong> ({ROUTE_TEXT[item.route_status ?? "NO_ROUTE"]}).</p>}
+        {item && (isRouted(item)
+          ? <p><strong>{item.ticker}</strong> as of <strong>{item.as_of}</strong> ({ROUTE_TEXT[item.route_status!]}).</p>
+          : <p><strong>{item.ticker}</strong> as of <strong>{item.as_of}</strong>, a passer of {item.scan}. It is not in a
+              route for that date, so the run uses its scan file instead.</p>)}
         <div className="checks">
           {ANALYSTS.map((a) => (
             <label key={a}><input type="checkbox" checked={analysts.includes(a)}

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { api, ResearchRun, StateLog } from "../api";
+import { api, QueueItem, ResearchRun, StateLog } from "../api";
 import { Card, Dialog, Empty, ErrorBox, JobLog, Markdown, Tabs } from "../components/ui";
 import { dateTime } from "../format";
 import { useJob } from "../useJob";
@@ -26,10 +26,19 @@ function RunCard() {
   const [asOf, setAsOf] = useState<string>("");
   const date = asOf || dates.data?.[0] || "";
   const summary = useQuery({ queryKey: ["summary", date], queryFn: () => api.summary(date), enabled: !!date });
+  const queues = useQuery({ queryKey: ["queues"], queryFn: api.queues, refetchInterval: 30_000 });
   const route = summary.data?.route?.data;
-  const routed = route ? [...route.tradeable.map((t) => ({ t, s: "ALLOWED" })), ...route.blocked.map((t) => ({ t, s: "BLOCKED" }))] : [];
+  const fromRoute: { t: string; s: string; item?: QueueItem }[] = route
+    ? [...route.tradeable.map((t) => ({ t, s: "ALLOWED" })), ...route.blocked.map((t) => ({ t, s: "BLOCKED" }))] : [];
+  // Queued scan tickers for the date that are not in the route (sideways names never are) run from their scan file.
+  const fromQueue = (queues.data?.research ?? [])
+    .filter((i) => i.as_of === date && !fromRoute.some((r) => r.t === i.ticker))
+    .filter((i, n, all) => all.findIndex((j) => j.ticker === i.ticker) === n)
+    .map((i) => ({ t: i.ticker, s: i.scan, item: i }));
+  const routed = [...fromRoute, ...fromQueue];
   const [ticker, setTicker] = useState("");
   const chosen = routed.some((r) => r.t === ticker) ? ticker : routed[0]?.t ?? "";
+  const queued = routed.find((r) => r.t === chosen)?.item;
   const [analysts, setAnalysts] = useState<string[]>(["market"]);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const runner = useJob();
@@ -45,7 +54,7 @@ function RunCard() {
             {(dates.data ?? []).map((d) => <option key={d} value={d}>{d}</option>)}
           </select>
         </label>
-        <label className="field">Ticker (from the route)
+        <label className="field">Ticker (route or research queue)
           <select value={chosen} onChange={(e) => setTicker(e.target.value)} disabled={!routed.length}>
             {routed.map((r) => <option key={r.t} value={r.t}>{r.t} · {r.s}</option>)}
           </select>
@@ -64,7 +73,8 @@ function RunCard() {
         </button>
       </div>
       {!routed.length && date && !summary.isLoading && (
-        <p className="muted">No routed tickers for {date}. Run the pipeline (Dashboard) or the router (Strategy) first.</p>
+        <p className="muted">No routed or queued tickers for {date}. Run the pipeline (Dashboard) or the router (Strategy),
+          or send scan tickers here with Send to → Research on the Scans page.</p>
       )}
       <p className="muted">Runs the LangGraph agents unchanged via run_research. Research only; no order is placed.</p>
       <ErrorBox error={runner.error} />
@@ -76,7 +86,8 @@ function RunCard() {
         actions={
           <button className="btn btn-primary" onClick={() => {
             setConfirmOpen(false);
-            runner.start(() => api.runResearch({ as_of: date, ticker: chosen, analysts, confirm: true }));
+            const scan = queued ? { scan_kind: queued.kind, scan_file: queued.scan_file } : {};
+            runner.start(() => api.runResearch({ as_of: date, ticker: chosen, analysts, confirm: true, ...scan }));
           }}>Run</button>
         }
       >

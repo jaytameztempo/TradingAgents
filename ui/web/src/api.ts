@@ -436,7 +436,8 @@ export const api = {
   runRouter: (body: { as_of: string; category?: Category }) => post<Job>("/api/router/run", body),
   runBot: (body: { as_of: string; bot: "up" | "down" | "side"; symbol: string }) =>
     post<Job>("/api/bots/run", body),
-  runResearch: (body: { as_of: string; ticker: string; analysts: string[]; confirm: true }) =>
+  runResearch: (body: { as_of: string; ticker: string; analysts: string[]; confirm: true;
+                        scan_kind?: ScanSource; scan_file?: string }) =>
     post<Job>("/api/research/run", body),
 };
 

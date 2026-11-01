@@ -4,6 +4,7 @@ A stand-in graph replaces TradingAgents, so no test calls an LLM; Alpaca is made
 """
 
 import ast
+import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -16,11 +17,14 @@ from extensions.research.research_runner import (
     ALLOWED,
     ANALYSTS,
     BLOCKED,
+    SCANNED,
     TickerNotInRoute,
+    TickerNotInScan,
     latest_route,
     make_graph,
     route_status,
     run_research,
+    scan_status,
 )
 from extensions.router.strategy_router import MissingInput, RouteDecision, save_decision
 from extensions.scans import upward_trend_momentum
@@ -285,6 +289,53 @@ def test_cli_reports_a_failed_run(tmp_path, monkeypatch, capsys):
 ])
 def test_cli_refuses_bad_input(argv, fake_graph):
     assert cli.main(argv) == cli.EXIT_BAD_INPUT
+    assert FakeGraph.instances == []
+
+
+def _scan_file(tmp_path, members, as_of="2026-09-30"):
+    path = tmp_path / "scans" / f"scan-side-long-category-2_{as_of}_20261001T000000Z.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"as_of": as_of, "members": members}), encoding="utf-8")
+    return path
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("members", [[{"ticker": "ST", "metrics": {}}], ["ST"]])
+def test_a_passing_member_of_a_scan_file_is_scanned(tmp_path, members):
+    """TickerBasket members are objects; channel report members are plain tickers."""
+    assert scan_status(_scan_file(tmp_path, members), "st", AS_OF) == SCANNED
+
+
+@pytest.mark.unit
+def test_a_scan_file_refuses_other_tickers_other_dates_and_bad_files(tmp_path):
+    with pytest.raises(TickerNotInScan, match="AAPL is not a passing member"):
+        scan_status(_scan_file(tmp_path, ["ST"]), "AAPL", AS_OF)
+    with pytest.raises(TickerNotInScan, match="is for 2026-09-29, not 2026-09-30"):
+        scan_status(_scan_file(tmp_path, ["ST"], as_of="2026-09-29"), "ST", AS_OF)
+    with pytest.raises(MissingInput, match="cannot read scan file"):
+        scan_status(tmp_path / "missing.json", "ST", AS_OF)
+
+
+@pytest.mark.unit
+def test_a_scan_member_is_researched_without_any_route(tmp_path, fake_graph, capsys):
+    scan = _scan_file(tmp_path, [{"ticker": "ST"}])
+
+    argv = ["--as-of", "2026-09-30", "--ticker", "ST", "--scan-file", str(scan), "--route-dir", str(tmp_path / "none")]
+    assert cli.main(argv) == cli.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert out.startswith("SCANNED: ST as of 2026-09-30")
+    assert f"scan file: {scan}" in out
+    assert FakeGraph.instances[0].propagated == [("ST", "2026-09-30")]
+
+
+@pytest.mark.unit
+def test_cli_stops_with_no_run_for_a_ticker_outside_the_scan_file(tmp_path, fake_graph, capsys):
+    scan = _scan_file(tmp_path, ["ST"])
+
+    assert cli.main(["--as-of", "2026-09-30", "--ticker", "AAPL", "--scan-file", str(scan)]) == cli.EXIT_FAILED
+
+    assert "nothing was run" in capsys.readouterr().err
     assert FakeGraph.instances == []
 
 

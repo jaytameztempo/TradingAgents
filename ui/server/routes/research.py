@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from ui.server import files, jobs, paths
+from ui.server import files, jobs, paths, queues
 from ui.server.routes import common
 
 router = APIRouter(prefix="/api/research", tags=["research"])
@@ -17,6 +17,9 @@ class ResearchRun(BaseModel):
     analysts: list[str] = ["market"]
     # The page asks before spending on LLM calls; a request without it is refused.
     confirm: bool = False
+    # A queued scan row that is not in a route (sideways names never are) is researched from its scan file.
+    scan_kind: str | None = None
+    scan_file: str | None = None
 
 
 @router.get("/runs")
@@ -50,5 +53,12 @@ def run(body: ResearchRun) -> dict:
     if not body.confirm:
         raise common.bad_request("research runs call the LLM; confirm the run first")
     args = ["--as-of", common.iso_date(body.as_of), "--ticker", common.ticker(body.ticker),
-            "--analysts", *common.analysts(body.analysts), "--route-dir", str(paths.routes_dir())]
+            "--analysts", *common.analysts(body.analysts)]
+    if body.scan_file:
+        try:
+            args += ["--scan-file", str(queues.scan_file(body.scan_kind or "", body.scan_file))]
+        except queues.QueueError as exc:
+            raise common.bad_request(str(exc)) from None
+    else:
+        args += ["--route-dir", str(paths.routes_dir())]
     return common.start("research", [jobs.Step("run_research", args)], group="research")

@@ -6,10 +6,15 @@ rating is printed and its report saved, and no order is placed. TradingAgents
 gets its data from its own vendors; nothing here calls Alpaca.
 
 A ticker that is not in the route is refused, and a missing route stops the run.
+
+The route lists only the UP and DOWN scan passers, so a sideways scan's names are never in it.
+Those are researched from their scan file instead: a passing member of a scan for the same date
+gets the status SCANNED, and the route is not read.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date
@@ -23,7 +28,7 @@ from extensions.router.strategy_router import (
     load_decision,
 )
 
-ALLOWED, BLOCKED = "ALLOWED", "BLOCKED"
+ALLOWED, BLOCKED, SCANNED = "ALLOWED", "BLOCKED", "SCANNED"
 # The analyst keys TradingAgentsGraph accepts.
 ANALYSTS = ("market", "social", "news", "fundamentals")
 DEFAULT_ANALYSTS = ("market",)
@@ -31,6 +36,10 @@ DEFAULT_ANALYSTS = ("market",)
 
 class TickerNotInRoute(ValueError):
     """The ticker is neither tradeable nor blocked in the route, so it was never routed."""
+
+
+class TickerNotInScan(ValueError):
+    """The scan file is for another date, or the ticker is not one of its passing members."""
 
 
 @dataclass(frozen=True)
@@ -69,6 +78,25 @@ def route_status(decision: RouteDecision, ticker: str) -> str:
     raise TickerNotInRoute(f"{ticker} is not in the route for {decision.as_of} (routed tickers: {routed})")
 
 
+def scan_status(scan_file: str | Path, ticker: str, as_of: date) -> str:
+    """SCANNED if the scan file is for as_of and lists the ticker as a passing member.
+
+    TickerBasket members are objects with a ticker; channel report members are plain tickers.
+    """
+    path = Path(scan_file)
+    ticker = validate_ticker(ticker)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise MissingInput(f"cannot read scan file {path}: {exc}") from exc
+    if data.get("as_of") != as_of.isoformat():
+        raise TickerNotInScan(f"{path.name} is for {data.get('as_of')}, not {as_of}")
+    members = [m.get("ticker") if isinstance(m, dict) else m for m in data.get("members") or []]
+    if ticker not in members:
+        raise TickerNotInScan(f"{ticker} is not a passing member of {path.name} (members: {', '.join(members) or 'none'})")
+    return SCANNED
+
+
 def validate_analysts(analysts: Iterable[str]) -> tuple[str, ...]:
     chosen = tuple(dict.fromkeys(a.strip().lower() for a in analysts))
     unknown = [a for a in chosen if a not in ANALYSTS]
@@ -92,9 +120,22 @@ def run_research(
     graph_factory: Callable[[tuple[str, ...]], object] | None = None,
 ) -> ResearchResult:
     """Run TradingAgents on a routed ticker and save its report. Places no order."""
-    status = route_status(decision, ticker)
-    ticker = validate_ticker(ticker)
+    return _run(validate_ticker(ticker), decision.as_of, route_status(decision, ticker), analysts, graph_factory)
+
+
+def run_scan_research(
+    scan_file: str | Path,
+    as_of: date,
+    ticker: str,
+    analysts: Iterable[str] = DEFAULT_ANALYSTS,
+    graph_factory: Callable[[tuple[str, ...]], object] | None = None,
+) -> ResearchResult:
+    """Run TradingAgents on a passing member of a scan file and save its report. Places no order."""
+    return _run(validate_ticker(ticker), as_of, scan_status(scan_file, ticker, as_of), analysts, graph_factory)
+
+
+def _run(ticker, as_of, status, analysts, graph_factory) -> ResearchResult:
     graph = (graph_factory or make_graph)(validate_analysts(analysts))
-    final_state, rating = graph.propagate(ticker, decision.as_of.isoformat())
+    final_state, rating = graph.propagate(ticker, as_of.isoformat())
     report_path = graph.save_reports(final_state, ticker)
-    return ResearchResult(ticker, decision.as_of, status, str(rating), Path(report_path))
+    return ResearchResult(ticker, as_of, status, str(rating), Path(report_path))

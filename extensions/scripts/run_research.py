@@ -4,9 +4,12 @@ Run from the TradingAgents folder:
 
     python -m extensions.scripts.run_research --as-of 2026-09-30 --ticker NVDA
     python -m extensions.scripts.run_research --as-of 2026-09-30 --ticker NVDA --analysts market news
+    python -m extensions.scripts.run_research --as-of 2026-10-30 --ticker ST --scan-file <basket.json>
 
 Reads the latest route from ~/.tradingagents/routes/ (or --route-dir), prints ALLOWED
 or BLOCKED, then runs TradingAgents and saves its report under TradingAgents' results folder.
+With --scan-file the route is not read: the ticker must be a passing member of that scan file
+for the same date (sideways scan names are never in a route), and the status printed is SCANNED.
 The LLM provider and models come from TradingAgents' own settings in .env.
 """
 
@@ -21,8 +24,10 @@ from extensions.research.research_runner import (
     ANALYSTS,
     DEFAULT_ANALYSTS,
     TickerNotInRoute,
+    TickerNotInScan,
     latest_route,
     route_status,
+    scan_status,
     validate_analysts,
 )
 from extensions.router.strategy_router import MissingInput
@@ -37,6 +42,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--analysts", nargs="+", default=list(DEFAULT_ANALYSTS), choices=ANALYSTS,
                         help=f"analysts to run (default: {' '.join(DEFAULT_ANALYSTS)})")
     parser.add_argument("--route-dir", help="folder of route JSON files (default: ~/.tradingagents/routes)")
+    parser.add_argument("--scan-file", help="research a passing member of this scan file instead of a routed ticker")
     return parser
 
 
@@ -51,19 +57,29 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_BAD_INPUT
 
     try:
-        route_path, decision = latest_route(as_of, args.route_dir)
-        status = route_status(decision, ticker)
-    except (MissingInput, TickerNotInRoute) as exc:
+        if args.scan_file:
+            status = scan_status(args.scan_file, ticker, as_of)
+        else:
+            route_path, decision = latest_route(as_of, args.route_dir)
+            status = route_status(decision, ticker)
+    except (MissingInput, TickerNotInRoute, TickerNotInScan) as exc:
         print(f"error: {exc}; nothing was run", file=sys.stderr)
         return EXIT_FAILED
 
     print(f"{status}: {ticker} as of {as_of}")
-    print(f"  route: {decision.reason}")
-    print(f"  route file: {route_path}")
+    if args.scan_file:
+        print("  not read from a route: a passing member of the scan file")
+        print(f"  scan file: {args.scan_file}")
+    else:
+        print(f"  route: {decision.reason}")
+        print(f"  route file: {route_path}")
     print(f"Running TradingAgents (research only, analysts: {', '.join(analysts)}). No order will be placed.")
 
     try:
-        result = research_runner.run_research(decision, ticker, analysts)
+        if args.scan_file:
+            result = research_runner.run_scan_research(args.scan_file, as_of, ticker, analysts)
+        else:
+            result = research_runner.run_research(decision, ticker, analysts)
     except Exception as exc:  # an LLM or data-vendor failure ends the run; nothing else happens
         print(f"error: TradingAgents run failed: {exc}", file=sys.stderr)
         return EXIT_FAILED

@@ -101,6 +101,25 @@ def test_research_needs_confirmation(home, client):
 
 
 @pytest.mark.unit
+def test_research_on_a_queued_scan_row_passes_its_scan_file_not_the_route(home, client, monkeypatch):
+    """Sideways scan names are never in a route, so the queue sends the row's scan file instead."""
+    started = []
+    monkeypatch.setattr(jobs.runner, "start", lambda kind, steps, group=None: started.append(steps) or jobs.Job("x", kind, group, steps))
+    name = f"scan-upward-trend-momentum_{AS_OF}_20261001T000000Z.json"
+    body = {"as_of": AS_OF, "ticker": "NVDA", "analysts": ["market"], "confirm": True}
+
+    client.post("/api/research/run", json={**body, "scan_kind": "up", "scan_file": name})
+    client.post("/api/research/run", json=body)
+
+    (scanned,), (routed,) = started
+    assert scanned.args[-2:] == ["--scan-file", str(home / "baskets" / name)]
+    assert "--route-dir" not in scanned.args
+    assert routed.args[-2:] == ["--route-dir", str(home / "routes")]
+    bad = client.post("/api/research/run", json={**body, "scan_kind": "up", "scan_file": "../../.env"})
+    assert bad.status_code == 400
+
+
+@pytest.mark.unit
 def test_step_refuses_scripts_outside_the_whitelist():
     with pytest.raises(ValueError):
         jobs.Step("place_order", [])
