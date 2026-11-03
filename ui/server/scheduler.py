@@ -1,18 +1,26 @@
-"""In-app scheduler: recurring scans, and paper auto-send inside the trading window.
+"""In-app scheduler: recurring scans, the Tradebot's checks, paper auto-send, and reconcile.
 
 It runs on a background thread while the UI server runs (``python -m ui.server``); nothing runs while the
-app is closed, and a time missed while it was closed is not made up later. Every 20 seconds it checks the
-settings saved on the Settings page, in New York time:
+app is closed. Every 20 seconds it checks the settings saved on the Settings page, in New York time:
 
 - recurring scans: on each chosen day (weekends included), at each chosen time, it starts either the three
-  category scans (upward, downward, sideways) at the saved category, or run_daily (which writes paper tickets
-  but sends nothing), dated the last open session whose bars
+  category scans (upward, downward, sideways) at the saved category, or run_daily at that category (which fills
+  the Tradebot queue and runs its eod trigger check, but sends nothing), dated the last open session whose bars
   are complete: Friday for a weekend run, the session before a market holiday (see scan_as_of).
-- auto-send: only when switched on, on each trading day that is not a market holiday, at each send time
-  inside a session and before any 1:00 PM early close, it
-  starts ``python -m paper_orders.sender --as-of <date> --send`` for the newest ticket file dated before
-  today (at most MAX_TICKET_AGE_DAYS old). The sender re-checks the window, refuses non-paper keys, and
-  never sends a client order ID twice, so a repeat run only places exits for entries that filled since.
+- Tradebot intraday checks (tradebot mode semi or auto), at each intraday time inside the trading window:
+  ``run_tradebot --stage intraday``; in auto mode also ``--ticket``, then ``paper_orders.sender --tradebot
+  --send``, then ``paper_orders.reconcile``.
+- auto-send (tradebot mode auto AND the paper auto-send switch on), at each send time inside the window:
+  ``run_tradebot --ticket-only``, then ``paper_orders.sender --tradebot --send``, then reconcile. The sender
+  re-checks the window and the risk guard, refuses non-paper keys, and never sends a client order ID twice, so a
+  repeat run only places exits for entries that filled since. The old automatic send of the daily paper ticket
+  file is retired: those files are sent by hand (``sender --as-of D --send``).
+- reconcile at 16:05 on trading days (tradebot mode semi or auto), read-only.
+
+In those sending chains the sender and reconcile steps run even when the step before them failed, so exits are
+placed whatever happened to the tickets. A missed intraday or send slot is made up once when the app comes back,
+if it is still the same trading day and the window is open: only the latest missed one runs, the others are
+recorded as skipped. Missed scan and reconcile slots are not made up.
 
 Each slot fires at most once a day: what fired is kept in scheduler_state.json beside the settings.
 """
@@ -21,23 +29,21 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
-from paper_orders.trade_window import MARKET_TZ, WEEKDAYS, SettingsError, TradeWindow, parse_hhmm
 from paper_orders import market_calendar
+from paper_orders.trade_window import MARKET_TZ, WEEKDAYS, SettingsError, TradeWindow, parse_hhmm
 from ui.server import jobs, paths, settings
 from ui.server.routes import common
 
 TICK_SECONDS = 20
 GRACE = timedelta(minutes=5)  # a slot still fires if the app noticed it up to 5 minutes late
 SCAN_CLOSE_CUTOFF = parse_hhmm("16:15")  # before this, scans are dated the previous weekday
-MAX_TICKET_AGE_DAYS = 5
 MAX_EVENTS = 50
-_TICKET_FILE = re.compile(r"^paper_tickets_(\d{4}-\d{2}-\d{2})_\d{8}T\d{6}Z\.json$")
+RECONCILE_AT = "16:05"
 
 
 @dataclass
@@ -62,16 +68,6 @@ def scan_as_of(local: datetime) -> date:
     return market_calendar.previous_trading_day(local.date())
 
 
-def newest_ticket_date(today: date) -> date | None:
-    """The newest ticket file's date before today, if it is at most MAX_TICKET_AGE_DAYS old."""
-    folder = paths.tickets_dir()
-    if not folder.is_dir():
-        return None
-    dates = {date.fromisoformat(m[1]) for p in folder.iterdir() if (m := _TICKET_FILE.match(p.name))}
-    candidates = [d for d in dates if d < today and (today - d).days <= MAX_TICKET_AGE_DAYS]
-    return max(candidates) if candidates else None
-
-
 class Scheduler:
     def __init__(self, clock: Callable[[], datetime] = lambda: datetime.now(UTC),
                  start: Callable[..., jobs.Job] = jobs.runner.start) -> None:
@@ -81,6 +77,7 @@ class Scheduler:
         self._events: list[Event] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self.last_tick: datetime | None = None
         self._load_state()
 
     # --- state --------------------------------------------------------------
@@ -144,8 +141,25 @@ class Scheduler:
         slot = local.replace(hour=at.hour, minute=at.minute, second=0, microsecond=0)
         return timedelta(0) <= local - slot < GRACE
 
+    def _passed(self, local: datetime, hhmm: str) -> bool:
+        at = parse_hhmm(hhmm)
+        return local >= local.replace(hour=at.hour, minute=at.minute, second=0, microsecond=0)
+
+    def _catch_up(self, kind: str, local: datetime, times: list[str]) -> str | None:
+        """The slot to run now among today's unfired ones that have passed: the latest. Earlier missed ones are
+        marked fired and recorded as skipped. None when nothing is due."""
+        missed = [t for t in sorted(times) if f"{kind}|{local.date()}|{t}" not in self._fired and self._passed(local, t)]
+        if not missed:
+            return None
+        for t in missed[:-1]:
+            self._fired.add(f"{kind}|{local.date()}|{t}")
+            self._record(kind, t, "skipped", "missed while the app was closed; a later slot runs instead")
+        self._fired.add(f"{kind}|{local.date()}|{missed[-1]}")
+        return missed[-1]
+
     def tick(self) -> None:
         now = self._clock()
+        self.last_tick = now
         local = now.astimezone(MARKET_TZ)
         day = WEEKDAYS[local.weekday()]
         changed = False
@@ -159,52 +173,101 @@ class Scheduler:
                     self._run_scans(local, t, auto["run"], auto["category"])
                     changed = True
 
+        try:
+            tb = settings.tradebot()
+        except SettingsError as exc:
+            key = f"settings|{local.date()}"
+            if key not in self._fired:
+                self._fired.add(key)
+                self._record("tradebot", "-", "error", f"tradebot settings: {exc}; the Tradebot is not scheduled")
+                changed = True
+            tb = {"mode": "manual", "intraday_times": []}
         trading = settings.trading(saved_only=True)
+        window = TradeWindow.from_dict(trading) if trading else None
+        trading_day = market_calendar.is_trading_day(local.date())
+        mode = tb["mode"]
+
+        if mode in ("semi", "auto") and trading_day:
+            if window is None:
+                key = f"nowindow|{local.date()}"
+                if key not in self._fired and any(self._passed(local, t) for t in tb["intraday_times"]):
+                    self._fired.add(key)
+                    self._record("intraday", "-", "skipped", "no trading window is saved; the Tradebot's intraday "
+                                                             "checks need one")
+                    changed = True
+            elif window.closed_reason(now) is None:
+                t = self._catch_up("intraday", local, tb["intraday_times"])
+                if t:
+                    self._run_intraday(t, mode)
+                    changed = True
+            if self._due(local, RECONCILE_AT) and f"reconcile|{local.date()}|{RECONCILE_AT}" not in self._fired:
+                self._fired.add(f"reconcile|{local.date()}|{RECONCILE_AT}")
+                self._run_reconcile(RECONCILE_AT)
+                changed = True
+
         auto_send = (trading or {}).get("auto_send") or {}
         if trading and auto_send.get("enabled") and day in trading.get("days", []):
-            window = TradeWindow.from_dict(trading)
-            for t in auto_send.get("times", []):
-                key = f"send|{local.date()}|{t}"
-                if key not in self._fired and self._due(local, t):
-                    self._fired.add(key)
-                    closed = window.closed_reason(now)
-                    if closed is None:
-                        self._run_sender(local, t)
+            times = auto_send.get("times", [])
+            closed = window.closed_reason(now)
+            if closed is None:
+                t = self._catch_up("send", local, times)
+                if t:
+                    if mode == "auto":
+                        self._run_auto_send(t)
                     else:
-                        self._record("send", t, "skipped", f"outside the trading window: {closed}")
+                        self._record("send", t, "skipped", f"tradebot mode is {mode}; automatic sends need auto mode "
+                                                           "and paper auto-send both on")
                     changed = True
+            else:
+                for t in times:
+                    key = f"send|{local.date()}|{t}"
+                    if key not in self._fired and self._due(local, t):
+                        self._fired.add(key)
+                        self._record("send", t, "skipped", f"outside the trading window: {closed}")
+                        changed = True
 
         if changed:
             self._save_state()
 
+    def _start_job(self, kind: str, slot: str, name: str, steps: list[jobs.Step], group: str, detail: str) -> None:
+        try:
+            job = self._start(name, steps, group)
+        except jobs.JobConflict as exc:
+            self._record(kind, slot, "skipped", f"{exc}")
+            return
+        self._record(kind, slot, "started", detail, job.id)
+
     def _run_scans(self, local: datetime, slot: str, run: str, category: int = 1) -> None:
         as_of = scan_as_of(local).isoformat()
         if run == "daily":
-            steps = [jobs.Step("run_daily", ["--as-of", as_of])]
+            steps = [jobs.Step("run_daily", ["--as-of", as_of, "--category", str(category)])]
             what = settings.AUTOMATION_RUNS[run]
         else:
             steps = [*common.input_steps(as_of), *common.category_scan_steps(as_of, common.CATEGORY_SCANS, category)]
             what = f"{settings.AUTOMATION_RUNS[run]}, category {category}"
-        try:
-            job = self._start(f"scheduled:{run}", steps, "pipeline")
-        except jobs.JobConflict as exc:
-            self._record("scan", slot, "skipped", f"{exc}")
-            return
-        self._record("scan", slot, "started", f"{what} for {as_of}", job.id)
+        self._start_job("scan", slot, f"scheduled:{run}", steps, "pipeline", f"{what} for {as_of}")
 
-    def _run_sender(self, local: datetime, slot: str) -> None:
-        as_of = newest_ticket_date(local.date())
-        if as_of is None:
-            self._record("send", slot, "skipped",
-                         f"no paper ticket file dated in the {MAX_TICKET_AGE_DAYS} days before today")
-            return
-        step = jobs.Step(jobs.SENDER, ["--as-of", as_of.isoformat(), "--send"])
-        try:
-            job = self._start("scheduled:paper-send", [step], "sender")
-        except jobs.JobConflict as exc:
-            self._record("send", slot, "skipped", f"{exc}")
-            return
-        self._record("send", slot, "started", f"paper tickets for {as_of}", job.id)
+    def _run_intraday(self, slot: str, mode: str) -> None:
+        if mode == "auto":
+            steps = [jobs.Step("run_tradebot", ["--stage", "intraday", "--ticket"]),
+                     jobs.Step(jobs.SENDER, ["--tradebot", "--send"], always=True),
+                     jobs.Step(jobs.RECONCILE, [], always=True)]
+            self._start_job("intraday", slot, "scheduled:tradebot-intraday-auto", steps, "sender",
+                            "intraday check, tickets, send and reconcile")
+        else:
+            self._start_job("intraday", slot, "scheduled:tradebot-intraday", [
+                jobs.Step("run_tradebot", ["--stage", "intraday"])], "pipeline", "intraday trigger check")
+
+    def _run_auto_send(self, slot: str) -> None:
+        steps = [jobs.Step("run_tradebot", ["--ticket-only"]),
+                 jobs.Step(jobs.SENDER, ["--tradebot", "--send"], always=True),
+                 jobs.Step(jobs.RECONCILE, [], always=True)]
+        self._start_job("send", slot, "scheduled:tradebot-send", steps, "sender",
+                        "tickets for triggered items, the Tradebot send, and reconcile")
+
+    def _run_reconcile(self, slot: str) -> None:
+        self._start_job("reconcile", slot, "scheduled:reconcile", [jobs.Step(jobs.RECONCILE, [])], "reconcile",
+                        "reconcile the paper account (read-only)")
 
     # --- status for the Settings page -----------------------------------------
 
@@ -231,8 +294,18 @@ class Scheduler:
             trading = None
         auto_send = (trading or {}).get("auto_send") or {}
         next_scan = self._next(auto["days"], auto["times"], now) if auto["enabled"] else None
+        try:
+            tb = settings.tradebot()
+        except SettingsError:
+            tb = {"mode": "manual", "intraday_times": []}
+        next_intraday = (self._next(list(WEEKDAYS), tb["intraday_times"], now, TradeWindow.from_dict(trading))
+                         if trading and tb["mode"] in ("semi", "auto") else None)
         return {
             "running": self.running,
+            "last_tick": self.last_tick.isoformat(timespec="seconds") if self.last_tick else None,
+            "tradebot_mode": tb["mode"],
+            "next_intraday": next_intraday,
+            "auto_send_sends": bool(trading and auto_send.get("enabled") and tb["mode"] == "auto"),
             "now": now.astimezone(MARKET_TZ).isoformat(timespec="seconds"),
             "next_scan": next_scan,
             "next_scan_as_of": scan_as_of(datetime.fromisoformat(next_scan)).isoformat() if next_scan else None,

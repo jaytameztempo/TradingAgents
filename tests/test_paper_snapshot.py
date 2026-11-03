@@ -11,19 +11,23 @@ import re
 import subprocess
 import sys
 import urllib.error
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from paper_orders import snapshot
 from paper_orders.snapshot import (
     ACCOUNT_PATH,
+    ASSET_PATH,
     EXIT_BAD_KEYS,
     EXIT_OK,
     EXIT_READ_FAILED,
     OPEN_ORDERS_PATH,
     PAPER_URL,
     POSITIONS_PATH,
+    RECENT_ORDERS_PATH,
     NotPaperKey,
     PaperReader,
     ReadFailed,
@@ -123,23 +127,38 @@ def test_live_or_missing_keys_are_refused_before_any_request(env, match, capsys)
     assert match in capsys.readouterr().err
 
 
-# --- the reader can only GET three paths on the paper URL --------------------
+# --- the reader can only GET five paths on the paper URL ---------------------
 
 @pytest.mark.unit
-def test_the_reader_sends_only_gets_to_the_three_paper_paths():
+def test_the_reader_sends_only_gets_to_the_five_paper_paths():
     account = {"equity": "5000", "buying_power": "20000"}
-    opener = FakeOpener({POSITIONS_PATH: [POSITION], OPEN_ORDERS_PATH: [ORDER], ACCOUNT_PATH: account})
+    asset = {"symbol": "TSLA", "shortable": True, "easy_to_borrow": True}
+    opener = FakeOpener({POSITIONS_PATH: [POSITION], OPEN_ORDERS_PATH: [ORDER], ACCOUNT_PATH: account,
+                         ASSET_PATH + "TSLA": asset, RECENT_ORDERS_PATH + "2026-10-01T13:30:00Z": [ORDER]})
     reader = PaperReader("PKTEST123", "secret", opener=opener)
     assert reader.positions() == [POSITION]
     assert reader.open_orders() == [ORDER]
     assert reader.account() == account
+    assert reader.asset("TSLA") == asset
+    assert reader.recent_orders(datetime(2026, 10, 1, 9, 30, tzinfo=ZoneInfo("America/New_York"))) == [ORDER]
     assert [(r.get_method(), r.full_url, r.data) for r in opener.requests] == [
         ("GET", PAPER_URL + POSITIONS_PATH, None),
         ("GET", PAPER_URL + OPEN_ORDERS_PATH, None),
         ("GET", PAPER_URL + ACCOUNT_PATH, None),
+        ("GET", PAPER_URL + ASSET_PATH + "TSLA", None),
+        ("GET", PAPER_URL + RECENT_ORDERS_PATH + "2026-10-01T13:30:00Z", None),
     ]
     assert opener.requests[0].get_header("Apca-api-key-id") == "PKTEST123"
     assert opener.requests[0].get_header("Apca-api-secret-key") == "secret"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("symbol", ["../orders", "tsla", "TSLA/x", "TSLA?x=1", "", None, "ABCDEFG"])
+def test_an_asset_read_takes_only_a_plain_ticker(symbol):
+    opener = FakeOpener({})
+    with pytest.raises(ReadFailed, match="is not a ticker"):
+        PaperReader("PKTEST123", "secret", opener=opener).asset(symbol)
+    assert opener.requests == []
 
 
 @pytest.mark.unit
@@ -149,16 +168,26 @@ def test_open_orders_asks_only_for_open_orders():
 
 
 @pytest.mark.unit
-def test_the_reader_exposes_only_three_read_methods():
+def test_the_reader_exposes_only_five_read_methods():
     public = {name for name in dir(PaperReader) if not name.startswith("_")}
-    assert public == {"positions", "open_orders", "account"}
+    assert public == {"positions", "open_orders", "account", "asset", "recent_orders"}
+
+
+@pytest.mark.unit
+def test_recent_orders_needs_an_aware_time():
+    opener = FakeOpener({})
+    with pytest.raises(ReadFailed, match="time-zone-aware"):
+        PaperReader("PKTEST123", "secret", opener=opener).recent_orders(datetime(2026, 10, 1))
+    assert opener.requests == []
 
 
 @pytest.mark.unit
 def test_paper_url_is_alpacas_paper_url():
-    from alpaca.common.enums import BaseURL  # only the test imports alpaca, to check the hardcoded URL
+    from alpaca.common.enums import (
+        BaseURL,  # only the test imports alpaca, to check the hardcoded URL
+    )
 
-    assert PAPER_URL == BaseURL.TRADING_PAPER.value
+    assert BaseURL.TRADING_PAPER.value == PAPER_URL
 
 
 # --- read failures -----------------------------------------------------------

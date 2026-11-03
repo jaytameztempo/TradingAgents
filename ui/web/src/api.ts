@@ -1,6 +1,8 @@
 // Typed client for the local FastAPI server. Every broker call here is a GET;
 // the UI has no request that places, changes, cancels or closes an order itself.
 // sendManualTicket starts paper_orders.sender on one manual ticket; the sender does the paper checks.
+// flatten starts paper_orders.flatten (the kill switch) as a job; the server turns the kill switch on first.
+// tradebotSend starts paper_orders.sender --tradebot --send on a confirmed request; the sender runs the risk guard.
 
 export class ApiError extends Error {
   constructor(public status: number, public code: string | null, message: string) {
@@ -131,6 +133,10 @@ export interface SchedulerStatus {
   next_scan: string | null;
   next_scan_as_of: string | null;
   next_send: string | null;
+  last_tick: string | null;
+  tradebot_mode: TradebotMode;
+  next_intraday: string | null;
+  auto_send_sends: boolean;
   auto_send_enabled: boolean;
   window_saved: boolean;
   events: SchedulerEvent[];
@@ -144,8 +150,110 @@ export interface LlmField {
   pattern?: string;
 }
 
-export interface SettingsData {
+export interface Risk {
+  kill_switch: boolean;
+  daily_loss_pct: number;
+  drawdown_pct: number;
+  max_positions: number;
+  max_gross_exposure_pct: number;
+  kill_switch_at?: string;
+  kill_switch_reason?: string;
+}
+
+export interface RiskStatus {
+  risk: Risk | null;
   error: string | null;
+  state: { peak_equity: number | null; peak_at: string | null } | null;
+  state_error: string | null;
+  kill_switch: boolean | null;
+}
+
+export interface LedgerLine {
+  at: string;
+  mode: "tradebot" | "daily" | "manual" | "flatten";
+  kind: "entry" | "exit" | "guard" | "flatten";
+  symbol: string | null;
+  client_order_id: string | null;
+  item_id: string | null;
+  action: string | null;
+  status: string | null;
+  qty: string | null;
+  filled_qty: string | null;
+  filled_avg_price: string | null;
+  stop: number | null;
+  reason: string | null;
+}
+
+export interface ReconcileProblem {
+  type: string;
+  symbol: string | null;
+  detail: string;
+  client_order_id: string | null;
+  item_id: string | null;
+}
+
+export interface ReconcileReport {
+  created_at: string;
+  after: string;
+  window_days: number;
+  counts: Record<string, number>;
+  problems: ReconcileProblem[];
+  clean: boolean;
+  by_type: Record<string, number>;
+}
+
+export type TradebotStatus = "waiting" | "armed" | "triggered" | "ticketed" | "sent" | "expired" | "blocked" | "removed";
+export type TradebotMode = "manual" | "semi" | "auto";
+export const TRADEBOT_FILTERS = ["squeeze_release", "rsi_extreme", "light_volume", "squeeze_4h1h"] as const;
+
+export interface TradebotCheck {
+  at: string;
+  stage: "eod" | "intraday" | "ticket";
+  status: TradebotStatus | null;
+  reason: string;
+  passed: boolean;
+  gates?: Record<string, unknown>;
+  daily?: Record<string, unknown> | null;
+  squeeze?: Record<string, unknown> | null;
+  filters?: Record<string, boolean>;
+}
+
+export interface TradebotItem {
+  id: string;
+  ticker: string;
+  as_of: string;
+  kind: string;
+  scan: string;
+  side: "long" | "short";
+  bot: "UP" | "DOWN" | "SIDE";
+  source: "auto" | "manual";
+  status: TradebotStatus;
+  status_reason: string | null;
+  expires_after: string | null;
+  sessions_left: number | null;
+  last_check: TradebotCheck | null;
+  checks: TradebotCheck[];
+  ticket: { file: string; client_order_id: string; exit_order_id: string; risk_dollars: number; entry?: number;
+            stop?: number; target?: number; quantity?: number; exit_done?: boolean } | null;
+  last_guard: { at: string; decision: "allowed" | "skipped" | "blocked"; reason: string | null } | null;
+}
+
+export interface TradebotSettings {
+  mode: TradebotMode;
+  expire_sessions: number;
+  max_enqueue: number;
+  filters: Record<(typeof TRADEBOT_FILTERS)[number], boolean>;
+  earnings_unknown: "block" | "allow";
+  earnings_cache_max_days: number;
+  intraday_times: string[];
+}
+
+export interface SettingsData {
+  tradebot: TradebotSettings | null;
+  tradebot_modes: Record<TradebotMode, string>;
+  auto_blockers: string[];
+  error: string | null;
+  risk: Risk | null;
   automation: Automation;
   automation_runs: Record<string, string>;
   trading: Trading;
@@ -163,6 +271,7 @@ export interface Health {
   data_home: string;
   orders_enabled: boolean;
   scheduler_running: boolean;
+  scheduler_refused: string | null;
 }
 
 // --- broker (paper, read-only) -------------------------------------------------------
@@ -422,6 +531,23 @@ export const api = {
   settings: () => get<SettingsData>("/api/settings"),
   saveAutomation: (body: Automation) => put<Automation>("/api/settings/automation", body),
   saveTrading: (body: Trading) => put<Trading>("/api/settings/trading", body),
+  saveRisk: (body: Partial<Risk>) => put<Risk>("/api/settings/risk", body),
+  risk: () => get<RiskStatus>("/api/risk"),
+  saveTradebot: (body: TradebotSettings) => put<TradebotSettings>("/api/settings/tradebot", body),
+  tradebotQueue: () => get<TradebotItem[]>("/api/tradebot/queue"),
+  tradebotCheck: (body: { stage: "eod" | "intraday"; item?: string }) => post<Job>("/api/tradebot/check", body),
+  tradebotTicket: (body: { item?: string }) => post<Job>("/api/tradebot/ticket", body),
+  // levels and size (nothing written), then the risk guard on the ticketed items (GET only); nothing is sent.
+  tradebotPreview: (body: { item?: string }) => post<Job>("/api/tradebot/preview", body),
+  // send: true needs confirm: true and starts paper_orders.sender --tradebot --send.
+  tradebotSend: (body: { send: true; confirm: true; item?: string }) => post<Job>("/api/tradebot/send", body),
+  ledger: (month?: string) => get<{ month: string | null; lines: LedgerLine[] }>(`/api/orders/ledger${month ? `?month=${month}` : ""}`),
+  reconcileReport: () => get<{ file: string | null; report: ReconcileReport | null }>("/api/orders/reconcile"),
+  // reconcile reads the paper account (GET only) and writes a report; it changes no order.
+  runReconcile: () => post<Job>("/api/orders/reconcile/run", {}),
+  setKillSwitch: (body: { on: boolean; reason: string }) => put<Risk>("/api/risk/kill-switch", body),
+  // send: false lists what would be cancelled and closed. send: true needs confirm: true.
+  flatten: (body: { send: false } | { send: true; confirm: true; reason: string }) => post<Job>("/api/risk/flatten", body),
   saveLlm: (values: Record<string, string>) => put<{ ok: true }>("/api/settings/llm", { values }),
   saveKeys: (body: { set: Record<string, string>; clear: string[] }) =>
     put<{ ok: true; saved: string[]; cleared: string[] }>("/api/settings/keys", body),

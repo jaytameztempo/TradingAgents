@@ -228,7 +228,21 @@ function stepInfo(step: JobStep): { label: string; typical?: string } {
     case "run_router":
       return { label: "Router", typical: "usually seconds" };
     case "run_daily":
-      return { label: "Daily SIDE pipeline" };
+      return { label: "Daily pipeline" };
+    case "paper_orders_sender":
+      return { label: step.args.includes("--tradebot")
+        ? `Tradebot ${step.args.includes("--send") ? "send" : "guard preview"}`
+        : step.args.includes("--send") ? "Paper send" : "Paper send preview" };
+    case "paper_orders_reconcile":
+      return { label: "Reconcile (read-only)", typical: "usually seconds" };
+    case "paper_orders_flatten":
+      return { label: step.args.includes("--send") ? "Flatten (kill switch)" : "Flatten preview" };
+    case "run_enqueue":
+      return { label: "Tradebot enqueue", typical: "usually seconds" };
+    case "run_tradebot": {
+      const stage = step.args.includes("--stage") ? step.args[step.args.indexOf("--stage") + 1] : null;
+      return { label: stage ? `Tradebot ${stage} check` : "Tradebot tickets", typical: "usually under a minute" };
+    }
     default:
       return { label: step.script };
   }

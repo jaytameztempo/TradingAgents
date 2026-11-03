@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "alpaca-py>=0.44.0",
+    "filelock>=3.12",  # cross-process lock on ~/.tradingagents/queues.json (extensions/tradebot/store.py)
     "langchain-core>=1.6.5",
     "langchain-anthropic>=1.7.4",
     "langchain-google-genai>=4.4.0",

@@ -66,11 +66,23 @@ def _api_error(status: int, message: str) -> APIError:
 class FakeClient:
     """Holds orders by client order ID, like the paper account."""
 
-    def __init__(self, reject=None, status="accepted"):
+    def __init__(self, reject=None, status="accepted", account=None, positions=None):
         self.orders: dict[str, dict] = {}
         self.submitted = []
         self.reject = reject or {}
         self.status = status
+        self.account = account or {"equity": "100000", "last_equity": "100000", "buying_power": "200000"}
+        self.positions = positions or []
+
+    # what the risk guard reads
+    def get_account(self):
+        return self.account
+
+    def get_all_positions(self):
+        return self.positions
+
+    def get_orders(self, filter=None):  # noqa: A002 - alpaca-py's own keyword
+        return [o for o in self.orders.values() if o["status"] not in sender.FINAL]
 
     def get_order_by_client_id(self, coid):
         if coid not in self.orders:

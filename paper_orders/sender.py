@@ -42,6 +42,18 @@ A manual ticket (``--manual NAME``) is one operator-written ticket in ``<ticket 
 named ``manual_ticket_<as_of>_<SYMBOL>_<id>.json`` (the UI's Trade page writes these). It gets the
 same per-ticket checks, entry and exits as the daily file, but needs no SIDE market label, so trend
 names can be sent too.
+
+--tradebot sends the Tradebot queue's ticketed items (extensions.tradebot): each item's ticket from its
+tradebot_tickets file, checked like a daily ticket, an UP item long only and a DOWN item short only, with IDs
+``tb-<item>-<attempt>-<SYMBOL>-<buy|sell|exit>``. It also places exits for items already sent. The queue is
+updated under its lock: sent, blocked when rejected, armed again (or expired) when a DAY entry ended unfilled,
+and each item's last guard decision.
+
+Every --send, in every mode, puts new entries through the risk guard (``paper_orders.guard``: kill switch,
+daily loss, drawdown, already held, position and gross exposure limits, book stop-risk) first. Exits are never
+held back: they are placed before and after the entries. --preview reads the account (GET only) and prints the
+guard's decisions, sending nothing; a plain dry run builds no client at all. From the command line (and so
+from the UI and the scheduler) every --send is logged to the order ledger (``paper_orders.ledger``).
 """
 
 from __future__ import annotations
@@ -61,20 +73,37 @@ from typing import Any
 from alpaca.common.enums import BaseURL
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
-from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest
+from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    LimitOrderRequest,
+    StopLossRequest,
+    TakeProfitRequest,
+)
 from dotenv import load_dotenv
 
-from extensions.market_data.alpaca_bars import API_KEY_ENV, PAPER_KEY_PREFIX, SECRET_KEY_ENV, validate_ticker
-from extensions.status.daily_status import LONG, SHORT, SIDE
+from extensions.market_data.alpaca_bars import (
+    API_KEY_ENV,
+    PAPER_KEY_PREFIX,
+    SECRET_KEY_ENV,
+    validate_ticker,
+)
+from extensions.status.daily_status import DOWN, LONG, SHORT, SIDE, UP
 from extensions.status.paper_tickets import TICKET_VERSION, default_ticket_dir, stop_for_fill
+from extensions.tradebot import store
+from extensions.tradebot.ticketing import (
+    TRADEBOT_TICKET_VERSION,
+    tickets_dir as tradebot_tickets_dir,
+)
+from paper_orders import guard, ledger, risk_state
 from paper_orders.trade_window import SettingsError, load_window
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PAPER_URL = BaseURL.TRADING_PAPER.value
 ORDER_SIDE = {LONG: "buy", SHORT: "sell"}
 FINAL = {"filled", "rejected", "canceled", "expired", "done_for_day", "replaced"}
-EXIT_OK, EXIT_BAD_INPUT, EXIT_ORDER_PROBLEM = 0, 2, 3
+EXIT_OK, EXIT_BAD_INPUT, EXIT_ORDER_PROBLEM, EXIT_GUARD_BLOCKED = 0, 2, 3, 4
+BOT_SIDE = {UP: LONG, DOWN: SHORT}  # SIDE items may be either
 PROBLEMS = {"rejected", "lookup_failed", "exit_rejected", "exit_refused", "exit_lookup_failed"}
 MANUAL_DIR = "manual"
 MANUAL_VERSION = 1
@@ -419,6 +448,168 @@ def place_exits(client: Any, as_of: date, tickets: list[dict], id_prefix: str | 
     return outcomes
 
 
+# --- the Tradebot queue ----------------------------------------------------------
+
+@dataclass
+class QueuedTicket:
+    item_id: str
+    status: str  # ticketed: entry and exits; sent: exits only
+    as_of: date
+    prefix: str
+    ticket: dict
+    expires_after: str | None
+
+
+def load_tradebot(item_ids: set[str] | None = None, folder: Path | None = None) -> list[QueuedTicket]:
+    """The queue's ticketed items, and its sent items still waiting for exits, each with its ticket from its
+    tradebot_tickets file, checked like a daily ticket. Any ticket that fails a check stops the run."""
+    folder = folder or tradebot_tickets_dir()
+    try:
+        items = store.read()["trade"]
+    except store.StoreError as exc:
+        raise TicketFileError(str(exc)) from exc
+    out, files = [], {}
+    for item in items:
+        t = item.get("ticket") or {}
+        if item.get("status") not in ("ticketed", "sent") or not t.get("file") or t.get("exit_done"):
+            continue
+        if item_ids and item["id"] not in item_ids:
+            continue
+        name = t["file"]
+
+        def bad(why: str, name=name, item=item) -> TicketFileError:
+            return TicketFileError(f"tradebot ticket {name} for {item['ticker']} ({item['id']}): {why}")
+
+        if name not in files:
+            path = folder / name
+            try:
+                files[name] = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise bad(f"cannot read {path}: {exc}") from exc
+        data = files[name]
+        if data.get("kind") != "tradebot" or data.get("tradebot_ticket_version") != TRADEBOT_TICKET_VERSION:
+            raise bad("is not a tradebot ticket file this sender knows")
+        if data.get("paper") is not True or data.get("orders_placed") is not False:
+            raise bad("is not marked paper with orders_placed false")
+        ticket = next((x for x in data.get("tickets") or [] if x.get("item_id") == item["id"]
+                       and x.get("client_order_id") == t.get("client_order_id")), None)
+        if ticket is None:
+            raise bad(f"has no ticket {t.get('client_order_id')}")
+        _check_ticket(ticket, bad)
+        if ticket["symbol"] != item["ticker"]:
+            raise bad(f"names {ticket['symbol']}, not the queued {item['ticker']}")
+        want = BOT_SIDE.get(item.get("bot"))
+        if item.get("bot") not in (UP, DOWN, SIDE) or (want and ticket["side"] != want):
+            raise bad(f"a {item.get('bot')} item may not be {ticket['side']}")
+        prefix = ticket.get("id_prefix") or ""
+        if not prefix.startswith(f"tb-{item['id']}-") or client_order_id(date.min, ticket, prefix) != \
+                ticket["client_order_id"]:
+            raise bad(f"client order ID {ticket['client_order_id']} does not match its prefix {prefix!r}")
+        out.append(QueuedTicket(item["id"], item["status"], date.fromisoformat(data["as_of"]), prefix, ticket,
+                                item.get("expires_after")))
+    return out
+
+
+def read_book(client: Any) -> tuple[dict, list[dict], list[dict]]:
+    """The account, open positions and open orders, as the guard reads them. GET requests only."""
+    account = client.get_account()
+    positions = client.get_all_positions()
+    orders = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True, limit=500))
+    return dict(account), list(positions), list(orders)
+
+
+def guard_entries(client: Any, tickets: list[dict], coids: dict[str, str], now: datetime | None = None,
+                  save_state: bool = True) -> guard.Decision:
+    """The guard's decision on the tickets whose entries are not on the account yet. Anything it cannot read
+    or check blocks every entry."""
+    decision = guard.Decision()
+
+    def blocked(why: str) -> guard.Decision:
+        decision.blocked = why
+        decision.skipped = {t["symbol"]: why for t in tickets}
+        return decision
+
+    try:
+        risk = guard.load_risk()
+    except SettingsError as exc:
+        return blocked(f"risk settings: {exc}")
+    try:
+        state = risk_state.load()
+    except risk_state.RiskStateError as exc:
+        return blocked(str(exc))
+    try:
+        account, positions, orders = read_book(client)
+    except Exception as exc:  # noqa: BLE001 - any failure to read the book blocks entries
+        return blocked(f"cannot read the paper account: {exc}")
+    try:
+        queue = store.read()["trade"]
+    except store.StoreError as exc:
+        return blocked(str(exc))
+    decision, new_state = guard.filter_entries(tickets, account, positions, orders, risk, state, queue,
+                                               set(coids.values()), now)
+    if save_state and new_state is not state:
+        try:
+            risk_state.save(new_state)
+        except (risk_state.RiskStateError, OSError) as exc:
+            print(f"warning: the peak equity was not saved: {exc}", file=sys.stderr)
+    return decision
+
+
+def new_entries(client: Any, tickets: list[dict], coids: dict[str, str]) -> list[dict]:
+    """The tickets whose entry is not on the account yet (a lookup that fails counts as new; send_tickets
+    reports it and sends nothing)."""
+    out = []
+    for t in tickets:
+        try:
+            if _existing(client, coids[t["symbol"]]) is None:
+                out.append(t)
+        except APIError:
+            out.append(t)
+    return out
+
+
+def update_queue(queued: list[QueuedTicket], entries: list[Outcome], exits: list[Outcome],
+                 decision: guard.Decision | None) -> list[str]:
+    """Record what this run did on the Tradebot items, under the queue lock. Returns notes to print."""
+    by_entry = {o.client_order_id: o for o in entries}
+    by_exit = {o.client_order_id: o for o in exits}
+    notes = []
+    today = datetime.now(UTC).date().isoformat()
+    with store.transaction() as queues:
+        for q in queued:
+            try:
+                item = store.find(queues, q.item_id)
+            except store.StoreError:
+                continue
+            t, symbol = q.ticket, q.ticket["symbol"]
+            if decision is not None and item.get("status") == "ticketed":
+                why = decision.reason_for(symbol)
+                item["last_guard"] = {"at": decision.checked_at,
+                                      "decision": "blocked" if decision.blocked else "skipped" if why else "allowed",
+                                      "reason": why}
+            e = by_entry.get(t["client_order_id"])
+            if e is not None and item.get("status") == "ticketed":
+                if e.action in ("sent", "already_sent"):
+                    store.set_status(item, "sent", f"entry {e.client_order_id} on the paper account")
+                elif e.action == "rejected":
+                    store.set_status(item, "blocked", f"entry rejected: {e.error or _describe(e.order or {})}")
+            x = by_exit.get(t["exit_order_id"])
+            if x is None:
+                continue
+            if x.action in ("exit_sent", "exit_already_sent"):
+                item["ticket"] = {**(item.get("ticket") or {}), "exit_done": True}
+            elif x.action == "no_fill" and item.get("status") == "sent":
+                past = item.get("ticket")
+                item["past_tickets"] = [*(item.get("past_tickets") or []), past]
+                item["ticket"] = None
+                if q.expires_after and today > q.expires_after:
+                    store.set_status(item, "expired", f"entry ended unfilled ({x.error}); past {q.expires_after}")
+                else:
+                    store.set_status(item, "armed", f"entry ended unfilled ({x.error}); armed again")
+                notes.append(f"{symbol}: {x.error}; the item is {item['status']} again")
+    return notes
+
+
 # --- printing ----------------------------------------------------------------
 
 def _describe(order: dict) -> str:
@@ -477,6 +668,10 @@ def _parser() -> argparse.ArgumentParser:
     which = parser.add_mutually_exclusive_group(required=True)
     which.add_argument("--as-of", help="the ticket date, YYYY-MM-DD")
     which.add_argument("--manual", metavar="NAME", help="one manual ticket file name from <ticket dir>/manual/")
+    which.add_argument("--tradebot", action="store_true", help="the Tradebot queue's ticketed items")
+    parser.add_argument("--item", action="append", help="with --tradebot: only this queue item id; repeatable")
+    parser.add_argument("--preview", action="store_true",
+                        help="read the account (GET only) and show the risk guard's decisions; send nothing")
     parser.add_argument("--ticket-dir", help="folder of ticket files (default: ~/.tradingagents/tickets)")
     parser.add_argument("--send", action="store_true", help="send to Alpaca paper; without it nothing is sent")
     parser.add_argument("--wait", type=float, default=5.0, help="seconds to watch each new order for a fill")
@@ -484,9 +679,15 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
-         make_client: Callable[[Mapping[str, str]], Any] = paper_client, now: datetime | None = None) -> int:
+         make_client: Callable[[Mapping[str, str]], Any] = paper_client, now: datetime | None = None,
+         on_outcomes: Callable[[str, list[Outcome], list[Outcome], guard.Decision | None], None] | None = None) -> int:
+    """on_outcomes(mode, entries, exits, decision) is called after a --send (the order log hooks in here)."""
     args = _parser().parse_args(argv)
+    if args.send and args.preview:
+        print("error: --preview sends nothing; use it without --send", file=sys.stderr)
+        return EXIT_BAD_INPUT
     id_prefix = None
+    queued: list[QueuedTicket] = []
     if args.as_of is not None:
         try:
             as_of = date.fromisoformat(args.as_of)
@@ -494,35 +695,55 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
             print(f"error: --as-of {args.as_of!r} is not YYYY-MM-DD", file=sys.stderr)
             return EXIT_BAD_INPUT
     try:
-        if args.manual:
+        if args.tradebot:
+            queued = load_tradebot(set(args.item or []) or None)
+            tickets = [q.ticket for q in queued]
+            path = None
+        elif args.manual:
             path, data = load_manual(args.manual, args.ticket_dir)
             as_of, id_prefix = date.fromisoformat(data["as_of"]), manual_prefix(data)
+            tickets = data["tickets"]
         else:
             path, data = load_latest_tickets(as_of, args.ticket_dir)
+            tickets = data["tickets"]
     except TicketFileError as exc:
         print(f"error: {exc}; nothing sent", file=sys.stderr)
         return EXIT_BAD_INPUT
 
-    tickets = data["tickets"]
-    what = "manual paper ticket" if args.manual else "paper tickets"
-    print(f"{what} {path.name}: {len(tickets)} limit DAY entr{'y' if len(tickets) == 1 else 'ies'} "
-          f"for {as_of}; each exit is placed from the actual fill")
+    # (as_of, prefix) per symbol: a Tradebot run mixes items, each with its own date and prefix
+    where = {q.ticket["symbol"]: (q.as_of, q.prefix) for q in queued} if args.tradebot else \
+        {t["symbol"]: (as_of, id_prefix) for t in tickets}
+    to_enter = [q.ticket for q in queued if q.status == "ticketed"] if args.tradebot else tickets
+    coids = {t["symbol"]: client_order_id(where[t["symbol"]][0], t, where[t["symbol"]][1]) for t in tickets}
+
+    if args.tradebot:
+        print(f"tradebot queue: {len(to_enter)} ticketed entr{'y' if len(to_enter) == 1 else 'ies'}, "
+              f"{len(queued) - len(to_enter)} sent item(s) waiting for exits; each exit is placed from the actual fill")
+        if not queued:
+            print("nothing to send")
+            return EXIT_OK
+    else:
+        what = "manual paper ticket" if args.manual else "paper tickets"
+        print(f"{what} {path.name}: {len(tickets)} limit DAY entr{'y' if len(tickets) == 1 else 'ies'} "
+              f"for {as_of}; each exit is placed from the actual fill")
     for t in tickets:
-        print(_ticket_line(as_of, t, id_prefix))
-    if not args.send:
-        print("dry run: nothing sent (add --send to send to Alpaca paper)")
+        print(_ticket_line(where[t["symbol"]][0], t, where[t["symbol"]][1]))
+    if not args.send and not args.preview:
+        print("dry run: nothing sent (add --preview to see the risk guard's decisions, --send to send to Alpaca "
+              "paper)")
         return EXIT_OK
 
-    # The operator's trading window (Settings page): a --send outside it sends nothing.
-    try:
-        window = load_window()
-    except SettingsError as exc:
-        print(f"error: {exc}; nothing sent", file=sys.stderr)
-        return EXIT_BAD_INPUT
-    closed = window.closed_reason(now or datetime.now(UTC)) if window is not None else None
-    if closed:
-        print(f"error: outside the trading window: {closed} ({window.describe()}); nothing sent", file=sys.stderr)
-        return EXIT_BAD_INPUT
+    if args.send:
+        # The operator's trading window (Settings page): a --send outside it sends nothing.
+        try:
+            window = load_window()
+        except SettingsError as exc:
+            print(f"error: {exc}; nothing sent", file=sys.stderr)
+            return EXIT_BAD_INPUT
+        closed = window.closed_reason(now or datetime.now(UTC)) if window is not None else None
+        if closed:
+            print(f"error: outside the trading window: {closed} ({window.describe()}); nothing sent", file=sys.stderr)
+            return EXIT_BAD_INPUT
 
     if env is None:
         load_dotenv(REPO_ROOT / ".env")
@@ -533,16 +754,48 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
         print(f"error: {exc}; nothing sent", file=sys.stderr)
         return EXIT_BAD_INPUT
 
+    fresh = new_entries(client, to_enter, coids)
+    decision = guard_entries(client, fresh, coids, now, save_state=args.send)
+    for line in guard.describe(decision):
+        print(line)
+    if args.preview:
+        print("preview: nothing sent")
+        return EXIT_GUARD_BLOCKED if decision.blocked else EXIT_OK
+
     print(f"sending to Alpaca paper ({PAPER_URL})")
-    entries = send_tickets(client, as_of, tickets, wait=args.wait, id_prefix=id_prefix)
+    allowed = {t["symbol"] for t in decision.allowed}
+    send = [t for t in to_enter if t["symbol"] in allowed or t not in fresh]  # on the account already: reported
+
+    def per_ticket(fn, items, **kw) -> list[Outcome]:
+        out = []
+        for t in items:
+            d, prefix = where[t["symbol"]]
+            out += fn(client, d, [t], id_prefix=prefix, **kw)
+        return out
+
+    early = per_ticket(place_exits, [q.ticket for q in queued if q.status == "sent"]) if args.tradebot else []
+    entries = per_ticket(send_tickets, send, wait=args.wait)
     print("entries:")
     _print_entries(entries)
-    exits = place_exits(client, as_of, tickets, id_prefix)
+    for t in to_enter:
+        if t in fresh and t["symbol"] not in allowed:
+            print(f"  {t['symbol']:<6}not sent  held back by the risk guard: {decision.reason_for(t['symbol'])}")
+    exits = early + per_ticket(place_exits, to_enter)
     print("exits:")
     _print_exits(exits)
+    if args.tradebot:
+        try:
+            for note in update_queue(queued, entries, exits, decision):
+                print(f"  {note}")
+        except store.StoreError as exc:
+            print(f"warning: the Tradebot queue was not updated: {exc}", file=sys.stderr)
+    if on_outcomes is not None:
+        on_outcomes("tradebot" if args.tradebot else "manual" if args.manual else "daily", entries, exits, decision)
     problems = [o for o in entries + exits if o.action in PROBLEMS]
-    return EXIT_ORDER_PROBLEM if problems else EXIT_OK
+    if problems:
+        return EXIT_ORDER_PROBLEM
+    return EXIT_GUARD_BLOCKED if decision.skipped and not decision.allowed and fresh else EXIT_OK
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(on_outcomes=ledger.record_send))  # every --send is logged

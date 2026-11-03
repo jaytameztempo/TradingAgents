@@ -36,7 +36,9 @@ SCRIPTS = frozenset({
     "run_up_bot",
     "run_down_bot",
     "run_research",
-    "run_daily",  # the 13-step daily SIDE pipeline; it writes paper tickets but never sends an order
+    "run_daily",  # the daily pipeline for the market label, ending in the Tradebot enqueue and eod check
+    "run_enqueue",  # the router-allowed candidates into the Tradebot queue
+    "run_tradebot",  # the Tradebot's trigger checks and tickets; reads the paper account by GET, never orders
 })
 
 # The paper order sender. Two places start it: the in-app scheduler (ui/server/scheduler.py), only when
@@ -44,13 +46,19 @@ SCRIPTS = frozenset({
 # which only ever passes --manual <one ticket> and adds --send only on a confirmed request. The sender
 # itself checks the trading window, paper keys and the paper URL, and never sends a client order ID twice.
 SENDER = "paper_orders_sender"
-SCHEDULER_ONLY = {SENDER: "paper_orders.sender"}
+# The kill switch's flatten (cancel every open order, close every position). Only the risk route starts it,
+# with --send only on a confirmed request; it turns the kill switch on before it touches the account.
+FLATTEN = "paper_orders_flatten"
+# Reconcile reads the paper account (GET only) and writes a report; it never places or changes an order.
+RECONCILE = "paper_orders_reconcile"
+SCHEDULER_ONLY = {SENDER: "paper_orders.sender", FLATTEN: "paper_orders.flatten", RECONCILE: "paper_orders.reconcile"}
 
 # Exit codes shared by the extension scripts.
-EXIT_MEANINGS = {0: "ok", 1: "failed", 2: "bad input", 3: "regime mismatch: bot blocked"}
+EXIT_MEANINGS = {0: "ok", 1: "failed", 2: "bad input", 3: "regime mismatch: bot blocked",
+                 4: "the risk guard held entries back"}
 
 # Jobs in the same group may not run at the same time (one research run, one pipeline, one sender).
-EXCLUSIVE_GROUPS = frozenset({"research", "pipeline", "sender"})
+EXCLUSIVE_GROUPS = frozenset({"research", "pipeline", "sender", "flatten", "reconcile"})
 
 MAX_JOBS_KEPT = 100
 
@@ -63,6 +71,7 @@ class JobConflict(RuntimeError):
 class Step:
     script: str
     args: list[str]
+    always: bool = False  # run even after an earlier step failed (the sender's exits, a reconcile)
     exit_code: int | None = None
     started_at: str | None = None  # set by the runner, for the job log's step and elapsed-time display
     finished_at: str | None = None
@@ -108,7 +117,7 @@ class Job:
             "status": self.status,
             "exit_code": self.exit_code,
             "exit_meaning": EXIT_MEANINGS.get(self.exit_code) if self.exit_code is not None else None,
-            "steps": [{"script": s.script, "args": s.args, "exit_code": s.exit_code,
+            "steps": [{"script": s.script, "args": s.args, "always": s.always, "exit_code": s.exit_code,
                        "started_at": s.started_at, "finished_at": s.finished_at} for s in self.steps],
             "current_step": self.current_step,
             "created_at": self.created_at,
@@ -122,7 +131,8 @@ class JobRunner:
         self._lock = threading.Lock()
 
     def start(self, kind: str, steps: list[Step], group: str | None = None) -> Job:
-        """Run the steps in order on a background thread; a non-zero exit stops the chain."""
+        """Run the steps in order on a background thread; a non-zero exit skips every later step that is not
+        marked always. The job's exit code is the first non-zero one."""
         with self._lock:
             if group in EXCLUSIVE_GROUPS and any(j.group == group and not j.done for j in self._jobs.values()):
                 raise JobConflict(f"a {group} job is already running")
@@ -146,8 +156,11 @@ class JobRunner:
     def _run(self, job: Job) -> None:
         job.status = "running"
         env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
-        code = 0
+        code = first = 0
         for step in job.steps:
+            if first and not step.always:
+                job.lines.append(f"[skipped python -m {step.module}: an earlier step failed]")
+                continue
             step.started_at = datetime.now(UTC).isoformat()
             job.lines.append(f"$ python -m {step.module} {' '.join(step.args)}")
             try:
@@ -165,10 +178,9 @@ class JobRunner:
             step.exit_code = code
             step.finished_at = datetime.now(UTC).isoformat()
             job.lines.append(f"[exit {code}: {EXIT_MEANINGS.get(code, 'error')}]")
-            if code != 0:
-                break
-        job.exit_code = code
-        job.status = {0: "ok", 3: "blocked"}.get(code, "failed")
+            first = first or code
+        job.exit_code = first
+        job.status = {0: "ok", 3: "blocked", 4: "blocked"}.get(first, "failed")
         job.finished_at = datetime.now(UTC).isoformat()
 
 

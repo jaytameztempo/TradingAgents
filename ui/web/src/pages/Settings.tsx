@@ -1,9 +1,11 @@
 import { ReactNode, useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, Automation, CATEGORIES, Category, CATEGORY_LABEL, ScanKind, SettingsData, Trading } from "../api";
-import { Card, Dialog, ErrorBox } from "../components/ui";
+import { api, Automation, CATEGORIES, Category, CATEGORY_LABEL, Risk, ScanKind, SettingsData, Trading, TRADEBOT_FILTERS,
+         TradebotMode, TradebotSettings } from "../api";
+import { Card, Dialog, ErrorBox, JobLog } from "../components/ui";
 import { dateTime } from "../format";
 import { DEFAULT_PREFS, Prefs, usePrefs } from "../prefs";
+import { useJob } from "../useJob";
 
 const DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
 const DAY_LABEL: Record<string, string> = { mon: "Mon", tue: "Tue", wed: "Wed", thu: "Thu", fri: "Fri", sat: "Sat", sun: "Sun" };
@@ -19,6 +21,8 @@ export default function Settings() {
         <>
           <AutomationCard data={settings.data} />
           <TradingCard data={settings.data} />
+          <RiskCard data={settings.data} />
+          <TradebotCard data={settings.data} />
           <LlmCard data={settings.data} />
           <KeysCard data={settings.data} />
         </>
@@ -294,6 +298,153 @@ function TradingCard({ data }: { data: SettingsData }) {
         <p>While BATS is running, it will send <strong>paper</strong> orders to Alpaca on its own at {t.auto_send.times.join(", ") || "your send times"} New York
           time on {t.days.map((d) => DAY_LABEL[d]).join(", ")}, without asking each time.</p>
         <p>Paper keys only (key IDs starting with PK); the sender refuses live keys and the live URL.</p>
+      </Dialog>
+    </Card>
+  );
+}
+
+// --- risk limits and the kill switch ------------------------------------------------------
+
+const RISK_FIELDS: [keyof Risk, string, string, number, number, number][] = [
+  ["daily_loss_pct", "Daily loss limit (%)", "No new entry once equity is this far below the last close.", 0.1, 50, 0.1],
+  ["drawdown_pct", "Drawdown limit (%)", "No new entry once equity is this far below its highest seen.", 0.1, 90, 0.1],
+  ["max_positions", "Max positions", "Open positions plus open entries plus the new ones.", 1, 200, 1],
+  ["max_gross_exposure_pct", "Max gross exposure (% of equity)", "Market value of positions plus open entries plus the new ones.", 1, 400, 1],
+];
+
+function RiskCard({ data }: { data: SettingsData }) {
+  const saved = data.risk;
+  const [r, setR] = useState<Risk | null>(saved);
+  useEffect(() => setR(saved), [saved]);
+  const save = useSave();
+  const sw = useSave();
+  const flatten = useJob();
+  const [reason, setReason] = useState("");
+  const [confirmFlatten, setConfirmFlatten] = useState(false);
+  const [typed, setTyped] = useState("");
+  if (!r || !saved) return <Card title="Risk limits and kill switch"><ErrorBox error="the saved risk settings cannot be read; fix settings.json" /></Card>;
+  const on = saved.kill_switch;
+  return (
+    <Card title="Risk limits and kill switch">
+      {on && (
+        <div className="notice notice-error" style={{ marginBottom: 12 }}>
+          Kill switch is ON{saved.kill_switch_at ? ` since ${dateTime(saved.kill_switch_at)}` : ""}
+          {saved.kill_switch_reason ? ` (${saved.kill_switch_reason})` : ""}. No entry is sent; exits still are.
+        </div>
+      )}
+      <p className="muted">paper_orders.guard checks these before every entry the sender sends, in every mode. Exits are never held back.</p>
+      {RISK_FIELDS.map(([key, label, hint, min, max, step]) => (
+        <Field key={key} label={label} hint={hint}>
+          <input type="number" min={min} max={max} step={step} value={r[key] as number}
+                 onChange={(e) => setR({ ...r, [key]: Number(e.target.value) })} aria-label={label} />
+        </Field>
+      ))}
+      <Field label="Book stop-risk" hint="Held to 8% of equity by the ticket builder and the guard (not editable here).">8% of equity</Field>
+      <SaveRow save={save} onSave={() => save.run(() => api.saveRisk({
+        daily_loss_pct: r.daily_loss_pct, drawdown_pct: r.drawdown_pct, max_positions: r.max_positions,
+        max_gross_exposure_pct: r.max_gross_exposure_pct }))} label="Save limits" />
+      <hr className="settings-rule" />
+      <Field label="Kill switch" hint="On: no entry goes to the paper account until it is turned off. Open positions and their exits are left alone.">
+        <div className="row">
+          <input type="text" placeholder="reason (recorded)" value={reason} onChange={(e) => setReason(e.target.value)} aria-label="Kill switch reason" />
+          <button className={on ? "btn" : "btn btn-danger"} disabled={sw.busy}
+                  onClick={() => sw.run(() => api.setKillSwitch({ on: !on, reason }))}>
+            {on ? "Turn kill switch off" : "Turn kill switch on"}
+          </button>
+        </div>
+        <ErrorBox error={sw.error} />
+      </Field>
+      <Field label="Flatten" hint="Turns the kill switch on, then cancels every open order and closes every position on the paper account at market.">
+        <div className="row">
+          <button className="btn" disabled={flatten.running} onClick={() => flatten.start(() => api.flatten({ send: false }))}>Preview</button>
+          <button className="btn btn-danger" disabled={flatten.running} onClick={() => { setTyped(""); setConfirmFlatten(true); }}>Flatten…</button>
+        </div>
+        <ErrorBox error={flatten.error} />
+        <JobLog job={flatten.job} onDone={flatten.onDone} />
+      </Field>
+      <Dialog open={confirmFlatten} onClose={() => setConfirmFlatten(false)} tone="danger" title="⚠ Flatten the paper account?"
+              actions={<button className="btn btn-danger" disabled={typed !== "FLATTEN"}
+                               onClick={() => { setConfirmFlatten(false);
+                                                flatten.start(() => api.flatten({ send: true, confirm: true, reason: reason || "flatten from the UI" })); }}>
+                         Flatten now</button>}>
+        <p>This turns the kill switch <strong>on</strong>, cancels <strong>every</strong> open order and closes <strong>every</strong> position on the Alpaca paper account at market.</p>
+        <p>Type <code>FLATTEN</code> to confirm:</p>
+        <input type="text" value={typed} onChange={(e) => setTyped(e.target.value)} aria-label="Type FLATTEN to confirm" />
+      </Dialog>
+    </Card>
+  );
+}
+
+// --- the Tradebot ------------------------------------------------------------------------------
+
+const FILTER_LABEL: Record<(typeof TRADEBOT_FILTERS)[number], string> = {
+  squeeze_release: "Daily TTM Squeeze release in the trade direction",
+  rsi_extreme: "RSI(14) extreme (≤ 45 long, ≥ 55 short)",
+  light_volume: "Light volume (at most its 20-day average)",
+  squeeze_4h1h: "4-hour and 1-hour squeeze fired (the intraday trigger)",
+};
+
+function TradebotCard({ data }: { data: SettingsData }) {
+  const [t, setT] = useState<TradebotSettings | null>(data.tradebot);
+  useEffect(() => setT(data.tradebot), [data.tradebot]);
+  const [confirmAuto, setConfirmAuto] = useState(false);
+  const save = useSave();
+  const saved = data.tradebot;
+  if (!t || !saved) return <Card title="Tradebot"><ErrorBox error="the saved tradebot settings cannot be read; fix settings.json" /></Card>;
+  const turningAuto = t.mode === "auto" && saved.mode !== "auto";
+  const doSave = () => save.run(() => api.saveTradebot(t));
+  const s = data.scheduler;
+  const mismatch = t.mode === "auto" && !data.trading.auto_send.enabled;
+  return (
+    <Card title="Tradebot: queue, triggers and mode">
+      <Field label="Mode">
+        <div className="grid" style={{ gap: 6 }}>
+          {(Object.keys(data.tradebot_modes) as TradebotMode[]).map((m) => (
+            <label key={m} className="row">
+              <input type="radio" name="tradebot-mode" checked={t.mode === m}
+                     disabled={m === "auto" && data.auto_blockers.length > 0 && saved.mode !== "auto"}
+                     onChange={() => setT({ ...t, mode: m })} />
+              <span>{data.tradebot_modes[m]}</span>
+            </label>
+          ))}
+          {data.auto_blockers.length > 0 && <span className="muted">Auto is locked: {data.auto_blockers.join("; ")}.</span>}
+          {mismatch && <div className="notice notice-warn">Auto mode sends only while Paper auto-send (Trade settings above) is on too. It is off, so nothing is sent automatically.</div>}
+        </div>
+      </Field>
+      <Field label="Entry triggers" hint="Each trigger that is on must hold; the switches in force are recorded with every check. Missing daily bars never pass, whatever is switched off.">
+        <div className="grid" style={{ gap: 6 }}>
+          {TRADEBOT_FILTERS.map((f) => (
+            <Toggle key={f} checked={t.filters[f]} label={FILTER_LABEL[f]}
+                    onChange={(v) => setT({ ...t, filters: { ...t.filters, [f]: v } })} />
+          ))}
+        </div>
+      </Field>
+      <Field label="Intraday check times (New York)" hint="Semi and auto mode: the 4-hour/1-hour check on armed names, on complete bars only. Not on early-close days.">
+        <TimeList value={t.intraday_times} onChange={(intraday_times) => setT({ ...t, intraday_times })} label="intraday time" />
+      </Field>
+      <Field label="Next intraday check">{s.next_intraday ? nyTime(s.next_intraday) : <span className="muted">Off</span>}</Field>
+      <Field label="Queue life (sessions)" hint="A name that never triggers expires after this many trading sessions.">
+        <input type="number" min={1} max={60} value={t.expire_sessions} aria-label="Queue life in sessions"
+               onChange={(e) => setT({ ...t, expire_sessions: Number(e.target.value) })} />
+      </Field>
+      <Field label="Names queued per run">
+        <input type="number" min={1} max={50} value={t.max_enqueue} aria-label="Names queued per run"
+               onChange={(e) => setT({ ...t, max_enqueue: Number(e.target.value) })} />
+      </Field>
+      <Field label="Earnings date unknown" hint="From the cached SEC EDGAR filings. Block (the default) keeps a name out when its next report date is unknown or the cache is stale.">
+        <select value={t.earnings_unknown} aria-label="Earnings date unknown"
+                onChange={(e) => setT({ ...t, earnings_unknown: e.target.value as TradebotSettings["earnings_unknown"] })}>
+          <option value="block">Block the name</option>
+          <option value="allow">Allow the name</option>
+        </select>
+      </Field>
+      <SaveRow save={save} onSave={() => (turningAuto ? setConfirmAuto(true) : doSave())} />
+      <EventLog events={s.events.filter((e) => ["intraday", "reconcile", "tradebot"].includes(e.kind))} />
+      <Dialog open={confirmAuto} onClose={() => setConfirmAuto(false)} tone="danger" title="⚠ Turn on auto mode?"
+              actions={<button className="btn btn-danger" onClick={() => { setConfirmAuto(false); doSave(); }}>Turn on and save</button>}>
+        <p>While BATS is running, the scheduler will check triggers, write tickets and send <strong>paper</strong> orders on its own,
+          at the intraday times and the send times, without asking each time. It sends only while Paper auto-send is on too.</p>
+        <p>Every entry still goes through the risk guard; the kill switch stops all of it.</p>
       </Dialog>
     </Card>
   );

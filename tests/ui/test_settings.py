@@ -191,7 +191,7 @@ def test_a_recurring_scan_fires_once_in_its_slot(home):
     assert len(started) == 1
     kind, steps, group = started[0]
     assert group == "pipeline" and steps[0].script == "run_daily"
-    assert steps[0].args == ["--as-of", "2026-10-09"]  # after 16:15 on a weekday: today's bars
+    assert steps[0].args == ["--as-of", "2026-10-09", "--category", "1"]  # after 16:15 on a weekday: today's bars
 
 
 @pytest.mark.unit
@@ -201,25 +201,30 @@ def test_morning_scans_use_the_previous_trading_day():
 
 
 @pytest.mark.unit
-def test_auto_send_starts_the_sender_inside_the_window_only_when_on(home):
-    tickets = home / "tickets"
-    tickets.mkdir()
-    (tickets / "paper_tickets_2026-10-09_20261010T000000Z.json").write_text("{}")
+def test_auto_send_needs_auto_mode_and_the_switch_then_runs_the_tradebot_chain(home):
     window = {"days": ["mon"], "sessions": [{"start": "09:35", "end": "15:55"}]}
     clock = Clock(datetime(2026, 10, 12, 13, 41, tzinfo=UTC))  # Mon 09:41 NY
 
-    _save(trading={**window, "auto_send": {"enabled": False, "times": ["09:40"]}})
+    _save(trading={**window, "auto_send": {"enabled": False, "times": ["09:40"]}}, tradebot={"mode": "auto"})
     sched, started = _scheduler(clock)
     sched.tick()
-    assert started == []  # off: nothing
+    assert started == []  # the switch is off: nothing
 
-    _save(trading={**window, "auto_send": {"enabled": True, "times": ["09:40"]}})
+    _save(trading={**window, "auto_send": {"enabled": True, "times": ["09:40"]}}, tradebot={"mode": "semi"})
     sched, started = _scheduler(clock)
     sched.tick()
-    assert len(started) == 1
-    _, steps, group = started[0]
-    assert group == "sender" and steps[0].script == jobs.SENDER
-    assert steps[0].command[1:] == ["-m", "paper_orders.sender", "--as-of", "2026-10-09", "--send"]
+    assert started == [] and "automatic sends need auto mode" in sched.status()["events"][0]["detail"]
+
+    _save(tradebot={"mode": "auto"})
+    paths.settings_path().with_name("scheduler_state.json").unlink()  # the 09:40 slot fired (skipped) above
+    sched, started = _scheduler(clock)
+    sched.tick()
+    [(_, steps, group)] = started
+    assert group == "sender"
+    assert [(s.module, s.args, s.always) for s in steps] == [
+        ("extensions.scripts.run_tradebot", ["--ticket-only"], False),
+        ("paper_orders.sender", ["--tradebot", "--send"], True),
+        ("paper_orders.reconcile", [], True)]
 
 
 @pytest.mark.unit
@@ -234,12 +239,16 @@ def test_auto_send_with_no_recent_tickets_sends_nothing(home):
 # --- only the scheduler and the manual ticket send start the sender -------------------------
 
 @pytest.mark.unit
-def test_no_route_but_the_manual_ticket_send_can_start_the_sender():
+def test_no_route_but_the_manual_ticket_and_tradebot_sends_can_start_the_sender():
     for path in (UI_ROOT / "server" / "routes").glob("*.py"):
         text = path.read_text(encoding="utf-8")
         if path.name == "trade.py":
             # One ticket by name, never a whole day's file.
             assert '["--manual", name' in text and "--as-of" not in text
+            continue
+        if path.name == "tradebot.py":
+            # The Tradebot queue only, never a whole day's file; --send only behind confirm.
+            assert '"--tradebot"' in text and "--as-of" not in text and "body.send and not body.confirm" in text
             continue
         assert not re.search(r"SENDER|paper_orders\.sender|paper_orders_sender|SCHEDULER_ONLY", text), path.name
     assert jobs.SENDER not in jobs.SCRIPTS

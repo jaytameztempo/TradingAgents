@@ -5,9 +5,10 @@ import { Card, Empty, ErrorBox, RegimeBadge } from "../components/ui";
 import { Ticker } from "../components/Ticker";
 import { ManualTickets } from "../components/OrderEntry";
 import { TradeQueue } from "../components/Queues";
+import { TradebotQueue } from "../components/TradebotQueue";
 
-// Order entry (manual paper tickets) and read-only plan review. Nothing on this page talks to the broker;
-// a confirmed ticket Send starts paper_orders.sender, which does.
+// The Tradebot queue, order entry (manual paper tickets) and read-only plan review. Nothing on this page talks
+// to the broker; a confirmed Send starts paper_orders.sender, which does.
 const CHECKLIST = [
   "Regime label still matches the bot",
   "Ticker is tradeable (not blocked) in the latest route",
@@ -40,8 +41,9 @@ export default function Trade() {
       <div className="page-head"><h1>Trade</h1></div>
       <div className="banner" role="note">
         <span className="badge badge-paper">PAPER</span>
-        <span>🔒 Paper keys only. Orders go out only when you confirm Send on a paper ticket below, or from paper auto-send in Settings.</span>
+        <span>🔒 Paper keys only. Orders go out only when you confirm Send (Tradebot queue or a manual ticket below), or from the scheduler in auto mode with paper auto-send on.</span>
       </div>
+      <TradebotQueue />
       <TradeQueue />
       <ManualTickets />
       <Card title="Plans">

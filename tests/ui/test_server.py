@@ -402,3 +402,21 @@ def test_plan_kind_and_symbol_come_from_the_file_name(tmp_path, name, bot, symbo
     path.write_text("# Research plan\n- Market regime: SIDE (SPY+QQQ)\n", encoding="utf-8")
     plan = files.parse_plan(path)
     assert (plan["bot"], plan["symbol"]) == (bot, symbol)
+
+
+@pytest.mark.unit
+def test_a_data_folder_inside_onedrive_keeps_the_scheduler_off(tmp_path, monkeypatch):
+    from ui.server import app as app_mod
+
+    monkeypatch.setenv(paths.HOME_ENV, str(tmp_path / "data"))
+    monkeypatch.setenv("OneDrive", str(tmp_path))
+    monkeypatch.delenv("BATS_SCHEDULER", raising=False)
+    started = []
+    monkeypatch.setattr(app_mod.scheduler, "start_thread", lambda: started.append(True))
+    with TestClient(app_mod.app) as c:
+        health = c.get("/api/health").json()
+    assert started == [] and "inside %OneDrive%" in health["scheduler_refused"]
+    monkeypatch.delenv("OneDrive")
+    with TestClient(app_mod.app) as c:
+        assert c.get("/api/health").json()["scheduler_refused"] is None
+    assert started == [True]

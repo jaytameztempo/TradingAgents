@@ -41,6 +41,8 @@ def _own_file_locations():
     os.environ["TRADINGAGENTS_MEMORY_LOG_PATH"] = os.path.join(home, "memory", "trading_memory.md")
     # No settings file here: the paper sender's trading window is off unless a test writes one.
     os.environ["TRADINGAGENTS_SETTINGS_PATH"] = os.path.join(home, "settings.json")
+    # The Tradebot queue, risk state and ticket folders (store.data_home) live here too, never in the user's home.
+    os.environ["TRADINGAGENTS_UI_HOME"] = os.path.join(home, "data")
 
 
 _own_file_locations()

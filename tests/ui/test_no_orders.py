@@ -75,9 +75,18 @@ def test_live_keys_are_refused():
 
 
 @pytest.mark.unit
-def test_only_the_scheduler_and_the_manual_ticket_route_start_the_sender():
+def test_only_the_scheduler_the_manual_ticket_and_the_tradebot_routes_start_the_sender():
     starters = sorted(path.relative_to(UI).as_posix() for path in UI.rglob("*.py")
                       if "jobs.SENDER" in path.read_text(encoding="utf-8"))
-    assert starters == ["server/routes/trade.py", "server/scheduler.py"]
+    assert starters == ["server/routes/trade.py", "server/routes/tradebot.py", "server/scheduler.py"]
     sender_routes = {p: set(ops) for p, ops in app.openapi()["paths"].items() if p.startswith("/api/trade")}
     assert sender_routes["/api/trade/manual/{name}/send"] == {"post"}
+
+
+@pytest.mark.unit
+def test_only_the_risk_route_starts_the_flatten_and_only_on_post():
+    starters = sorted(path.relative_to(UI).as_posix() for path in UI.rglob("*.py")
+                      if "jobs.FLATTEN" in path.read_text(encoding="utf-8"))
+    assert starters == ["server/routes/risk.py"]
+    risk_paths = {p: set(ops) for p, ops in app.openapi()["paths"].items() if p.startswith("/api/risk")}
+    assert risk_paths["/api/risk/flatten"] == {"post"}

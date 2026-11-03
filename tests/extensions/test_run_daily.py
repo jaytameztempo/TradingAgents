@@ -1,4 +1,4 @@
-"""The daily command runs the existing steps in order, stops unless SIDE, stops on unmapped sectors, and never orders.
+"""The daily command runs the steps for the market label in order, ends with the Tradebot, and never orders.
 
 Steps are replaced by a fake runner that records them and writes the route and
 channel files the gates read, under a tmp home folder. No step process is started.
@@ -20,7 +20,8 @@ from extensions.scripts import run_daily
 AS_OF = date(2026, 10, 9)
 T0 = datetime(2026, 10, 10, 22, 0, tzinfo=UTC)
 ORDER = ["regime SPY", "regime QQQ", "router", "universe", "financials", "long channel", "short channel",
-         "channel rank", "ranked side plans", "4-hour confirm", "daily status", "earnings blackout", "paper tickets"]
+         "channel rank", "ranked side plans", "4-hour confirm", "daily status", "earnings blackout", "enqueue",
+         "tradebot eod"]
 
 
 @pytest.fixture
@@ -87,9 +88,11 @@ def test_a_side_day_runs_every_step_in_order(home, guards, monkeypatch, capsys):
         "extensions.scripts.run_scanbot_long_channel", "extensions.scripts.run_scanbot_short_channel",
         "extensions.scripts.run_scanbot_channel_rank", "extensions.scripts.run_ranked_side_handoff",
         "extensions.scripts.run_side_confirm_4h", "extensions.scripts.run_daily_status",
-        "extensions.scripts.run_earnings_blackout", "extensions.scripts.run_paper_tickets",
+        "extensions.scripts.run_earnings_blackout", "extensions.scripts.run_enqueue",
+        "extensions.scripts.run_tradebot",
     ]
-    assert all(argv[:2] == ["--as-of", "2026-10-09"] for _, _, argv in ran)
+    assert all(argv[:2] == ["--as-of", "2026-10-09"] for _, _, argv in ran[:-1])
+    assert ran[-1][2] == ["--stage", "eod", "--as-of", "2026-10-09"]
     assert ran[0][2][2:] == ["--symbol", "SPY"] and ran[1][2][2:] == ["--symbol", "QQQ"]
     assert guards == ["assert_no_order_path", "refuse_trading_client", "assert_no_order_path"]
     out = capsys.readouterr().out
@@ -97,14 +100,26 @@ def test_a_side_day_runs_every_step_in_order(home, guards, monkeypatch, capsys):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("label", ["UP", "DOWN"])
-def test_a_label_other_than_side_stops_after_the_router(home, guards, monkeypatch, capsys, label):
+@pytest.mark.parametrize("label, scan, word", [("UP", "upward scan", "up"), ("DOWN", "downward scan", "down")])
+def test_a_trend_day_runs_its_category_scan_then_the_tradebot(home, guards, monkeypatch, capsys, label, scan, word):
     ran = _fake_runner(home, monkeypatch, label=label)
-    assert run_daily.main(["--as-of", "2026-10-09"]) == run_daily.EXIT_OK
-    assert [name for name, _, _ in ran] == ["regime SPY", "regime QQQ", "router"]
+    assert run_daily.main(["--as-of", "2026-10-09", "--category", "2"]) == run_daily.EXIT_OK
+    assert [name for name, _, _ in ran] == ["regime SPY", "regime QQQ", "router", "universe", "financials", scan,
+                                            "enqueue", "tradebot eod"]
+    argv = {name: a for name, _, a in ran}
+    assert argv[scan] == ["--scan", word, "--as-of", "2026-10-09", "--category", "2"]
+    assert argv["enqueue"] == ["--as-of", "2026-10-09", "--category", "2"]
     out = capsys.readouterr().out
-    assert f"stopped: SPY+QQQ market label is {label}, not SIDE" in out
+    assert f"complete (SPY+QQQ market label {label})" in out and "no order sent" in out
     assert "paper tickets" not in out
+
+
+@pytest.mark.unit
+def test_legacy_tickets_run_only_when_asked_on_a_side_day(home, guards, monkeypatch):
+    ran = _fake_runner(home, monkeypatch)
+    run_daily.main(["--as-of", "2026-10-09", "--legacy-tickets"])
+    names = [name for name, _, _ in ran]
+    assert names.index("paper tickets") == names.index("earnings blackout") + 1 and names[-1] == "tradebot eod"
 
 
 @pytest.mark.unit
@@ -137,7 +152,8 @@ def test_the_sector_check_reads_the_newest_channel_reports(home):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("fail_at", ["regime QQQ", "financials", "ranked side plans", "earnings blackout"])
+@pytest.mark.parametrize("fail_at", ["regime QQQ", "financials", "ranked side plans", "earnings blackout",
+                                     "enqueue", "tradebot eod"])
 def test_a_failed_step_stops_everything_after_it(home, guards, monkeypatch, capsys, fail_at):
     ran = _fake_runner(home, monkeypatch, fail_at=fail_at)
     assert run_daily.main(["--as-of", "2026-10-09"]) == run_daily.EXIT_FAILED
@@ -153,7 +169,7 @@ def test_options_reach_the_steps_that_take_them(home, guards, monkeypatch):
     for name in ("regime SPY", "regime QQQ", "universe", "long channel", "short channel", "4-hour confirm"):
         assert argv[name][-2:] == ["--cache-dir", "c"], name
     assert "--offline" in argv["financials"] and argv["universe"][2:4] == ["--preset", "CONSERVATIVE"]
-    assert argv["paper tickets"] == ["--as-of", "2026-10-09"]
+    assert argv["enqueue"] == ["--as-of", "2026-10-09", "--category", "1"]
 
 
 @pytest.mark.unit
@@ -181,7 +197,7 @@ def test_each_step_runs_as_its_own_python_module(monkeypatch):
         return subprocess.CompletedProcess(cmd, 3)
 
     monkeypatch.setattr(run_daily.subprocess, "run", fake_run)
-    step = run_daily.STEPS_AFTER_SECTOR_GATE[-1]
+    step = run_daily.LEGACY_TICKETS
     assert run_daily._run_step(step, ["--as-of", "2026-10-09"]) == 3
     assert seen["cmd"] == [sys.executable, "-m", "extensions.scripts.run_paper_tickets", "--as-of", "2026-10-09"]
     assert seen["cwd"] == run_daily.REPO_ROOT
@@ -206,6 +222,5 @@ def test_daily_source_never_names_paper_orders_or_an_order_call():
             assert not any("alpaca" in a.name or "paper_orders" in a.name for a in node.names)
     for word in ("TradingClient", "submit_order", "OrderRequest", "close_position", "sender"):
         assert not re.search(rf"\b{word}\b", source), word  # TradingClientLoaded is the guard's own error
-    modules = [s.module for s in run_daily.STEPS_BEFORE_SIDE_GATE + run_daily.STEPS_BEFORE_SECTOR_GATE
-               + run_daily.STEPS_AFTER_SECTOR_GATE]
+    modules = [s.module for s in run_daily.ALL_STEPS]
     assert all(m.startswith("extensions.scripts.") for m in modules)

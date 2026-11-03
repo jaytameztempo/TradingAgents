@@ -10,13 +10,15 @@ does not start with "PK", and asks the paper account for two things:
 - GET /v2/positions
 - GET /v2/orders?status=open&nested=true&limit=500
 
-PaperReader has one more read, GET /v2/account, which the paper-ticket builder
-uses for equity and buying power at ticket time; the snapshot does not print it.
+PaperReader has three more reads the snapshot does not print: GET /v2/account, which the ticket builders use
+for equity and buying power at ticket time, GET /v2/assets/<SYMBOL>, which the Tradebot uses to check a
+short name is shortable and easy to borrow, and GET /v2/orders?status=all&after=<time>, which reconcile uses to
+see the orders that filled, expired or were rejected.
 
 Nothing is placed, cancelled or changed. This module imports no Alpaca package
 and nothing that loads one (not the sender, the UI broker or alpaca_bars), so
 Alpaca's trading client is never loaded. It reads the paper REST API with the
-standard library, and PaperReader can only make those three GET requests, and
+standard library, and PaperReader can only make those five GET requests, and
 only to the paper URL.
 """
 
@@ -25,10 +27,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +49,9 @@ PAPER_URL = "https://paper-api.alpaca.markets"
 POSITIONS_PATH = "/v2/positions"
 OPEN_ORDERS_PATH = "/v2/orders?status=open&nested=true&limit=500"
 ACCOUNT_PATH = "/v2/account"
+ASSET_PATH = "/v2/assets/"  # + one checked symbol
+RECENT_ORDERS_PATH = "/v2/orders?status=all&nested=true&limit=500&direction=desc&after="  # + one UTC time
+ASSET_SYMBOL = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z]{1,2})?$")
 EXIT_OK, EXIT_BAD_KEYS, EXIT_READ_FAILED = 0, 2, 3
 
 
@@ -83,7 +90,7 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
 
 
 class PaperReader:
-    """The paper account over HTTPS GET. Public surface: positions, open_orders, account."""
+    """The paper account over HTTPS GET. Public surface: positions, open_orders, account, asset, recent_orders."""
 
     def __init__(self, api_key: str, secret_key: str,
                  opener: Callable[..., Any] = urllib.request.urlopen, timeout: float = 15.0) -> None:
@@ -100,6 +107,20 @@ class PaperReader:
 
     def account(self) -> dict:
         return self.__get(ACCOUNT_PATH, dict)
+
+    def asset(self, symbol: str) -> dict:
+        """One asset (tradable, shortable, easy_to_borrow, ...). Only a plain ticker goes into the path."""
+        if not isinstance(symbol, str) or not ASSET_SYMBOL.fullmatch(symbol):
+            raise ReadFailed(f"{symbol!r} is not a ticker")
+        return self.__get(ASSET_PATH + symbol, dict)
+
+    def recent_orders(self, after: datetime) -> list[dict]:
+        """Every order (open, filled, expired, rejected...) submitted after `after`, newest first, legs nested.
+        At most 500: reconcile asks for a window short enough to stay under that."""
+        if not isinstance(after, datetime) or after.tzinfo is None:
+            raise ReadFailed(f"after must be a time-zone-aware datetime, not {after!r}")
+        stamp = after.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return self.__get(RECENT_ORDERS_PATH + stamp, list)
 
     def __get(self, path: str, shape: type = list):
         req = urllib.request.Request(PAPER_URL + path, headers=self.__headers, method="GET")

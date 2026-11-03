@@ -10,8 +10,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from extensions.tradebot import store
 from ui.server import paths
-from ui.server.routes import broker, jobs, pipeline, queues, research, trade
+from ui.server.routes import broker, jobs, orders, pipeline, queues, research, risk, trade, tradebot
 from ui.server.routes import settings as settings_routes
 from ui.server.scheduler import scheduler
 
@@ -20,10 +21,20 @@ load_dotenv(paths.REPO_ROOT / ".env")
 
 
 
+def scheduler_refusal() -> str | None:
+    """Why the scheduler must not start: the data folder is inside a OneDrive-synced folder, where sync can lock
+    or roll back the queue, ledger and lock files. None when it may start."""
+    where = store.synced_folder()
+    if where:
+        return (f"the data folder {store.data_home()} is inside {where}; the scheduler is not started. Move it "
+                f"out of OneDrive (or set {store.HOME_ENV}) and restart the server")
+    return None
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # The scheduler runs while the server runs; BATS_SCHEDULER=0 turns it off.
-    if os.environ.get("BATS_SCHEDULER", "1") != "0":
+    # The scheduler runs while the server runs; BATS_SCHEDULER=0 turns it off, and a synced data folder refuses it.
+    if os.environ.get("BATS_SCHEDULER", "1") != "0" and scheduler_refusal() is None:
         scheduler.start_thread()
     yield
     scheduler.stop_thread()
@@ -31,17 +42,17 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="BATS local UI", docs_url="/api/docs", redoc_url=None, openapi_url="/api/openapi.json",
               lifespan=lifespan)
-for module in (pipeline, research, jobs, broker, settings_routes, queues, trade):
+for module in (pipeline, research, jobs, broker, settings_routes, queues, trade, risk, orders, tradebot):
     app.include_router(module.router)
 
 
 @app.get("/api/health")
 def health() -> dict:
     status = scheduler.status()
-    # orders_enabled: the scheduler's paper auto-send is on. Apart from it, only a confirmed manual ticket
-    # send on the Trade page starts the paper sender; no route talks to the broker itself.
-    return {"ok": True, "data_home": str(paths.data_home()), "orders_enabled": status["auto_send_enabled"],
-            "scheduler_running": status["running"]}
+    # orders_enabled: the scheduler sends on its own (tradebot auto mode and paper auto-send both on). Apart from
+    # it, only a confirmed send on the Trade page starts the paper sender; no route talks to the broker itself.
+    return {"ok": True, "data_home": str(paths.data_home()), "orders_enabled": status["auto_send_sends"],
+            "scheduler_running": status["running"], "scheduler_refused": scheduler_refusal()}
 
 
 if paths.WEB_DIST.is_dir():

@@ -1,4 +1,4 @@
-"""Settings: automation schedule, trading window and auto-send, research (LLM) settings, and API keys.
+"""Settings: automation schedule, trading window and auto-send, risk limits, research (LLM) settings, and API keys.
 
 LLM settings and keys are written to the repo's .env with python-dotenv, which keeps every other line as
 it is, and copied into this process's environment so the next script or research run sees them without a
@@ -84,15 +84,24 @@ def get_settings() -> dict:
     try:
         automation, trading = settings.automation(), settings.trading()
         saved_trading = settings.trading(saved_only=True)
+        risk = settings.risk()
+        tradebot = settings.tradebot()
         error = None
     except SettingsError as exc:
         automation, trading, saved_trading, error = settings.DEFAULT_AUTOMATION, settings.DEFAULT_TRADING, None, str(exc)
+        risk = tradebot = None
     return {
         "error": error,
         "automation": automation,
         "automation_runs": settings.AUTOMATION_RUNS,
         "trading": trading,
         "trading_saved": saved_trading is not None,
+        "risk": risk,
+        "tradebot": tradebot,
+        "tradebot_modes": {"manual": "Manual: you run every check, ticket and send",
+                           "semi": "Semi: the scheduler checks triggers; you ticket and send",
+                           "auto": "Auto: the scheduler checks, tickets and sends (needs paper auto-send on too)"},
+        "auto_blockers": settings.auto_blockers(),
         "llm": {name: {**spec, "value": env.get(name) or os.environ.get(name) or ""} for name, spec in LLM_FIELDS.items()},
         "keys": [{"name": name, "label": label, "set": bool(env.get(name) or os.environ.get(name))}
                  for name, label in KEYS.items()],
@@ -120,6 +129,23 @@ def put_automation(body: dict) -> dict:
 def put_trading(body: dict) -> dict:
     try:
         return settings.save_section("trading", settings.validate_trading(body))
+    except SettingsError as exc:
+        raise _bad(str(exc)) from None
+
+
+@router.put("/tradebot")
+def put_tradebot(body: dict) -> dict:
+    try:
+        return settings.save_section("tradebot", settings.validate_tradebot(body))
+    except SettingsError as exc:
+        raise _bad(str(exc)) from None
+
+
+@router.put("/risk")
+def put_risk(body: dict) -> dict:
+    """The risk limits. The kill switch is not changed here (PUT /api/risk/kill-switch)."""
+    try:
+        return settings.save_section("risk", settings.validate_risk_update(body))
     except SettingsError as exc:
         raise _bad(str(exc)) from None
 

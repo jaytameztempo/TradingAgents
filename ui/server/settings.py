@@ -1,8 +1,10 @@
-"""Settings the UI saves: the automation schedule and the trading window, in one JSON file.
+"""Settings the UI saves: the automation schedule, the trading window and the risk limits, in one JSON file.
 
 The file is ~/.tradingagents/settings.json (paths.settings_path()). Its "trading" section is the window
 ``paper_orders.sender`` enforces (see paper_orders/trade_window.py), so it is validated with the same parser
-the sender uses. Writes go through a temp file and a rename, so a reader never sees half a file.
+the sender uses. Its "risk" section (limits and the kill switch) is the one paper_orders.guard reads, validated with
+the guard's own validate_risk; its "tradebot" section (mode, filters, intraday times) with
+extensions.tradebot.config.validate, the one run_tradebot reads. Writes go through a temp file and a rename, so a reader never sees half a file.
 """
 
 from __future__ import annotations
@@ -11,12 +13,20 @@ import json
 import os
 from typing import Any
 
-from paper_orders.trade_window import SettingsError, TradeWindow, load_settings, parse_days, parse_hhmm
+from extensions.tradebot import config as tradebot_config
+from paper_orders.guard import validate_risk
+from paper_orders.trade_window import (
+    SettingsError,
+    TradeWindow,
+    load_settings,
+    parse_days,
+    parse_hhmm,
+)
 from ui.server import paths
 
 AUTOMATION_RUNS = {
     "category_scans": "Category scans (upward, downward, sideways)",
-    "daily": "Daily SIDE pipeline (run_daily: regime → … → paper tickets; sends nothing)",
+    "daily": "Daily pipeline (run_daily: regime → scans for the label → Tradebot queue and eod check; sends nothing)",
 }
 # Saved runs that are retired, and what they now mean: "scans" ran the five-name trend scans and the
 # sideways channel scans; a schedule saved with it keeps running, as the category scans.
@@ -48,6 +58,53 @@ def automation() -> dict:
     if auto["category"] not in CATEGORIES:
         auto["category"] = DEFAULT_AUTOMATION["category"]
     return auto
+
+
+def risk() -> dict:
+    """The risk limits and kill switch, defaults filled in. Raises SettingsError for a saved value that is wrong."""
+    return validate_risk(read_all().get("risk"))
+
+
+def validate_risk_update(data: dict) -> dict:
+    """A risk update from the page: the limits as sent, the kill switch and its note kept as saved."""
+    if not isinstance(data, dict):
+        raise SettingsError("the risk settings are not an object")
+    current = risk()
+    limits = {k: v for k, v in data.items() if k not in ("kill_switch", "kill_switch_at", "kill_switch_reason")}
+    return validate_risk({**current, **limits})
+
+
+def tradebot() -> dict:
+    """The Tradebot settings, defaults filled in. Raises SettingsError for a saved value that is wrong."""
+    return tradebot_config.validate(read_all().get("tradebot") or {})
+
+
+AUTO_NEEDS = ("paper_orders.guard", "paper_orders.ledger", "paper_orders.reconcile")
+
+
+def auto_blockers() -> list[str]:
+    """Why auto mode may not be chosen yet: the risk guard, order ledger and reconcile must be installed, and a
+    trading window saved (without one the sender is not gated by time)."""
+    import importlib
+
+    out = []
+    for name in AUTO_NEEDS:
+        try:
+            importlib.import_module(name)
+        except ImportError as exc:
+            out.append(f"{name} is not installed ({exc})")
+    if not read_all().get("trading"):
+        out.append("no trading window is saved")
+    return out
+
+
+def validate_tradebot(data: dict) -> dict:
+    out = tradebot_config.validate(data)
+    if out["mode"] == "auto":
+        blockers = auto_blockers()
+        if blockers:
+            raise SettingsError("auto mode is locked: " + "; ".join(blockers))
+    return out
 
 
 def trading(saved_only: bool = False) -> dict | None:

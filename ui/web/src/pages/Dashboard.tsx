@@ -8,6 +8,7 @@ import {
 import { dateTime, money, num, qty, signedMoney, signedPct } from "../format";
 import { Ticker, TickerChips } from "../components/Ticker";
 import { usePrefs } from "../prefs";
+import { OpsPanels } from "../components/OpsPanels";
 
 const RANGES: HistoryRange[] = ["1D", "1W", "1M", "1Y"];
 
@@ -22,14 +23,28 @@ export default function Dashboard() {
         <h1>Dashboard</h1>
         <span className="muted">Paper account · refreshes every {REFRESH_MS / 1000}s</span>
       </div>
+      <KillSwitchBanner />
       {keysMissing ? <ConnectKeys message={(account.error as Error).message} /> : (
         <>
           <AccountCard />
           <PositionsOrders />
         </>
       )}
+      <OpsPanels />
       <PipelineStrip />
     </>
+  );
+}
+
+function KillSwitchBanner() {
+  const risk = useQuery({ queryKey: ["risk"], queryFn: api.risk, refetchInterval: 30_000 });
+  const r = risk.data?.risk;
+  if (risk.data?.error) return <div className="notice notice-error" style={{ marginBottom: 12 }}>Risk settings cannot be read, so the guard sends no entry: {risk.data.error}</div>;
+  if (!r?.kill_switch) return null;
+  return (
+    <div className="notice notice-error" style={{ marginBottom: 12 }}>
+      <strong>Kill switch is ON</strong>{r.kill_switch_reason ? ` (${r.kill_switch_reason})` : ""}: no entry is sent. Turn it off on the Settings page.
+    </div>
   );
 }
 
