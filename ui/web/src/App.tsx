@@ -6,6 +6,7 @@ import Scans from "./pages/Scans";
 import Research from "./pages/Research";
 import Strategy from "./pages/Strategy";
 import Trade from "./pages/Trade";
+import Backtest from "./pages/Backtest";
 import Settings from "./pages/Settings";
 
 const PAGES = [
@@ -14,6 +15,7 @@ const PAGES = [
   { to: "/research", label: "Research", icon: "✎" },
   { to: "/strategy", label: "Strategy", icon: "⇄" },
   { to: "/trade", label: "Trade", icon: "◎" },
+  { to: "/backtest", label: "Backtest", icon: "↺" },
   { to: "/settings", label: "Settings", icon: "⚙" },
 ];
 
@@ -59,6 +61,7 @@ export default function App() {
           <Route path="/research" element={<Research />} />
           <Route path="/strategy" element={<Strategy />} />
           <Route path="/trade" element={<Trade />} />
+          <Route path="/backtest" element={<Backtest />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>

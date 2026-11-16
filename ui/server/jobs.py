@@ -39,6 +39,7 @@ SCRIPTS = frozenset({
     "run_daily",  # the daily pipeline for the market label, ending in the Tradebot enqueue and eod check
     "run_enqueue",  # the router-allowed candidates into the Tradebot queue
     "run_tradebot",  # the Tradebot's trigger checks and tickets; reads the paper account by GET, never orders
+    "run_backtest_reconstruct",  # rebuilds the pipeline for past dates into backtest/reconstructed; no orders
 })
 
 # The paper order sender. Two places start it: the in-app scheduler (ui/server/scheduler.py), only when
@@ -58,7 +59,7 @@ EXIT_MEANINGS = {0: "ok", 1: "failed", 2: "bad input", 3: "regime mismatch: bot 
                  4: "the risk guard held entries back"}
 
 # Jobs in the same group may not run at the same time (one research run, one pipeline, one sender).
-EXCLUSIVE_GROUPS = frozenset({"research", "pipeline", "sender", "flatten", "reconcile"})
+EXCLUSIVE_GROUPS = frozenset({"research", "pipeline", "sender", "flatten", "reconcile", "backtest"})
 
 MAX_JOBS_KEPT = 100
 

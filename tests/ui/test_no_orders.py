@@ -75,6 +75,13 @@ def test_live_keys_are_refused():
 
 
 @pytest.mark.unit
+def test_backtest_reads_by_get_and_only_the_rebuild_job_is_a_post():
+    backtest_paths = {p: set(ops) for p, ops in app.openapi()["paths"].items() if p.startswith("/api/backtest")}
+    assert backtest_paths == {"/api/backtest": {"get"}, "/api/backtest/coverage": {"get"},
+                              "/api/backtest/reconstruct": {"post"}}
+
+
+@pytest.mark.unit
 def test_only_the_scheduler_the_manual_ticket_and_the_tradebot_routes_start_the_sender():
     starters = sorted(path.relative_to(UI).as_posix() for path in UI.rglob("*.py")
                       if "jobs.SENDER" in path.read_text(encoding="utf-8"))

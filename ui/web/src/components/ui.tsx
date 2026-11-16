@@ -44,6 +44,38 @@ export function Delta({ value, children }: { value: number | null | undefined; c
   );
 }
 
+/** A hover tooltip drawn just above the mouse cursor (a native `title` tooltip opens under the cursor, where the
+ *  pointer hides it). Fixed-positioned, so a scrolling table does not clip it. Multi-line text keeps its breaks. */
+export function HoverTip({ text, children, as = "span", style, className }: {
+  text: ReactNode;
+  children: ReactNode;
+  as?: "span" | "label";
+  style?: React.CSSProperties;
+  className?: string;
+}) {
+  const [at, setAt] = useState<{ x: number; y: number } | null>(null);
+  const Tag = as;
+  const place = (e: React.MouseEvent) => setAt({ x: e.clientX, y: e.clientY });
+  const half = 170; // keep the box inside the window near its left and right edges
+  return (
+    <Tag style={style} className={className} onMouseEnter={place} onMouseMove={place} onMouseLeave={() => setAt(null)}>
+      {children}
+      {at && text && (
+        <span role="tooltip" style={{
+          position: "fixed", left: Math.min(Math.max(at.x, half + 8), window.innerWidth - half - 8),
+          top: at.y - 14, transform: "translate(-50%, -100%)", zIndex: 1000, pointerEvents: "none",
+          maxWidth: half * 2, width: "max-content", whiteSpace: "pre-line", textAlign: "left",
+          background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)",
+          borderRadius: 6, padding: "6px 10px", fontSize: 12, fontWeight: 400, lineHeight: 1.4,
+          boxShadow: "0 4px 14px rgba(0, 0, 0, 0.18)",
+        }}>
+          {text}
+        </span>
+      )}
+    </Tag>
+  );
+}
+
 export function RegimeBadge({ label }: { label?: string | null }) {
   if (!label) return <span className="badge">—</span>;
   const icon = label === "UP" ? "▲" : label === "DOWN" ? "▼" : "◆";

@@ -489,7 +489,108 @@ export interface JobStep {
   finished_at?: string | null;
 }
 
+// --- backtest (read-only replay of saved files and cached bars) ---------------------------
+export type BacktestStrategy = "all" | "up" | "down" | "side";
+export type BacktestBot = "up" | "down" | "side";
+export type BacktestOrigin = "replay" | "reconstructed";
+export interface BacktestCoverageDay {
+  date: string;
+  status: "saved" | "reconstructed" | "holiday" | "missing";
+  label: string | null;
+  rebuilt: boolean;
+  warnings: string[];
+  // Where a rebuilt date's fundamentals came from (absent on saved or missing dates).
+  fundamentals: { fetch: boolean; cached: number; fetched: number; missing: number } | null;
+}
+export interface BacktestParams {
+  start: string;
+  end?: string;
+  strategy: BacktestStrategy;
+  timeframe: "daily" | "4h";
+  max_sessions: number;
+  risk_pct: number;
+  include_reconstructed: boolean;
+  hold_to_exit: boolean; // no time exit: a trade closes only at its stop or target
+}
+export interface BacktestSummaryRow {
+  origin: BacktestOrigin;
+  strategy: BacktestStrategy;
+  label: string;
+  trades: number;
+  open: number;
+  wins: number;
+  win_rate: number | null;
+  avg_r: number | null;
+  total_r: number;
+  total_return_pct: number;
+  max_drawdown_pct: number;
+}
+export interface BacktestTrade {
+  origin: BacktestOrigin;
+  run_date: string;
+  bot: BacktestBot;
+  symbol: string;
+  side: "long" | "short";
+  source_file: string;
+  report_as_of: string;
+  known_on: string;
+  note: string;
+  levels_source: "recorded" | "derived";
+  reference_entry: number | null;
+  entry_date: string;
+  entry: number;
+  stop: number;
+  target: number;
+  exit_date: string;
+  exit: number;
+  exit_reason: "stop" | "target" | "time" | "open_at_end";
+  r: number;
+  risk_per_share: number;
+  sessions_held: number;
+  detail: string;
+}
+export interface BacktestSkip {
+  origin: BacktestOrigin;
+  run_date: string;
+  bot: BacktestBot;
+  symbol: string;
+  source_file: string;
+  report_as_of: string;
+  reason: string;
+}
+export type BacktestCurvePoint = { date: string } & Partial<Record<BacktestOrigin, number>>;
+export interface BacktestResult {
+  params: BacktestParams & { end: string; max_report_age_days: number };
+  rules: Record<string, string>;
+  caveats: Record<BacktestOrigin, string>;
+  coverage: BacktestCoverageDay[];
+  summary: BacktestSummaryRow[];
+  curve: BacktestCurvePoint[];
+  trades: BacktestTrade[];
+  skipped: BacktestSkip[];
+  days: { date: string; origin: BacktestOrigin; regime_label: string | null; route_file: string | null;
+          sources: { bot: BacktestBot; side: string; file: string; known_on: string }[] }[];
+  warnings: string[];
+}
+
 export const api = {
+  // Reads saved and rebuilt pipeline files and cached bars; places no order.
+  backtest: (p: BacktestParams) => {
+    const q = new URLSearchParams({
+      start: p.start, strategy: p.strategy, timeframe: p.timeframe,
+      max_sessions: String(p.max_sessions), risk_pct: String(p.risk_pct),
+      include_reconstructed: String(p.include_reconstructed), hold_to_exit: String(p.hold_to_exit),
+    });
+    if (p.end) q.set("end", p.end);
+    return get<BacktestResult>(`/api/backtest?${q.toString()}`);
+  },
+  backtestCoverage: (start: string, end?: string) =>
+    get<BacktestCoverageDay[]>(`/api/backtest/coverage?start=${start}${end ? `&end=${end}` : ""}`),
+  // Starts the rebuild job: fetches missing daily bars and rebuilds the pipeline for dates with no saved files.
+  // fetch_fundamentals: download missing SEC fundamentals the live way (slower).
+  reconstruct: (body: { start: string; end?: string; rebuild?: boolean; all_dates?: boolean;
+                        fetch_fundamentals?: boolean }) =>
+    post<Job>("/api/backtest/reconstruct", body),
   account: () => get<Account>("/api/broker/account"),
   history: (range: HistoryRange) => get<History>(`/api/broker/history?range=${range}`),
   positions: () => get<Position[]>("/api/broker/positions"),

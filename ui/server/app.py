@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from extensions.tradebot import store
 from ui.server import paths
-from ui.server.routes import broker, jobs, orders, pipeline, queues, research, risk, trade, tradebot
+from ui.server.routes import backtest, broker, jobs, orders, pipeline, queues, research, risk, trade, tradebot
 from ui.server.routes import settings as settings_routes
 from ui.server.scheduler import scheduler
 
@@ -42,7 +42,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="BATS local UI", docs_url="/api/docs", redoc_url=None, openapi_url="/api/openapi.json",
               lifespan=lifespan)
-for module in (pipeline, research, jobs, broker, settings_routes, queues, trade, risk, orders, tradebot):
+for module in (pipeline, research, jobs, broker, settings_routes, queues, trade, risk, orders, tradebot, backtest):
     app.include_router(module.router)
 
 
