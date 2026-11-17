@@ -149,6 +149,28 @@ def _peaks(trades: list[dict], capital: float) -> tuple[int, float]:
     return best_n, round(best_risk / capital * 100, 3) if capital else 0.0
 
 
+BREAKDOWNS = (
+    ("long", "Long", lambda t: t["side"] == "long"),
+    ("short", "Short", lambda t: t["side"] == "short"),
+    ("stop_swing", "Stop: swing - 1 ATR", lambda t: t.get("stop_source") == "swing"),
+    ("stop_invalidation", "Stop: handoff invalidation", lambda t: t.get("stop_source") == "invalidation"),
+    ("stop_derived", "Stop: derived (trend)", lambda t: t.get("stop_source") == "derived"),
+)
+
+
+def breakdown(trades: list[dict], capital: float, origins: tuple[str, ...]) -> list[dict]:
+    """Rows by side and by stop source, per origin, with the summary's columns; groups with no trade are left out."""
+    rows = []
+    for origin in origins:
+        for key, label, keep in BREAKDOWNS:
+            mine = [{**t, "bot": "x"} for t in trades if t.get("origin", "replay") == origin and keep(t)]
+            if not mine:
+                continue
+            [row], _ = summarize(mine, capital, date.min, bots=(), origins=(origin,))
+            rows.append({**row, "strategy": key, "label": label})
+    return rows
+
+
 def summarize(trades: list[dict], capital: float, start: date, bots: tuple[str, ...] = BOTS,
               origins: tuple[str, ...] = ("replay",)) -> tuple[list, list]:
     """(summary rows, equity curve). Dollars come from each trade's whole-share ``pnl_usd`` on the starting

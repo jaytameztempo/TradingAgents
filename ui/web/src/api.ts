@@ -519,6 +519,21 @@ export interface BacktestParams {
   max_open_risk_pct?: number | null; // live 8
   slippage_bps?: number;
   commission_per_share?: number;
+  buying_power?: number | null; // null: the starting capital; the 23% basket is a share of it (live: includes margin)
+  entry_mode?: BacktestEntryMode; // SIDE: tradebot (queue, daily confirmation, 4h/1h squeeze) or next_day
+  squeeze_release?: boolean | null; // the Tradebot filter switches; null: the Tradebot settings
+  rsi_extreme?: boolean | null;
+  light_volume?: boolean | null;
+  squeeze_4h1h?: boolean | null;
+  expire_sessions?: number | null;
+}
+export type BacktestEntryMode = "tradebot" | "next_day";
+export type TradebotFilters = { squeeze_release: boolean; rsi_extreme: boolean; light_volume: boolean;
+                                squeeze_4h1h: boolean };
+export interface BacktestFunnel {
+  queued: number; armed: number; triggered: number; expired: number; removed: number; already_queued: number;
+  squeeze_missing: number; filled: number; closed: number; won: number; no_levels?: number;
+  limit_not_reached?: number; guard?: number; reasons: [string, number][];
 }
 export type BacktestOrigins = "both" | "replay" | "reconstructed";
 export type BacktestSizing = "live" | "fixed";
@@ -579,6 +594,11 @@ export interface BacktestTrade {
   calm_scale_fallback?: boolean; // live: SPY / QQQ bars missing, calm scale taken as 1.0
   notional_limit?: number | null;
   outlier?: boolean; // over 5R
+  stop_source?: "swing" | "invalidation" | "derived";
+  entry_mode?: BacktestEntryMode;
+  queued_on?: string; // Tradebot triggers: the day the name was queued
+  triggered_on?: string;
+  squeeze_missing?: boolean; // no cached 30-minute bars: the 4h/1h squeeze was taken as off
 }
 export interface BacktestSkip {
   origin: BacktestOrigin;
@@ -595,6 +615,10 @@ export interface BacktestResult {
   rules: Record<string, string>;
   caveats: Partial<Record<BacktestOrigin, string>>;
   assumptions?: string[];
+  breakdown?: BacktestSummaryRow[]; // by side and stop source, per origin
+  funnel?: Partial<Record<BacktestOrigin, BacktestFunnel>> | null;
+  comparison?: Record<BacktestEntryMode, BacktestSummaryRow[]> | null; // SIDE rows, Tradebot vs next day
+  market?: { index_change_pct: Record<string, number>; regime_days: Record<string, number> };
   calm_scale_fallback_dates?: string[];
   coverage: BacktestCoverageDay[];
   summary: BacktestSummaryRow[];
@@ -636,12 +660,17 @@ export const api = {
     if (p.origins) q.set("origins", p.origins);
     if (p.sizing) q.set("sizing", p.sizing);
     for (const k of ["max_positions", "max_gross_pct", "max_open_risk_pct", "slippage_bps",
-                     "commission_per_share"] as const) {
+                     "commission_per_share", "buying_power", "entry_mode", "squeeze_release", "rsi_extreme",
+                     "light_volume", "squeeze_4h1h", "expire_sessions"] as const) {
       const v = p[k];
       if (v != null) q.set(k, String(v));
     }
     return get<BacktestResult>(`/api/backtest?${q.toString()}`);
   },
+  // The live series' original buying power (tickets/series.json): the Buying power field's default.
+  backtestDefaults: () =>
+    get<{ series_original_buying_power: number | null; series_recorded_at: string | null;
+          tradebot_filters: TradebotFilters; tradebot_expire_sessions: number }>("/api/backtest/defaults"),
   backtestCoverage: (start: string, end?: string) =>
     get<BacktestCoverageDay[]>(`/api/backtest/coverage?start=${start}${end ? `&end=${end}` : ""}`),
   // Starts the rebuild job: fetches missing daily bars and rebuilds the pipeline for dates with no saved files.

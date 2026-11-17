@@ -1,10 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Area, CartesianGrid, ComposedChart, Legend, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import {
   api, BacktestBot, BacktestCoverageDay, BacktestExportFormat, BacktestOrigin, BacktestOrigins, BacktestParams,
-  BacktestResult, BacktestRunMeta, BacktestSavedRun, BacktestSizing, BacktestSkip, BacktestStrategy,
-  BacktestSummaryRow, BacktestTrade, defaultAsOf,
+  BacktestEntryMode, BacktestFunnel, BacktestResult, BacktestRunMeta, BacktestSavedRun, BacktestSizing, BacktestSkip,
+  BacktestStrategy, BacktestSummaryRow, BacktestTrade, defaultAsOf, TradebotFilters,
 } from "../api";
 import { Card, Column, DataTable, Delta, Empty, ErrorBox, HoverTip, JobLog, RegimeBadge } from "../components/ui";
 import { Ticker } from "../components/Ticker";
@@ -19,6 +19,12 @@ const STRATEGIES: { id: BacktestStrategy; label: string }[] = [
 ];
 const BOT_LABEL: Record<BacktestBot, string> = { up: "UPBot", down: "DOWNBot", side: "SIDEBot" };
 const ORIGIN_LABEL: Record<BacktestOrigin, string> = { replay: "Replay", reconstructed: "Reconstructed" };
+const FILTER_LABEL: Record<keyof TradebotFilters, { label: string; tip: string }> = {
+  squeeze_release: { label: "Daily squeeze release", tip: "Daily TTM Squeeze released in the trade's direction" },
+  rsi_extreme: { label: "RSI extreme", tip: "RSI(14) at its extreme (oversold for a long, overbought for a short)" },
+  light_volume: { label: "Light volume", tip: "The day's volume at or under its 20-session average" },
+  squeeze_4h1h: { label: "4h/1h squeeze", tip: "The 4-hour and 1-hour TTM Squeeze both fired in the trade's direction" },
+};
 const SIZING_LABEL: Record<BacktestSizing, string> = { live: "Live (Tradebot basket)", fixed: "Fixed risk %" };
 const LIMIT_DEFAULTS: Record<BacktestSizing, { positions: string; gross: string; risk: string }> = {
   live: { positions: "15", gross: "60", risk: "8" },
@@ -49,6 +55,21 @@ export default function Backtest() {
   const [holdToExit, setHoldToExit] = useState(false);
   const [riskPct, setRiskPct] = useState(1);
   const [capital, setCapital] = useState(100000);
+  const [buyingPower, setBuyingPower] = useState("");
+  const defaults = useQuery({ queryKey: ["backtest-defaults"], queryFn: api.backtestDefaults, staleTime: Infinity });
+  const seriesBp = defaults.data?.series_original_buying_power ?? null;
+  useEffect(() => {  // start from the live series' buying power, once it is known
+    if (seriesBp != null) setBuyingPower((v) => (v === "" ? String(seriesBp) : v));
+  }, [seriesBp]);
+  const [entryMode, setEntryMode] = useState<BacktestEntryMode>("tradebot");
+  const [filters, setFilters] = useState<TradebotFilters | null>(null);
+  const [expireSessions, setExpireSessions] = useState("");
+  useEffect(() => {  // start from the Tradebot's own settings
+    if (defaults.data) {
+      setFilters((f) => f ?? defaults.data.tradebot_filters);
+      setExpireSessions((v) => (v === "" ? String(defaults.data.tradebot_expire_sessions) : v));
+    }
+  }, [defaults.data]);
   const [sizingMode, setSizingMode] = useState<BacktestSizing>("live");
   const [origins, setOrigins] = useState<BacktestOrigins>("both");
   const [maxPositions, setMaxPositions] = useState("");
@@ -86,6 +107,8 @@ export default function Backtest() {
       include_reconstructed: origins !== "replay", hold_to_exit: holdToExit, capital, origins,
       sizing: sizingMode, max_positions: blankToNull(maxPositions), max_gross_pct: blankToNull(maxGross),
       max_open_risk_pct: blankToNull(maxOpenRisk), slippage_bps: slippage, commission_per_share: commission,
+      buying_power: blankToNull(buyingPower), entry_mode: entryMode,
+      ...(filters ?? {}), expire_sessions: blankToNull(expireSessions),
     };
     // Rebuild dates with no files (cheap when there are none) and fetch the bars the trades need.
     if (prepare && start <= rebuildEnd) await rebuild({ trade_bars: true });
@@ -144,12 +167,29 @@ export default function Backtest() {
             </select>
           </label>
           <HoverTip as="label" className="field"
-                    text={"Starting capital stands in for equity and buying power on every day, with no "
-                          + "compounding. Dollars are whole shares x the price move, less fees."}>
+                    text={"Starting capital is the account equity on every day, with no compounding. Dollars "
+                          + "are whole shares x the price move, less fees."}>
             Starting capital ($)
             <input type="number" min={1000} step={1000} value={capital}
                    onChange={(e) => setCapital(Number(e.target.value))} style={{ width: 120 }} />
           </HoverTip>
+          <HoverTip as="label" className="field"
+                    text={"The buying power the 23% daily basket is a share of, as live, where Alpaca's buying power "
+                          + "includes margin (from the capital up to 4 x it). The 15% name cap, 8% stop-risk and 60% "
+                          + "gross limits stay shares of the starting capital. Blank = the starting capital (no "
+                          + "margin)."
+                          + (seriesBp != null ? `\nYour live series recorded ${money(seriesBp)}`
+                            + (defaults.data?.series_recorded_at ? ` on ${defaults.data.series_recorded_at.slice(0, 10)}`
+                              : "") + "." : "")}>
+            Buying power ($)
+            <input type="number" min={1000} step={1000} value={buyingPower} placeholder="= capital"
+                   onChange={(e) => setBuyingPower(e.target.value)} style={{ width: 120 }} />
+          </HoverTip>
+          {seriesBp != null && buyingPower !== String(seriesBp) && (
+            <button className="btn btn-sm" onClick={() => setBuyingPower(String(seriesBp))}>
+              Use live series ({money(seriesBp)})
+            </button>
+          )}
           <HoverTip as="label" className="field"
                     text={"Live: as the Tradebot sizes tickets: 23% of capital (x 0.7 when SPY and QQQ ADX are both "
                           + "under 15) split equally over the day's names, at most 15% a name, whole shares, the "
@@ -194,6 +234,30 @@ export default function Backtest() {
             <input type="number" min={0} max={1} step={0.001} value={commission}
                    onChange={(e) => setCommission(Number(e.target.value))} style={{ width: 80 }} />
           </label>
+          <HoverTip as="label" className="field"
+                    text={"SIDE entry. Tradebot triggers: each PLAN name is queued on its run date and checked at "
+                          + "each close, as the Tradebot does: the daily confirmation arms it, the 4-hour/1-hour "
+                          + "squeeze triggers it, and the DAY limit at the line goes out the next session. "
+                          + "Next-day limit: every PLAN name gets the limit the next session."}>
+            SIDE entry
+            <select value={entryMode} onChange={(e) => setEntryMode(e.target.value as BacktestEntryMode)}>
+              <option value="tradebot">Tradebot triggers</option>
+              <option value="next_day">Next-day limit</option>
+            </select>
+          </HoverTip>
+          {entryMode === "tradebot" && filters && (Object.keys(FILTER_LABEL) as (keyof TradebotFilters)[]).map((k) => (
+            <HoverTip key={k} as="label" className="field" text={`${FILTER_LABEL[k].tip}. Default: your Tradebot settings.`}>
+              {FILTER_LABEL[k].label}
+              <input type="checkbox" checked={filters[k]} onChange={(e) => setFilters({ ...filters, [k]: e.target.checked })} />
+            </HoverTip>
+          ))}
+          {entryMode === "tradebot" && (
+            <HoverTip as="label" className="field" text="Sessions a queued name waits for its trigger before it expires">
+              Expire sessions
+              <input type="number" min={1} max={60} value={expireSessions}
+                     onChange={(e) => setExpireSessions(e.target.value)} style={{ width: 70 }} />
+            </HoverTip>
+          )}
           <HoverTip as="label" className="field"
                     text={"Before running: rebuild dates with no saved files, and fetch the daily and 4-hour bars "
                           + "of the names the backtest would trade, up to yesterday (only what the cache lacks)."}>
@@ -357,6 +421,8 @@ function SavedRuns({ openedId, onOpen }: {
           {STRATEGIES.find((s) => s.id === x.params.strategy)?.label ?? x.params.strategy} · {x.params.timeframe}
           {" · "}{x.params.hold_to_exit ? "hold to stop/target" : `max ${x.params.max_sessions} sessions`}
           {" · "}{(x.params.sizing ?? "fixed") === "live" ? `live sizing on ${money(x.params.capital)}`
+            + (x.params.buying_power && x.params.buying_power !== x.params.capital
+              ? ` (BP ${money(x.params.buying_power)})` : "")
             : `${x.params.risk_pct}% of ${money(x.params.capital)}`}
         </span>
       ) },
@@ -432,16 +498,24 @@ function Results({ data }: { data: BacktestResult }) {
   return (
     <>
       <DataWarnings data={data} />
+      {data.funnel && <TriggerFunnel data={data} />}
       <Card title="Summary">
         <SummaryTable rows={data.summary} />
+        {!!data.breakdown?.length && (
+          <>
+            <h3 style={{ marginTop: 16 }}>By side and stop source</h3>
+            <SummaryTable rows={data.breakdown} />
+          </>
+        )}
         <p className="muted">
           {live
-            ? <>Live sizing on {money(data.params.capital)}: each day's basket gets 23% of it (x 0.7 in a calm
-                market) split equally, at most 15% a name, in whole shares, with the book's stop-risk held to{" "}
-                {data.params.max_open_risk_pct ?? 8}%.</>
+            ? <>Live sizing on {money(data.params.capital)} of equity and{" "}
+                {money(data.params.buying_power ?? data.params.capital)} of buying power: each day's basket gets 23% of
+                the buying power (x 0.7 in a calm market) split equally, at most 15% of the equity a name, in whole
+                shares, with the book's stop-risk held to {data.params.max_open_risk_pct ?? 8}% of the equity.</>
             : <>Each closed trade risks {data.params.risk_pct}% of {money(data.params.capital)} at its stop, in whole
                 shares, held to a position value of at most the capital.</>}{" "}
-          Starting capital stands in for equity and buying power; no compounding. Replay and reconstructed results
+          Starting capital is the equity; no compounding. Replay and reconstructed results
           are never added together. Trades still open when the bars run out, or whose bars ended early, are listed,
           marked to their last close, and left out of these figures.
         </p>
@@ -613,6 +687,8 @@ function TradeFlags({ t }: { t: BacktestTrade }) {
   if (t.capped) flags.push({ label: "capped", tip: "Fixed risk wanted more shares than the capital buys; held to the capital." });
   if (t.calm_scale_fallback) flags.push({ label: "calm 1.0",
     tip: "SPY or QQQ daily bars were missing on the run date, so the calm scale was taken as 1.0 (live would not ticket)." });
+  if (t.squeeze_missing) flags.push({ label: "no 30m", tip: "No cached 30-minute bars: the 4h/1h squeeze was taken as off." });
+  if (t.triggered_on) flags.push({ label: "trigger", tip: `Queued ${t.queued_on}, triggered ${t.triggered_on}. ${t.note}` });
   if (t.entry_type === "limit") flags.push({ label: "limit", tip: "Filled by the DAY limit at the channel line." });
   if (!flags.length) return <span className="muted">{DASH}</span>;
   return (
@@ -624,6 +700,44 @@ function TradeFlags({ t }: { t: BacktestTrade }) {
         </HoverTip>
       ))}
     </span>
+  );
+}
+
+function TriggerFunnel({ data }: { data: BacktestResult }) {
+  const entries = Object.entries(data.funnel ?? {}).filter(([, f]) => f && f.queued) as [BacktestOrigin, BacktestFunnel][];
+  const cmp = data.comparison;
+  const line = (rows: BacktestSummaryRow[] | undefined, origin: BacktestOrigin) => {
+    const x = rows?.find((r) => r.origin === origin);
+    return x ? `${x.trades} closed, ${pct(x.win_rate)} wins, ${num(x.total_r, 2)}R, ${signedMoney(x.total_return_usd)}`
+      : DASH;
+  };
+  return (
+    <Card title="Tradebot trigger funnel (SIDE)">
+      {!entries.length ? <p className="muted">No SIDE names were queued.</p> : entries.map(([origin, f]) => (
+        <div key={origin} style={{ marginBottom: 12 }}>
+          <strong>{ORIGIN_LABEL[origin]}:</strong>{" "}
+          {f.queued} queued → {f.armed} armed → {f.triggered} triggered
+          {f.no_levels ? ` (${f.no_levels} with no levels)` : ""} → {f.filled} filled
+          {f.limit_not_reached ? ` (${f.limit_not_reached} limit not reached` : ""}
+          {f.limit_not_reached && f.guard ? `, ${f.guard} skipped by the guard)` : f.limit_not_reached ? ")" : ""}
+          {" "}→ {f.closed} closed → {f.won} won.
+          <span className="muted"> {f.expired} expired, {f.removed} removed by a regime change
+            {f.already_queued ? `, ${f.already_queued} already in the queue` : ""}
+            {f.squeeze_missing ? `, ${f.squeeze_missing} with no 30-minute bars` : ""}.</span>
+          {!!f.reasons.length && (
+            <ul className="muted" style={{ marginTop: 4 }}>
+              {f.reasons.map(([why, n]) => <li key={why}>{n} × {why}</li>)}
+            </ul>
+          )}
+          {cmp && (
+            <div>
+              Same names with the next-day limit: {line(cmp.next_day, origin)}; with Tradebot triggers:{" "}
+              {line(cmp.tradebot, origin)}.
+            </div>
+          )}
+        </div>
+      ))}
+    </Card>
   );
 }
 
@@ -654,6 +768,14 @@ function DataWarnings({ data }: { data: BacktestResult }) {
   if (ended) lines.push(`${ended} trade(s) whose bars stopped early (bars ended): left out of the figures`);
   const open = count((t) => t.exit_reason === "open_at_end");
   if (open) lines.push(`${open} trade(s) still open at the data end: left out of the figures`);
+  const m = data.market;
+  if (m && Object.keys(m.index_change_pct).length) {
+    const moves = Object.entries(m.index_change_pct).map(([s, v]) => `${s} ${v > 0 ? "+" : ""}${num(v, 1)}%`).join(", ");
+    const labels = Object.entries(m.regime_days).map(([l, n]) => `${l} ${n}`).join(", ");
+    lines.push(`market over the range: ${moves}; regime labels by day: ${labels}`);
+  }
+  const noSqueeze = count((t) => !!t.squeeze_missing);
+  if (noSqueeze) lines.push(`${noSqueeze} trade(s) triggered with the 4h/1h squeeze taken as off (no cached 30-minute bars)`);
   if (calmDays.length) lines.push(`calm scale taken as 1.0 on ${calmDays.length} day(s) with no SPY / QQQ bar: ${calmDays.join(", ")}`);
   const capped = count((t) => !!t.capped);
   if (capped) lines.push(`${capped} fixed-risk trade(s) capped at the capital`);
@@ -663,7 +785,7 @@ function DataWarnings({ data }: { data: BacktestResult }) {
     <Card title="Data warnings">
       {lines.length ? <ul>{lines.map((l) => <li key={l}>{l}</li>)}</ul> : <p className="muted">None.</p>}
       <ul className="muted">
-        {(data.assumptions ?? ["Starting capital stands in for equity and buying power; there is no compounding."])
+        {(data.assumptions ?? ["Starting capital is the equity; buying power defaults to it; there is no compounding."])
           .map((a) => <li key={a}>{a}</li>)}
       </ul>
     </Card>

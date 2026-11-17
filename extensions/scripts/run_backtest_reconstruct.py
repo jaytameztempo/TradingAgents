@@ -12,7 +12,7 @@ reports go to <home>/backtest/reconstructed, never to the live folders. With --f
 missing from the cache are downloaded the way the live financials step does it (SEC_EDGAR_USER_AGENT in .env) and
 saved in the shared fundamentals cache.
 
-With --trade-bars, after rebuilding, the daily and 4-hour bars of every name a backtest of the range would trade
+With --trade-bars, after rebuilding, the daily, 4-hour and 30-minute (for the Tradebot trigger replay) bars of every name a backtest of the range would trade
 (saved and rebuilt dates) are fetched from the first date to yesterday where the cache lacks them, so trades can be
 followed to their exits. Only the missing tail of each symbol is fetched.
 """
@@ -89,6 +89,7 @@ def _trade_bars(home: Path, start: date, end: date, today: date) -> int:
     try:
         rc.ensure_bars(home, symbols, start, fetch_end, progress=_log, slack_end=rc.trade_slack(fetch_end))
         rc.ensure_4h_bars(home, symbols, start, fetch_end, progress=_log)
+        rc.ensure_30min_bars(home, symbols, start - rc.THIRTY_MIN_LOOKBACK, fetch_end, progress=_log)
     except (MissingAlpacaKeys, *DATA_ERRORS) as exc:
         print(f"error: fetching trade bars failed: {exc}", file=sys.stderr)
         return EXIT_FAILED

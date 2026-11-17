@@ -15,8 +15,10 @@ Two modes:
 - **fixed**: floor(capital x risk % / risk per share at the fill) shares, held to a position value of at most the
   capital (marked ``capped``); the limits are off unless set.
 
-Starting capital stands in for equity, buying power and the series' original buying power on every day, with no
-compounding; the guard's daily-loss and drawdown stops are not simulated. The book's stop-risk is each open
+Starting capital is the equity on every day (the 15% name cap, the 8% book stop-risk and the 60% gross limit are
+shares of it), with no compounding. Buying power (default: the starting capital) stands in for the series' original
+buying power and the buying power read at ticket time, so the 23% basket is a share of it, as live, where Alpaca's
+buying power includes margin; the guard's daily-loss and drawdown stops are not simulated. The book's stop-risk is each open
 position's shares x its risk per share at the fill (live reads the current price against the stop order).
 """
 
@@ -112,11 +114,13 @@ def _ticket_plan(entry: float, risk_per_share: float, side: str) -> dict:
             "stop_calculated": entry, "risk_per_share": risk_per_share, "reward_per_share": risk_per_share}
 
 
-def live_basket(names: list[dict], capital: float, scale: float, room: float) -> tuple[dict[str, int], dict[str, str],
-                                                                                       dict]:
+def live_basket(names: list[dict], capital: float, scale: float, room: float,
+                buying_power: float | None = None) -> tuple[dict[str, int], dict[str, str], dict]:
     """(shares by key, skip reasons by key, basket record) for one basket. ``names`` are dicts with key, symbol,
-    side, entry, risk_per_share, in rank order."""
-    before = basket_allocation(capital, capital)
+    side, entry, risk_per_share, in rank order. ``capital`` is the equity; ``buying_power`` (default the capital)
+    the original and current buying power the basket is a share of."""
+    bp = capital if buying_power is None else buying_power
+    before = basket_allocation(bp, bp)
     allocation = math.floor(before * scale * 100) / 100
     info = {"allocation_before_calm_scale": before, "calm_scale": scale, "allocation": allocation,
             "floor": allocation_floor(capital), "names_n": len(names), "room": round(room, 2)}
@@ -147,11 +151,13 @@ def live_basket(names: list[dict], capital: float, scale: float, room: float) ->
     return {t.symbol: t.quantity for t in kept}, skipped, info
 
 
-def fixed_quantity(capital: float, risk_pct: float, risk_per_share: float, entry: float) -> tuple[int, bool]:
-    """(shares, capped): floor(capital x risk % / risk per share), held to a position value of at most the
-    capital."""
+def fixed_quantity(capital: float, risk_pct: float, risk_per_share: float, entry: float,
+                   buying_power: float | None = None) -> tuple[int, bool]:
+    """(shares, capped): floor(capital x risk % / risk per share), held to a position value of at most the buying
+    power (default the capital)."""
+    bp = capital if buying_power is None else buying_power
     qty = math.floor(round(capital * risk_pct / 100 / risk_per_share, 6)) if risk_per_share > 0 else 0
-    most = math.floor(round(capital / entry, 6)) if entry > 0 else 0
+    most = math.floor(round(bp / entry, 6)) if entry > 0 else 0
     return (most, True) if qty > most else (qty, False)
 
 

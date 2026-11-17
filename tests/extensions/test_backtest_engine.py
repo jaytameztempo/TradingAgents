@@ -13,7 +13,7 @@ import pytest
 from extensions.backtest import pit, sizing
 from extensions.backtest.bars import BarCache
 from extensions.backtest.engine import BacktestInputError, run_backtest
-from extensions.backtest.levels import Plan, side_plan_from_handoff, trend_plan_for
+from extensions.backtest.levels import LevelsError, Plan, side_plan_from_handoff, trend_plan_for
 from extensions.backtest.simulate import Skip, simulate, summarize
 from extensions.status.paper_tickets import plan_ticket
 
@@ -424,6 +424,12 @@ def test_live_basket_is_the_tradebot_allocation_split_and_capped():
     assert none == {} and "under the floor" in why["A"]
     scaled, _, info = sizing.live_basket(_names(("A", 100.0, 10.0), ("B", 100.0, 10.0)), 100_000, 1.0, 1_000)
     assert scaled == {"A": 50, "B": 50} and info["book_scale"] < 1  # 2,300 of stop-risk held to 1,000
+    margin, _, info = sizing.live_basket(_names(*[(s, 100.0, 1.0) for s in "ABCDE"]), 100_000, 1.0, 8_000,
+                                         buying_power=393_393.64)
+    assert info["allocation"] == 90_480.53 and set(margin.values()) == {150}  # 23% of 393k / 5, held to 15% of 100k
+    eight, _, _ = sizing.live_basket(_names(*[(s, 100.0, 0.1) for s in "ABCDEFGH"]), 100_000, 1.0, 8_000,
+                                     buying_power=393_393.64)
+    assert set(eight.values()) == {113}  # 90,480.53 / 8 = 11,310 a name, under the cap
     full, why, _ = sizing.live_basket(_names(("A", 100.0, 1.0)), 100_000, 1.0, 0)
     assert full == {} and "already fills" in why["A"]
 
@@ -447,6 +453,7 @@ def test_the_guard_checks_held_symbols_positions_and_gross_in_order():
 def test_fixed_risk_is_held_to_the_capital_and_marked_capped():
     assert sizing.fixed_quantity(100_000, 3, 0.15, 30.23) == (3307, True)  # 20,000 shares wanted
     assert sizing.fixed_quantity(100_000, 1, 4.0, 100.0) == (250, False)
+    assert sizing.fixed_quantity(100_000, 3, 0.15, 30.23, buying_power=200_000) == (6615, True)  # held to the BP
 
 
 def _handoff(home, names, stamp=STAMP, as_of=D0):
@@ -561,3 +568,120 @@ def test_live_sizing_removes_the_amlx_style_outsized_position(tmp_path):
     assert amlx["notional"] <= 15_000 and amlx["calm_scale_fallback"]
     assert amlx["pnl_usd"] == round(153 * (30.23 - 28.1), 2) < 1_000  # was $42,600
     assert max(t["notional"] for t in live["trades"]) <= 15_000
+
+
+# --- the stop rule and the Tradebot trigger replay -------------------------------------------
+
+def test_a_current_rule_report_with_no_stop_swing_is_refused_as_live():
+    entry = {"levels": {"support": 100.0, "resistance": 110.0, "midline": 105.0, "atr_14": 2.0,
+                        "invalidation": 99.5}}
+    report = {"calls": {"AAA": {"metrics": {"stop_swing_low": {"price": None, "rule": RULE,
+                                                                "window_sessions": 120}}}}}
+    with pytest.raises(LevelsError, match="no confirmed swing"):
+        side_plan_from_handoff("AAA", "long", entry, report)
+    old = side_plan_from_handoff("AAA", "long", entry, {"calls": {"AAA": {"metrics": {}}}})  # before the rule
+    assert old.stop == 99.5
+
+
+def _confirm_on(monkeypatch, passing_days):
+    """Daily confirmation passes (RSI extreme, light volume) on ``passing_days`` only."""
+    from extensions.status import confirmation as conf
+
+    def fake(symbol, side, market, as_of):
+        ok = as_of in passing_days
+        return conf.Confirmation(symbol, side, ok, [] if ok else [f"{conf.AWAITING_TRIGGER} (test)"],
+                                 ["rsi"] if ok else [], {}, 25.0, 1.0, 2.0, str(as_of))
+    monkeypatch.setattr(conf, "confirm", fake)
+
+
+def _squeeze_on(monkeypatch, firing_days):
+    from types import SimpleNamespace
+
+    from extensions.backtest import triggers as tbm
+    monkeypatch.setattr(tbm, "squeeze_reads", lambda bars, symbol, side, as_of, now: SimpleNamespace(
+        passed=as_of in firing_days, reason="" if as_of in firing_days else "4-hour squeeze has not fired"))
+
+
+def _thirty(home, symbol):
+    path = home / "cache" / "bars" / f"{symbol}_2026-01-01_2026-12-31_iex_split.30min.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([(symbol, "2026-03-02 09:30:00", 100, 101, 99, 100, 1000, 10, 100)],
+                 columns=["symbol", "timestamp", "open", "high", "low", "close", "volume", "trade_count",
+                          "vwap"]).to_csv(path, index=False)
+
+
+SQUEEZE_OFF = {"squeeze_release": True, "rsi_extreme": True, "light_volume": True, "squeeze_4h1h": False}
+D2, D3, D4 = date(2026, 3, 4), date(2026, 3, 5), date(2026, 3, 6)
+
+
+def test_a_queued_name_arms_on_its_confirmation_day_and_buys_the_next_session(tmp_path, monkeypatch):
+    _route(tmp_path, "SIDE")
+    _handoff(tmp_path, [("LA", "long", 1, 100.0, 110.0, 99.5)])
+    _bars(tmp_path, "LA", _flat_then([LONG_FILL] * 8))
+    _confirm_on(monkeypatch, {D2})
+    result = run_backtest(tmp_path, D0, strategy="side", entry_mode="tradebot", filters=SQUEEZE_OFF)
+    [trade] = result["trades"]
+    assert (trade["queued_on"], trade["triggered_on"], trade["run_date"], trade["entry_date"]) == \
+           (str(D0), str(D2), str(D2), str(D3))
+    assert trade["entry_mode"] == "tradebot"
+    f = result["funnel"]["replay"]
+    assert (f["queued"], f["armed"], f["triggered"], f["filled"]) == (1, 1, 1, 1)
+    # the same name the next day, for comparison
+    assert result["comparison"]["next_day"][0]["trades"] + result["comparison"]["next_day"][0]["open"] == 1
+
+
+def test_the_squeeze_triggers_an_armed_name_and_missing_30_minute_bars_are_flagged(tmp_path, monkeypatch):
+    _route(tmp_path, "SIDE")
+    _handoff(tmp_path, [("LA", "long", 1, 100.0, 110.0, 99.5), ("LB", "long", 2, 100.0, 110.0, 99.5)])
+    for s in ("LA", "LB"):
+        _bars(tmp_path, s, _flat_then([LONG_FILL] * 8))
+    _thirty(tmp_path, "LA")  # LB has none
+    _confirm_on(monkeypatch, {D0, D1})  # a daily fail would return an armed name to waiting, as live
+    _squeeze_on(monkeypatch, {D2})
+    result = run_backtest(tmp_path, D0, strategy="side", entry_mode="tradebot")
+    by = {t["symbol"]: t for t in result["trades"]}
+    assert by["LA"]["triggered_on"] == str(D2) and not by["LA"]["squeeze_missing"]  # armed D0, fired D2 intraday
+    assert by["LB"]["triggered_on"] == str(D0) and by["LB"]["squeeze_missing"]  # taken as off, flagged
+    assert result["funnel"]["replay"]["squeeze_missing"] == 1
+
+
+def test_a_name_never_confirmed_expires_and_a_regime_change_removes_one(tmp_path, monkeypatch):
+    _route(tmp_path, "SIDE")
+    _handoff(tmp_path, [("LA", "long", 1, 100.0, 110.0, 99.5)])
+    _bars(tmp_path, "LA", _flat_then([LONG_FILL] * 8))
+    _confirm_on(monkeypatch, set())
+    result = run_backtest(tmp_path, D0, strategy="side", entry_mode="tradebot", filters=SQUEEZE_OFF,
+                          expire_sessions=3)
+    assert result["trades"] == []
+    [skip] = [s for s in result["skipped"] if s["symbol"] == "LA"]
+    assert skip["reason"].startswith("expired after 3 session(s) without a trigger")
+    assert result["funnel"]["replay"]["expired"] == 1
+
+    _route(tmp_path, "UP", as_of=D1, stamp="20260303T220000Z")
+    removed = run_backtest(tmp_path, D0, strategy="side", entry_mode="tradebot", filters=SQUEEZE_OFF)
+    [skip] = [s for s in removed["skipped"] if s["symbol"] == "LA"]
+    assert skip["reason"] == f"regime UP on {D1}, not SIDE"
+
+
+def test_a_name_that_drops_out_of_the_newest_channel_report_expires(tmp_path, monkeypatch):
+    _route(tmp_path, "SIDE")
+    _handoff(tmp_path, [("LA", "long", 1, 100.0, 110.0, 99.5)])
+    _bars(tmp_path, "LA", _flat_then([LONG_FILL] * 8))
+    _channel(tmp_path, ["OTHER"], stamp="20260303T220000Z")  # known on D1, without LA
+    _confirm_on(monkeypatch, {D2})
+    result = run_backtest(tmp_path, D0, strategy="side", entry_mode="tradebot", filters=SQUEEZE_OFF)
+    [skip] = [s for s in result["skipped"] if s["symbol"] == "LA"]
+    assert "is not in the newest long channel report" in skip["reason"]
+
+
+def test_breakdown_rows_split_long_short_and_stop_source(tmp_path):
+    _route(tmp_path, "SIDE")
+    _handoff(tmp_path, [("LA", "long", 1, 100.0, 110.0, 99.5), ("SA", "short", 1, 110.0, 100.0, 110.5)])
+    _bars(tmp_path, "LA", _flat_then([LONG_FILL, (101, 105.5, 100.5, 105)]))
+    _bars(tmp_path, "SA", _flat_then([SHORT_FILL, (109, 111, 108.5, 110.9)]))
+    result = run_backtest(tmp_path, D0, strategy="side")
+    rows = {r["strategy"]: r for r in result["breakdown"]}
+    assert set(rows) == {"long", "short", "stop_invalidation"}  # no channel report: pre-rule invalidation stops
+    assert (rows["long"]["trades"], rows["long"]["wins"], rows["short"]["trades"], rows["short"]["wins"]) == \
+           (1, 1, 1, 0)
+    assert result["market"]["regime_days"] == {"SIDE": 1}

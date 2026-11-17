@@ -5,7 +5,8 @@ a long, resistance for a short), atr_14 and midline come from the side handoff's
 the channel report, midline = (support + resistance) / 2), and the clustered stop swing from the channel report.
 Stop = stop swing -/+ STOP_ATR (1.0) x atr_14, snapped to .99/.49 (long) or .01/.51 (short). Target = the midline.
 Channel reports written before the stop-swing rule record no stop swing; for a handoff name the handoff's recorded
-``invalidation`` (0.25 ATR through the line) is then the stop.
+``invalidation`` (0.25 ATR through the line) is then the stop. A report under the current rule that found no stop
+swing (``price`` null) is refused, as live ``plan_ticket`` refuses it.
 
 UP / DOWN (derived; the trend baskets record no stop or target):
 - stop: the last confirmed swing low - STOP_ATR (1.0) x ATR(14), snapped down with ``snap_stop`` (long, UPBot);
@@ -24,7 +25,7 @@ from datetime import date
 import pandas as pd
 
 from extensions.scanbot.swings import SWING_HIGH, SWING_LOW, wilder_atr, zigzag_swings
-from extensions.status.paper_tickets import STOP_ATR, plan_ticket, snap_stop
+from extensions.status.paper_tickets import STOP_ATR, STOP_SWING_RULE, plan_ticket, snap_stop
 
 LONG, SHORT = "long", "short"
 TARGET_R = 2.0
@@ -35,8 +36,9 @@ TREND_SWING = {LONG: "last_swing_low", SHORT: "last_swing_high"}
 
 RULES = {
     "side": "SIDEBot (recorded levels): stop = the channel report's clustered stop swing -/+ 1.0 x ATR14, snapped to "
-            ".99/.49 (long) or .01/.51 (short); when the channel report predates the stop swing, the side "
-            "handoff's recorded invalidation (0.25 x ATR14 through the line) is the stop; target = the channel "
+            ".99/.49 (long) or .01/.51 (short); a name whose report found no such swing is skipped, as live; only "
+            "when the channel report predates the stop-swing rule is the side handoff's recorded invalidation "
+            "(0.25 x ATR14 through the line) the stop; target = the channel "
             "midline; the recorded entry is the limit at support (long) or resistance (short), shown for reference.",
     "trend": "UPBot / DOWNBot (derived levels): stop = last confirmed swing low - 1.0 x ATR14, snapped to .99/.49 "
              "(long), or last confirmed swing high + 1.0 x ATR14, snapped to .01/.51 (short); target = entry +/- 2R; "
@@ -114,7 +116,10 @@ def side_plan_from_handoff(symbol: str, side: str, entry: dict, channel_report: 
         return side_plan(symbol, side, line, levels.get("atr_14"), mid, swing, source="handoff")
     except LevelsError as first:
         # Channel reports written before the stop-swing rule record no stop swing; the handoff's recorded
-        # invalidation (0.25 ATR through the line) is then the stop.
+        # invalidation (0.25 ATR through the line) is then the stop. A report under the current rule that found no
+        # swing is refused, as live plan_ticket refuses it.
+        if isinstance(swing, dict) and swing.get("rule") == STOP_SWING_RULE:
+            raise first from None
         sign = 1 if side == LONG else -1
         if not (_price(line) and _price(mid) and _price(stop)) or not sign * (line - stop) > 0 \
                 or not sign * (mid - line) > 0:

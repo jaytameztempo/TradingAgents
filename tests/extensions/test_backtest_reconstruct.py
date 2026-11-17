@@ -361,3 +361,22 @@ def test_trade_bars_extend_a_cache_that_ends_a_few_sessions_short(tmp_path):
     assert calls == [(["BJRI"], cached_to + timedelta(days=1), end)]
     # one session short of Friday is still fetched; a cache reaching Friday is enough for a Sunday end
     assert rc.trade_slack(date(2026, 11, 15)) == timedelta(days=2) and rc.trade_slack(date(2026, 11, 12)) == timedelta(0)
+
+
+def test_thirty_minute_bars_fetch_only_the_missing_tail(tmp_path):
+    calls = []
+
+    def fetcher(symbols, start, end, **kwargs):
+        calls.append((list(symbols), start, end, kwargs["feed"]))
+        return pd.DataFrame()
+
+    start, cached_to, end = date(2026, 6, 15), date(2026, 11, 6), date(2026, 11, 13)
+    folder = tmp_path / "cache" / "bars"
+    folder.mkdir(parents=True)
+    stamps = [f"{d} 09:30:00" for d in pd.bdate_range(start, cached_to).date]
+    pd.DataFrame({"symbol": "GOOD", "timestamp": stamps, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
+                  "trade_count": 1, "vwap": 1}).to_csv(folder / f"GOOD_{start}_{cached_to}_iex_split.30min.csv",
+                                                       index=False)
+    assert rc.ensure_30min_bars(tmp_path, ["GOOD", "NEW"], start, end, fetcher=fetcher) == 2
+    assert sorted(calls) == [(["GOOD"], cached_to + timedelta(days=1), end, "iex"), (["NEW"], start, end, "iex")]
+    assert rc.ensure_30min_bars(tmp_path, ["GOOD", "NEW"], start, end, fetcher=fetcher) == 0

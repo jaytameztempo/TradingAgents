@@ -33,7 +33,7 @@ from extensions.backtest.bars import FOUR_HOUR, BarCache
 from extensions.backtest.pit import (DONE, HOLIDAY, MANIFEST, MANIFEST_VERSION, RECON_DIR, read_manifest,
                                      recon_home, saved_dates, weekdays)
 from extensions.market_data import alpaca_assets
-from extensions.market_data.alpaca_bars import fetch_4hour_bars, fetch_daily_bars
+from extensions.market_data.alpaca_bars import fetch_4hour_bars, fetch_30min_bars, fetch_daily_bars
 from extensions.regime import regime_bot
 from extensions.research import ranked_side_handoff, side_handoff
 from extensions.router import strategy_router
@@ -205,6 +205,55 @@ def ensure_4h_bars(home: str | Path, symbols: list[str], start: date, end: date,
             done += len(part)
             if progress:
                 progress(f"4-hour bars: fetched {done} of {total}")
+    return total
+
+
+THIRTY_MIN_FEED = "iex"  # squeeze_gate.BARS_FEED: the feed the live 4-hour/1-hour squeeze reads
+THIRTY_MIN_LOOKBACK = timedelta(days=120)  # squeeze_gate.BARS_LOOKBACK_DAYS before the first check
+
+
+def ensure_30min_bars(home: str | Path, symbols: list[str], start: date, end: date, *,
+                      fetcher: Callable = fetch_30min_bars, chunk: int = FOUR_HOUR_CHUNK,
+                      progress: Callable[[str], None] | None = None) -> int:
+    """Alpaca's 30-minute bars (iex, as the live squeeze reads them) for ``symbols`` from start to end, saved in the
+    live cache, for the Tradebot trigger replay. Tail-only like ``ensure_4h_bars``; logged under ``30m:<SYMBOL>``.
+    Returns how many symbols were fetched."""
+    from extensions.backtest.triggers import Bars30
+
+    home = Path(home)
+    folder = home / "cache" / "bars"
+    log_path = recon_home(home) / FETCH_LOG
+    try:
+        tried = json.loads(log_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        tried = {}
+    cached = Bars30(home)
+    groups: dict[date, list[str]] = {}
+    for s in symbols:
+        raw = cached.get(s)
+        if raw.empty:
+            frame = pd.DataFrame({"date": pd.Series([], dtype="datetime64[ns]")})
+        else:
+            frame = pd.DataFrame({"date": pd.to_datetime(raw["timestamp"]).dt.normalize().drop_duplicates()})
+            frame = frame.sort_values("date").reset_index(drop=True)
+        need = _need_from(frame, tried.get(f"30m:{s}"), start, end, trade_slack(end))
+        if need is not None:
+            groups.setdefault(need, []).append(s)
+    total = sum(len(g) for g in groups.values())
+    if progress:
+        progress(f"30-minute bars: {len(symbols) - total} of {len(symbols)} symbols cached, fetching {total}")
+    done = 0
+    for need, members in sorted(groups.items()):
+        for i in range(0, len(members), chunk):
+            part = members[i:i + chunk]
+            fetcher(part, need, end, feed=THIRTY_MIN_FEED, adjustment=ADJUSTMENT, cache_dir=folder)
+            for s in part:
+                old = tried.get(f"30m:{s}")
+                tried[f"30m:{s}"] = [min(old[0], start.isoformat()) if old else start.isoformat(), end.isoformat()]
+            _write_json(log_path, tried)
+            done += len(part)
+            if progress:
+                progress(f"30-minute bars: fetched {done} of {total}")
     return total
 
 

@@ -93,6 +93,8 @@ def test_single_date_defaults_end_to_start(client):
     {"start": AS_OF, "origins": "mars"},
     {"start": AS_OF, "max_positions": 500},
     {"start": AS_OF, "slippage_bps": 900},
+    {"start": AS_OF, "buying_power": 50_000},
+    {"start": AS_OF, "buying_power": 500_000},
 ])
 def test_bad_requests_are_400(client, params):
     assert client.get("/api/backtest", params=params).status_code == 400
@@ -238,3 +240,31 @@ def test_reconstruct_passes_the_trade_bars_flag(client, monkeypatch):
     monkeypatch.setattr(jobs.runner, "start", lambda kind, steps, group=None: started.append(steps[0].args) or Job())
     client.post("/api/backtest/reconstruct", json={"start": "2026-03-02", "trade_bars": True})
     assert "--trade-bars" in started[0]
+
+
+def test_buying_power_sets_the_basket_and_the_equity_caps_stay(client, tmp_path):
+    assert client.get("/api/backtest/defaults").json()["series_original_buying_power"] is None
+    _write(tmp_path / "tickets" / "series.json", {"series_version": 1, "original_buying_power": 393393.64,
+                                                  "recorded_at": "2026-10-15T21:48:24+00:00"})
+    assert client.get("/api/backtest/defaults").json()["series_original_buying_power"] == 393393.64
+    base = {"start": AS_OF, "end": "2026-03-06", "capital": 100_000}
+    plain = client.get("/api/backtest", params=base).json()
+    assert plain["params"]["buying_power"] == 100_000 and plain["trades"][0]["qty"] == 150  # 15% cap of 100k
+    # 2 x margin: the 23% basket is $46,000, but one name is still held to 15% of the equity
+    margin = client.get("/api/backtest", params={**base, "buying_power": 200_000}).json()
+    assert margin["params"]["buying_power"] == 200_000 and margin["trades"][0]["qty"] == 150
+
+
+def test_tradebot_entry_and_its_switches_are_passed_through(client):
+    defaults = client.get("/api/backtest/defaults").json()
+    assert set(defaults["tradebot_filters"]) == {"squeeze_release", "rsi_extreme", "light_volume", "squeeze_4h1h"}
+    assert isinstance(defaults["tradebot_expire_sessions"], int)
+    body = client.get("/api/backtest", params={"start": AS_OF, "end": "2026-03-06", "strategy": "side",
+                                               "entry_mode": "tradebot", "squeeze_4h1h": False,
+                                               "expire_sessions": 4}).json()
+    p = body["params"]
+    assert (p["entry_mode"], p["filters"]["squeeze_4h1h"], p["filters"]["rsi_extreme"], p["expire_sessions"]) == \
+           ("tradebot", False, True, 4)
+    assert body["funnel"]["replay"]["queued"] == 1 and "next_day" in body["comparison"]
+    assert {r["strategy"] for r in body["breakdown"]} <= {"long", "short", "stop_swing", "stop_invalidation"}
+    assert client.get("/api/backtest", params={"start": AS_OF, "entry_mode": "later"}).status_code == 400
