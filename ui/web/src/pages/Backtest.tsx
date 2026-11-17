@@ -7,6 +7,7 @@ import {
   BacktestSummaryRow, BacktestTrade, defaultAsOf,
 } from "../api";
 import { Card, Column, DataTable, Delta, Empty, ErrorBox, HoverTip, JobLog, RegimeBadge } from "../components/ui";
+import { Ticker } from "../components/Ticker";
 import { DASH, dateTime, money, num, signedMoney } from "../format";
 import { useJob } from "../useJob";
 
@@ -574,10 +575,11 @@ function TradesTable({ rows }: { rows: BacktestTrade[] }) {
     { key: "asof", label: "As-of", render: (t) => <HoverTip text={t.source_file}>{t.report_as_of}</HoverTip>,
       sortValue: (t) => t.report_as_of },
     { key: "bot", label: "Bot", render: (t) => BOT_LABEL[t.bot], sortValue: (t) => t.bot },
-    { key: "sym", label: "Symbol", render: (t) => <strong>{t.symbol}</strong>, sortValue: (t) => t.symbol },
+    { key: "sym", label: "Symbol", render: (t) => <strong><Ticker symbol={t.symbol} /></strong>,
+      sortValue: (t) => t.symbol },
     { key: "side", label: "Side", render: (t) => t.side },
+    { key: "qty", label: "Qty", align: "right", render: (t) => t.qty ?? DASH, sortValue: (t) => t.qty ?? 0 },
     { key: "lv", label: "Levels", render: (t) => <HoverTip text={t.detail}>{t.levels_source}</HoverTip> },
-    { key: "ref", label: "Recorded entry", align: "right", render: (t) => num(t.reference_entry) },
     { key: "ed", label: "Entry date", render: (t) => t.entry_date, sortValue: (t) => t.entry_date },
     { key: "entry", label: "Entry", align: "right", render: (t) => num(t.entry) },
     { key: "stop", label: "Stop", align: "right", render: (t) => num(t.stop) },
@@ -587,7 +589,6 @@ function TradesTable({ rows }: { rows: BacktestTrade[] }) {
     { key: "why", label: "Exit reason", render: (t) => t.exit_reason.replace(/_/g, " "),
       sortValue: (t) => t.exit_reason },
     { key: "r", label: "R", align: "right", render: (t) => r(t.r), sortValue: (t) => t.r },
-    { key: "qty", label: "Qty", align: "right", render: (t) => t.qty ?? DASH, sortValue: (t) => t.qty ?? 0 },
     { key: "notional", label: "Notional", align: "right", render: (t) => (t.notional == null ? DASH : money(t.notional)),
       sortValue: (t) => t.notional ?? 0 },
     { key: "fees", label: "Fees", align: "right", render: (t) => (t.fees ? money(t.fees) : DASH) },
@@ -674,7 +675,7 @@ function SkippedTable({ rows }: { rows: BacktestSkip[] }) {
     { key: "origin", label: "Origin", render: (s) => ORIGIN_LABEL[s.origin], sortValue: (s) => s.origin },
     { key: "asof", label: "As-of", render: (s) => s.report_as_of, sortValue: (s) => s.report_as_of },
     { key: "bot", label: "Bot", render: (s) => BOT_LABEL[s.bot], sortValue: (s) => s.bot },
-    { key: "sym", label: "Symbol", render: (s) => s.symbol, sortValue: (s) => s.symbol },
+    { key: "sym", label: "Symbol", render: (s) => <Ticker symbol={s.symbol} />, sortValue: (s) => s.symbol },
     { key: "src", label: "Source", render: (s) => <span className="muted">{s.source_file}</span> },
     { key: "why", label: "Reason", render: (s) => s.reason, sortValue: (s) => s.reason },
   ];
