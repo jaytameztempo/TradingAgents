@@ -11,6 +11,10 @@ fetched (Alpaca paper keys, ALPACA_API_KEY and ALPACA_SECRET_KEY, in the environ
 reports go to <home>/backtest/reconstructed, never to the live folders. With --fetch-fundamentals, SEC fundamentals
 missing from the cache are downloaded the way the live financials step does it (SEC_EDGAR_USER_AGENT in .env) and
 saved in the shared fundamentals cache.
+
+With --trade-bars, after rebuilding, the daily and 4-hour bars of every name a backtest of the range would trade
+(saved and rebuilt dates) are fetched from the first date to yesterday where the cache lacks them, so trades can be
+followed to their exits. Only the missing tail of each symbol is fetched.
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--all-dates", action="store_true", help="also rebuild dates that have saved files")
     parser.add_argument("--fetch-fundamentals", action="store_true",
                         help="download missing SEC fundamentals the live way (needs SEC_EDGAR_USER_AGENT; slower)")
+    parser.add_argument("--trade-bars", action="store_true",
+                        help="also fetch the daily and 4-hour bars of the names a backtest would trade, to yesterday")
     return parser
 
 
@@ -58,14 +64,41 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: need start <= end < today ({today}) and at most {MAX_RANGE_DAYS} days", file=sys.stderr)
         return EXIT_BAD_INPUT
     home = Path(args.home)
+    load_dotenv(find_dotenv(usecwd=True))
 
     dates = rc.pending_dates(home, start, end, rebuild=args.rebuild, all_dates=args.all_dates)
     if not dates:
         _log(f"nothing to rebuild from {start} to {end}: every weekday is saved or already rebuilt")
+        return _trade_bars(home, start, end, today) if args.trade_bars else EXIT_OK
+    status = _rebuild(home, dates, today, args.fetch_fundamentals)
+    if args.trade_bars and status != EXIT_BAD_INPUT:
+        trade_status = _trade_bars(home, start, end, today)
+        status = status if status != EXIT_OK else trade_status
+    return status
+
+
+def _trade_bars(home: Path, start: date, end: date, today: date) -> int:
+    """Fetch the missing daily and 4-hour bars of every name a backtest of start..end would trade, to yesterday."""
+    from extensions.backtest.engine import candidate_symbols
+
+    symbols = candidate_symbols(home, start, end)
+    fetch_end = today - timedelta(days=1)
+    _log(f"trade bars: {len(symbols)} name(s) a backtest of {start} .. {end} would trade; bars to {fetch_end}")
+    if not symbols:
         return EXIT_OK
+    try:
+        rc.ensure_bars(home, symbols, start, fetch_end, progress=_log, slack_end=rc.trade_slack(fetch_end))
+        rc.ensure_4h_bars(home, symbols, start, fetch_end, progress=_log)
+    except (MissingAlpacaKeys, *DATA_ERRORS) as exc:
+        print(f"error: fetching trade bars failed: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    _log("trade bars: done; no order placed")
+    return EXIT_OK
+
+
+def _rebuild(home: Path, dates: list[date], today: date, fetch_fundamentals: bool) -> int:
     _log(f"rebuilding {len(dates)} date(s): {dates[0]} .. {dates[-1]}")
 
-    load_dotenv(find_dotenv(usecwd=True))
     try:
         snapshot = rc.newest_snapshot(home)
         from extensions.market_data import alpaca_assets
@@ -81,8 +114,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: fetching daily bars failed: {exc}", file=sys.stderr)
         return EXIT_FAILED
 
-    ctx = rc.build_context(home, rc.master_frame(frames), log=_log, fetch_fundamentals=args.fetch_fundamentals)
-    _log(f"SEC fundamentals: {'download missing files' if args.fetch_fundamentals else 'cached files only'}")
+    ctx = rc.build_context(home, rc.master_frame(frames), log=_log, fetch_fundamentals=fetch_fundamentals)
+    _log(f"SEC fundamentals: {'download missing files' if fetch_fundamentals else 'cached files only'}")
     manifest = rc.read_manifest(home)
     failed = 0
     for i, as_of in enumerate(dates, 1):

@@ -58,6 +58,22 @@ def test_backtest_returns_trades_summary_and_curve(client):
     side = {(row["origin"], row["strategy"]): row for row in body["summary"]}[("replay", "side")]
     assert side["trades"] == 1 and side["win_rate"] == 100.0
     assert body["curve"][0]["replay"] == 100.0 and body["curve"][-1]["replay"] > 100.0
+    assert body["params"]["capital"] == 100_000.0
+    # live sizing: one name gets min(23% basket, 15% name cap) = $15,000 -> 150 shares at the 100 limit
+    assert (trade["sizing"], trade["qty"], trade["entry"]) == ("live", 150, 100.0)
+    assert trade["pnl_usd"] == round(150 * (trade["exit"] - trade["entry"]), 2)
+    assert side["total_return_usd"] == trade["pnl_usd"]
+
+
+def test_capital_sets_the_dollar_figures(client):
+    body = client.get("/api/backtest", params={"start": AS_OF, "end": "2026-03-06", "capital": 20000,
+                                               "risk_pct": 2}).json()
+    [trade] = body["trades"]
+    assert body["params"]["capital"] == 20000 and trade["qty"] == 30  # 15% of $20,000 at 100
+    fixed = client.get("/api/backtest", params={"start": AS_OF, "end": "2026-03-06", "capital": 20000,
+                                                "risk_pct": 2, "sizing": "fixed"}).json()["trades"][0]
+    assert fixed["qty"] == int(400 // fixed["risk_per_share"])  # 2% of $20,000 at risk a share
+    assert fixed["pnl_usd"] == round(fixed["qty"] * (fixed["exit"] - fixed["entry"]), 2)
 
 
 def test_single_date_defaults_end_to_start(client):
@@ -72,6 +88,11 @@ def test_single_date_defaults_end_to_start(client):
     {"start": AS_OF, "timeframe": "1m"},
     {"start": AS_OF, "max_sessions": 0},
     {"start": AS_OF, "risk_pct": 50},
+    {"start": AS_OF, "capital": 10},
+    {"start": AS_OF, "sizing": "huge"},
+    {"start": AS_OF, "origins": "mars"},
+    {"start": AS_OF, "max_positions": 500},
+    {"start": AS_OF, "slippage_bps": 900},
 ])
 def test_bad_requests_are_400(client, params):
     assert client.get("/api/backtest", params=params).status_code == 400
@@ -144,3 +165,76 @@ def test_hold_to_exit_is_passed_through(client):
     assert body["params"]["hold_to_exit"] is True
     [trade] = body["trades"]
     assert trade["exit_reason"] == "target" and trade["sessions_held"] == 2  # past the 1-session limit
+
+
+def test_save_list_open_export_and_delete_a_run(client, tmp_path):
+    saved = client.post("/api/backtest/runs", json={"start": AS_OF, "end": "2026-03-06", "name": "Side test",
+                                                    "capital": 50000}).json()
+    assert saved["name"] == "Side test" and saved["trades"] == 1 and saved["params"]["capital"] == 50000
+    assert list((tmp_path / "backtest" / "runs").glob("*.json")) == [tmp_path / "backtest" / "runs" /
+                                                                     f"{saved['id']}.json"]
+    assert [r["id"] for r in client.get("/api/backtest/runs").json()] == [saved["id"]]
+
+    run = client.get(f"/api/backtest/runs/{saved['id']}").json()
+    [trade] = run["result"]["trades"]
+    assert trade["symbol"] == "AAA" and trade["qty"] == 75  # 15% of $50,000 at 100
+
+    js = client.get(f"/api/backtest/runs/{saved['id']}/export", params={"format": "json"})
+    assert js.headers["content-type"].startswith("application/json")
+    assert 'filename="backtest_Side-test_' in js.headers["content-disposition"]
+    assert js.json()["result"]["trades"] == run["result"]["trades"]
+
+    trades = client.get(f"/api/backtest/runs/{saved['id']}/export", params={"format": "trades_csv"})
+    assert trades.headers["content-type"].startswith("text/csv")
+    header, row = trades.text.strip().splitlines()
+    assert header.startswith("origin,run_date,bot,symbol") and ",AAA," in row
+    summary = client.get(f"/api/backtest/runs/{saved['id']}/export", params={"format": "summary_csv"}).text
+    assert "total_return_usd,total_return_usd_ex_best,max_drawdown_pct,peak_positions" in summary.splitlines()[0]
+    assert client.get(f"/api/backtest/runs/{saved['id']}/export", params={"format": "xml"}).status_code == 400
+
+    renamed = client.put(f"/api/backtest/runs/{saved['id']}", json={"name": "Renamed"}).json()
+    assert renamed["name"] == "Renamed" and client.get("/api/backtest/runs").json()[0]["name"] == "Renamed"
+    assert client.put(f"/api/backtest/runs/{saved['id']}", json={"name": ""}).status_code == 422
+
+    assert client.delete(f"/api/backtest/runs/{saved['id']}").json() == {"deleted": saved["id"]}
+    assert client.get("/api/backtest/runs").json() == []
+    assert client.get(f"/api/backtest/runs/{saved['id']}").status_code == 404
+
+
+def test_saving_a_bad_run_is_refused_and_ids_cannot_leave_the_runs_folder(client):
+    assert client.post("/api/backtest/runs", json={"start": AS_OF, "risk_pct": 50}).status_code == 400
+    assert client.get("/api/backtest/runs").json() == []
+    for bad in ("..%2Fsettings", "20260302T220000Z-zzzzzz", "nope"):
+        assert client.get(f"/api/backtest/runs/{bad}").status_code == 404
+        assert client.delete(f"/api/backtest/runs/{bad}").status_code in (404, 405)
+
+
+def test_default_name_describes_the_run(client):
+    saved = client.post("/api/backtest/runs", json={"start": AS_OF, "strategy": "side"}).json()
+    assert saved["name"] == f"{AS_OF} to {AS_OF} · side"
+
+
+def test_origins_filter_and_new_settings_are_passed_through(client):
+    body = client.get("/api/backtest", params={"start": AS_OF, "end": "2026-03-06", "origins": "reconstructed",
+                                               "slippage_bps": 5, "commission_per_share": 0.01,
+                                               "max_positions": 3}).json()
+    p = body["params"]
+    assert (p["origins"], p["include_reconstructed"], p["slippage_bps"], p["commission_per_share"],
+            p["max_positions"], p["max_gross_pct"], p["max_open_risk_pct"]) == ("reconstructed", True, 5, 0.01, 3,
+                                                                                60.0, 8.0)
+    assert body["trades"] == [] and {r["origin"] for r in body["summary"]} == {"reconstructed"}
+    assert any("Starting capital" in a for a in body["assumptions"])
+
+
+def test_reconstruct_passes_the_trade_bars_flag(client, monkeypatch):
+    from ui.server import jobs
+
+    started = []
+
+    class Job:
+        def summary(self):
+            return {"id": "j3"}
+
+    monkeypatch.setattr(jobs.runner, "start", lambda kind, steps, group=None: started.append(steps[0].args) or Job())
+    client.post("/api/backtest/reconstruct", json={"start": "2026-03-02", "trade_bars": True})
+    assert "--trade-bars" in started[0]

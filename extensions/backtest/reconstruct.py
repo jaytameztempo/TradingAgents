@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from extensions.backtest.bars import BarCache
+from extensions.backtest.bars import FOUR_HOUR, BarCache
 from extensions.backtest.pit import (DONE, HOLIDAY, MANIFEST, MANIFEST_VERSION, RECON_DIR, read_manifest,
                                      recon_home, saved_dates, weekdays)
 from extensions.market_data import alpaca_assets
@@ -87,7 +87,14 @@ def stamp_for(as_of: date) -> datetime:
 SLACK_START, SLACK_END = timedelta(days=7), timedelta(days=5)  # weekends and holidays at either edge
 
 
-def _need_from(frame: pd.DataFrame, attempt: list[str] | None, start: date, end: date) -> date | None:
+def trade_slack(end: date) -> timedelta:
+    """Trade bars must reach the last weekday on or before ``end`` (a holiday costs one small fetch, then the fetch
+    log covers it), so a cache ending even one session short is extended."""
+    return timedelta(days=max(end.weekday() - 4, 0))
+
+
+def _need_from(frame: pd.DataFrame, attempt: list[str] | None, start: date, end: date,
+               slack_end: timedelta = SLACK_END) -> date | None:
     """The first date to fetch for one symbol, or None when the cache (or an earlier attempt) already covers
     start..end. A symbol whose history already reaches back to start (or was already tried back to start) only
     needs the days after what it holds, so a later end date fetches a short tail, not the whole range again."""
@@ -103,14 +110,15 @@ def _need_from(frame: pd.DataFrame, attempt: list[str] | None, start: date, end:
     reached = max(d for d in (last, tried_to) if d is not None) if (last or tried_to) else None
     if reached is None:
         return start
-    if reached >= end - SLACK_END:
+    if reached >= end - slack_end:
         return None
     return reached + timedelta(days=1)
 
 
 def ensure_bars(home: str | Path, symbols: list[str], start: date, end: date, *,
                 fetcher: Callable = fetch_daily_bars, chunk: int = funnel.BAR_CHUNK,
-                progress: Callable[[str], None] | None = None) -> dict[str, pd.DataFrame]:
+                progress: Callable[[str], None] | None = None,
+                slack_end: timedelta = SLACK_END) -> dict[str, pd.DataFrame]:
     """Daily bars for ``symbols`` from start to end, saving what is fetched in the live cache. Only what the cache
     lacks is fetched: the whole range for a symbol with no history back to start, else only the days after its last
     cached bar; a range already tried (``fetch_log.json``) is not fetched again. Returns the cached and fetched bars
@@ -125,7 +133,7 @@ def ensure_bars(home: str | Path, symbols: list[str], start: date, end: date, *,
     frames = {s: cache.raw_daily(s) for s in symbols}
     groups: dict[date, list[str]] = {}
     for s in symbols:
-        need = _need_from(frames[s], tried.get(s), start, end)
+        need = _need_from(frames[s], tried.get(s), start, end, slack_end)
         if need is not None:
             groups.setdefault(need, []).append(s)
     total = sum(len(g) for g in groups.values())
@@ -152,6 +160,52 @@ def ensure_bars(home: str | Path, symbols: list[str], start: date, end: date, *,
             if progress:
                 progress(f"daily bars: fetched {done} of {total}")
     return frames
+
+
+FOUR_HOUR_CHUNK = 50
+
+
+def ensure_4h_bars(home: str | Path, symbols: list[str], start: date, end: date, *,
+                   fetcher: Callable = fetch_4hour_bars, chunk: int = FOUR_HOUR_CHUNK,
+                   progress: Callable[[str], None] | None = None) -> int:
+    """Regular-session 4-hour bars for ``symbols`` from start to end, saved in the live cache, so a backtest on
+    4-hour bars can follow a trade past the date its symbol was last scanned. Only what the cache lacks is fetched
+    (as ``ensure_bars``: the days after the last cached bar when the history reaches back to start); ranges already
+    tried are logged under ``4h:<SYMBOL>`` in ``fetch_log.json``. Returns how many symbols were fetched."""
+    home = Path(home)
+    cache = BarCache(home)
+    log_path = recon_home(home) / FETCH_LOG
+    try:
+        tried = json.loads(log_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        tried = {}
+    groups: dict[date, list[str]] = {}
+    for s in symbols:
+        raw = cache._read(s, FOUR_HOUR)
+        if raw.empty or "date" not in raw.columns:
+            frame = pd.DataFrame({"date": pd.Series([], dtype="datetime64[ns]")})
+        else:
+            frame = pd.DataFrame({"date": pd.to_datetime(raw["date"]).drop_duplicates().sort_values()})
+            frame = frame.reset_index(drop=True)
+        need = _need_from(frame, tried.get(f"4h:{s}"), start, end, trade_slack(end))
+        if need is not None:
+            groups.setdefault(need, []).append(s)
+    total = sum(len(g) for g in groups.values())
+    if progress:
+        progress(f"4-hour bars: {len(symbols) - total} of {len(symbols)} symbols cached, fetching {total}")
+    done = 0
+    for need, members in sorted(groups.items()):
+        for i in range(0, len(members), chunk):
+            part = members[i:i + chunk]
+            fetcher(part, need, end, feed=FEED, adjustment=ADJUSTMENT, cache_dir=cache.folder)
+            for s in part:
+                old = tried.get(f"4h:{s}")
+                tried[f"4h:{s}"] = [min(old[0], start.isoformat()) if old else start.isoformat(), end.isoformat()]
+            _write_json(log_path, tried)
+            done += len(part)
+            if progress:
+                progress(f"4-hour bars: fetched {done} of {total}")
+    return total
 
 
 def master_frame(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:

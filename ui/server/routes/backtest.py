@@ -2,16 +2,19 @@
 
 GET /api/backtest reads files and cached bars and returns the results. GET /api/backtest/coverage says which dates
 are saved, rebuilt or missing. POST /api/backtest/reconstruct starts the rebuild job (run_backtest_reconstruct),
-which fetches missing daily bars and writes rebuilt reports under backtest/reconstructed. Nothing here places an order.
+which fetches missing daily bars and writes rebuilt reports under backtest/reconstructed. /api/backtest/runs saves a
+backtest result under backtest/runs, lists, opens, renames, exports (JSON or CSV) and deletes saved runs. Nothing here
+places an order.
 """
 
 from __future__ import annotations
 
 from datetime import date
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Response
+from pydantic import BaseModel, Field
 
+from extensions.backtest import runs
 from extensions.backtest.engine import MAX_RANGE_DAYS, BacktestInputError, coverage, run_backtest
 from ui.server import jobs, paths
 from ui.server.routes import common
@@ -29,15 +32,46 @@ def _range(start: str, end: str | None) -> tuple[date, date]:
     return first, last
 
 
+class Settings(BaseModel):
+    """The backtest settings (GET /api/backtest takes them as query parameters, POST /runs as JSON)."""
+    start: str
+    end: str | None = None
+    strategy: str = "all"
+    timeframe: str = "daily"
+    max_sessions: int = 10
+    risk_pct: float = 1.0
+    include_reconstructed: bool = True
+    hold_to_exit: bool = False
+    capital: float = 100_000.0
+    origins: str | None = None  # both, replay or reconstructed (default from include_reconstructed)
+    sizing: str = "live"  # live or fixed
+    max_positions: int | None = None  # None: the sizing mode's default (live: the guard's)
+    max_gross_pct: float | None = None
+    max_open_risk_pct: float | None = None
+    slippage_bps: float = 0.0
+    commission_per_share: float = 0.0
+
+
 @router.get("")
 def backtest(start: str, end: str | None = None, strategy: str = "all", timeframe: str = "daily",
              max_sessions: int = 10, risk_pct: float = 1.0, include_reconstructed: bool = True,
-             hold_to_exit: bool = False) -> dict:
-    first, last = _range(start, end)
+             hold_to_exit: bool = False, capital: float = 100_000.0, origins: str | None = None,
+             sizing: str = "live", max_positions: int | None = None, max_gross_pct: float | None = None,
+             max_open_risk_pct: float | None = None, slippage_bps: float = 0.0,
+             commission_per_share: float = 0.0) -> dict:
+    return _run(Settings(**{k: v for k, v in locals().items()}))
+
+
+def _run(q: Settings) -> dict:
+    first, last = _range(q.start, q.end)
     try:
-        return run_backtest(paths.data_home(), first, last, strategy=strategy, timeframe=timeframe,
-                            max_sessions=max_sessions, risk_pct=risk_pct, include_reconstructed=include_reconstructed,
-                            hold_to_exit=hold_to_exit)
+        return run_backtest(paths.data_home(), first, last, strategy=q.strategy, timeframe=q.timeframe,
+                            max_sessions=q.max_sessions, risk_pct=q.risk_pct,
+                            include_reconstructed=q.include_reconstructed, hold_to_exit=q.hold_to_exit,
+                            capital=q.capital, origins=q.origins, sizing_mode=q.sizing,
+                            max_positions=q.max_positions, max_gross_pct=q.max_gross_pct,
+                            max_open_risk_pct=q.max_open_risk_pct, slippage_bps=q.slippage_bps,
+                            commission_per_share=q.commission_per_share)
     except BacktestInputError as exc:
         raise common.bad_request(str(exc)) from None
 
@@ -54,6 +88,7 @@ class Reconstruct(BaseModel):
     rebuild: bool = False  # rebuild dates that were already rebuilt
     all_dates: bool = False  # also rebuild dates that have saved files, to compare
     fetch_fundamentals: bool = False  # download missing SEC fundamentals the live way (slower)
+    trade_bars: bool = False  # also fetch the daily and 4-hour bars of the names a backtest would trade
 
 
 @router.post("/reconstruct")
@@ -69,4 +104,61 @@ def reconstruct(body: Reconstruct) -> dict:
         args.append("--all-dates")
     if body.fetch_fundamentals:
         args.append("--fetch-fundamentals")
+    if body.trade_bars:
+        args.append("--trade-bars")
     return common.start("backtest_reconstruct", [jobs.Step("run_backtest_reconstruct", args)], group="backtest")
+
+
+class SaveRun(Settings):
+    """The backtest settings to run and save (the same as GET /api/backtest), and an optional name."""
+    name: str = Field("", max_length=runs.MAX_NAME)
+
+
+class Rename(BaseModel):
+    name: str = Field(..., min_length=1, max_length=runs.MAX_NAME)
+
+
+@router.get("/runs")
+def list_runs() -> list[dict]:
+    return runs.list_runs(paths.data_home())
+
+
+@router.post("/runs")
+def save_run(body: SaveRun) -> dict:
+    result = _run(Settings(**body.model_dump(exclude={"name"})))
+    return runs.save_run(paths.data_home(), result, body.name)
+
+
+def _load(run_id: str) -> dict:
+    try:
+        return runs.load_run(paths.data_home(), run_id)
+    except runs.RunNotFound:
+        raise HTTPException(status_code=404, detail="no such saved run") from None
+
+
+@router.get("/runs/{run_id}")
+def get_run(run_id: str) -> dict:
+    return _load(run_id)
+
+
+@router.put("/runs/{run_id}")
+def rename_run(run_id: str, body: Rename) -> dict:
+    _load(run_id)
+    return runs.rename_run(paths.data_home(), run_id, body.name)
+
+
+@router.get("/runs/{run_id}/export")
+def export_run(run_id: str, format: str = "json") -> Response:
+    run = _load(run_id)
+    try:
+        body, media, name = runs.export_run(run, format)
+    except ValueError as exc:
+        raise common.bad_request(str(exc)) from None
+    return Response(body, media_type=media, headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@router.delete("/runs/{run_id}")
+def delete_run(run_id: str) -> dict:
+    _load(run_id)
+    runs.delete_run(paths.data_home(), run_id)
+    return {"deleted": run_id}

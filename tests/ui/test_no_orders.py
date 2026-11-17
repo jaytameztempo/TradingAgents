@@ -75,10 +75,12 @@ def test_live_keys_are_refused():
 
 
 @pytest.mark.unit
-def test_backtest_reads_by_get_and_only_the_rebuild_job_is_a_post():
+def test_backtest_reads_by_get_and_writes_only_the_rebuild_job_and_saved_runs():
     backtest_paths = {p: set(ops) for p, ops in app.openapi()["paths"].items() if p.startswith("/api/backtest")}
     assert backtest_paths == {"/api/backtest": {"get"}, "/api/backtest/coverage": {"get"},
-                              "/api/backtest/reconstruct": {"post"}}
+                              "/api/backtest/reconstruct": {"post"}, "/api/backtest/runs": {"get", "post"},
+                              "/api/backtest/runs/{run_id}": {"get", "put", "delete"},
+                              "/api/backtest/runs/{run_id}/export": {"get"}}
 
 
 @pytest.mark.unit

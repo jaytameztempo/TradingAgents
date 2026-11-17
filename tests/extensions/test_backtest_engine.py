@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from extensions.backtest import pit
+from extensions.backtest import pit, sizing
 from extensions.backtest.bars import BarCache
 from extensions.backtest.engine import BacktestInputError, run_backtest
 from extensions.backtest.levels import Plan, side_plan_from_handoff, trend_plan_for
@@ -157,7 +157,7 @@ def test_side_levels_are_the_paper_ticket_levels(tmp_path):
     _route(tmp_path, "SIDE")
     ch = _channel(tmp_path, ["AAA"])
     _side_handoff(tmp_path, ["AAA"], ch)
-    # D1 opens 100.5; D2 reaches the 105 midline.
+    # D1 opens 100.5 and dips to 99.8: the DAY limit at support 100 fills; D2 reaches the 105 midline.
     _bars(tmp_path, "AAA", _flat_then([(100.5, 102, 99.8, 101), (101, 105.5, 100.5, 105)]))
     trade = run_backtest(tmp_path, D0, strategy="side")["trades"][0]
     expected = plan_ticket("AAA", "long", 100.0, 2.0, 105.0,
@@ -165,9 +165,10 @@ def test_side_levels_are_the_paper_ticket_levels(tmp_path):
     assert (trade["stop"], trade["target"], trade["reference_entry"]) == \
            (expected["stop"], expected["target"], expected["entry"]) == (95.99, 105.0, 100.0)
     assert trade["levels_source"] == "recorded"
-    assert (trade["entry_date"], trade["entry"]) == (str(D1), 100.5)
+    assert (trade["entry_date"], trade["entry"], trade["entry_type"]) == (str(D1), 100.0, "limit")
+    assert trade["stop"] == round(100.0 - expected["stop_offset"], 2)  # the stop is set from the fill
     assert (trade["exit_reason"], trade["exit"]) == ("target", 105.0)
-    assert trade["r"] == round(4.5 / (100.5 - 95.99), 3)
+    assert trade["r"] == round(5.0 / 4.01, 3)
 
 
 def test_side_falls_back_to_the_handoff_invalidation_without_a_stop_swing():
@@ -273,7 +274,7 @@ def test_four_hour_bars_enter_on_the_first_bar_of_the_next_session(tmp_path):
     pd.DataFrame(rows, columns=["symbol", "timestamp", "date", "open", "high", "low", "close", "volume",
                                 "source_bars"]).to_csv(path, index=False)
     trade = run_backtest(tmp_path, D0, strategy="side", timeframe="4h")["trades"][0]
-    assert (trade["entry"], trade["exit_reason"], trade["sessions_held"]) == (100.5, "target", 1)
+    assert (trade["entry"], trade["exit_reason"], trade["sessions_held"]) == (100.0, "target", 1)
 
 
 def test_one_position_a_symbol_a_bot(tmp_path):
@@ -304,14 +305,17 @@ def test_overlapping_bar_files_merge_with_the_later_range_winning(tmp_path):
 def test_summary_and_curve():
     def t(bot, r, exit_date, reason="target", origin="replay"):
         return {"bot": bot, "r": r, "exit_date": exit_date, "entry_date": "2026-03-03", "symbol": bot + exit_date,
-                "exit_reason": reason, "origin": origin}
+                "exit_reason": reason, "origin": origin, "pnl_usd": r * 1000, "risk_dollars": 1000.0}
     trades = [t("side", 2.0, "2026-03-04"), t("side", -1.0, "2026-03-05"), t("up", 0.5, "2026-03-06"),
               t("up", 9.0, "2026-03-07", "open_at_end"), t("side", 3.0, "2026-03-05", origin="reconstructed")]
-    rows, curve = summarize(trades, 1.0, D0, origins=("replay", "reconstructed"))
+    rows, curve = summarize(trades, 100_000, D0, origins=("replay", "reconstructed"))
     by = {(r["origin"], r["strategy"]): r for r in rows}
     every = by[("replay", "all")]
     assert (every["trades"], every["open"], every["wins"], every["win_rate"], every["avg_r"]) == (3, 1, 2, 66.67, 0.5)
     assert every["total_return_pct"] == 1.5
+    assert every["total_return_usd"] == 1500.0  # the closed trades' P/L; the open trade is left out
+    assert (every["total_r_ex_best"], every["total_return_usd_ex_best"]) == (-0.5, -500.0)
+    assert (every["peak_positions"], every["peak_open_risk_pct"]) == (4, 4.0)  # the open one was held too
     assert every["max_drawdown_pct"] == round(1 / 102 * 100, 3)
     assert by[("reconstructed", "all")]["total_r"] == 3.0  # never added to the replay figures
     assert [p["replay"] for p in curve] == [100.0, 102.0, 101.0, 101.5]
@@ -325,6 +329,8 @@ def test_bad_inputs_are_refused(tmp_path):
         run_backtest(tmp_path, D0, strategy="moon")
     with pytest.raises(BacktestInputError):
         run_backtest(tmp_path, D0, timeframe="1m")
+    with pytest.raises(BacktestInputError):
+        run_backtest(tmp_path, D0, capital=0)
 
 
 def test_the_real_data_folder_is_never_written(tmp_path):
@@ -365,3 +371,193 @@ def test_a_held_open_trade_keeps_its_symbol_held(tmp_path):
     # with the default 10-session limit the first trade closes on time and the second one trades
     limited = run_backtest(tmp_path, D0, date(2026, 3, 16), strategy="side")
     assert [t["exit_reason"] for t in limited["trades"]] == ["time", "time"]
+
+
+# --- the SIDE limit entry ------------------------------------------------------------------
+
+SIDE_PLAN = Plan(bot="side", symbol="AAA", side="long", stop=96.0, target=105.0, levels_source="recorded",
+                 reference_entry=100.0, stop_offset=4.0)
+
+
+def test_the_side_limit_fills_at_the_line_or_a_better_open_and_sets_the_stop_from_the_fill():
+    better = simulate(SIDE_PLAN, _frame([(99.0, 100.5, 98.5, 100)]), D0, 10, entry_limit=100.0)
+    assert (better["entry"], better["stop"], better["entry_type"]) == (99.0, 95.0, "limit")
+    at_line = simulate(SIDE_PLAN, _frame([(101.0, 101.5, 99.5, 100.5)]), D0, 10, entry_limit=100.0)
+    assert (at_line["entry"], at_line["stop"]) == (100.0, 96.0)
+    with pytest.raises(Skip, match="limit 100 not reached in 1 session"):
+        simulate(SIDE_PLAN, _frame([(101, 103, 100.5, 102), (100, 101, 99, 100)]), D0, 10, entry_limit=100.0)
+
+
+def test_a_bar_filled_inside_at_the_limit_counts_the_stop_but_not_the_target():
+    reached_target = simulate(SIDE_PLAN, _frame([(101, 106, 99.5, 105)]), D0, 10, entry_limit=100.0)
+    assert reached_target["exit_reason"] == "open_at_end"  # which came first inside the bar is unknown
+    stopped = simulate(SIDE_PLAN, _frame([(101, 106, 95.5, 96)]), D0, 10, entry_limit=100.0)
+    assert (stopped["exit_reason"], stopped["exit"]) == ("stop", 96.0)
+
+
+# --- slippage and fees ---------------------------------------------------------------------
+
+def test_slippage_moves_market_prices_against_the_trade_and_fees_come_off_the_dollars():
+    trade = simulate(LONG_PLAN, _frame([(100, 101, 99, 100), (96, 96, 94, 95)]), D0, 10, slippage_bps=10)
+    assert trade["entry"] == 100.1 and trade["exit"] == round(95.0 * 0.999, 4)
+    assert trade["r"] == round((95.0 * 0.999 - 100.1) / (100.1 - 95.0), 3)
+    target = simulate(LONG_PLAN, _frame([(100, 111, 99, 110)]), D0, 10, slippage_bps=10)
+    assert target["exit"] == 110.0  # a target fill gets none
+    money = sizing.dollars(trade, 100, 0.01)
+    assert money["fees"] == 2.0 and money["pnl_usd"] == round(100 * (trade["exit"] - trade["entry"]) - 2.0, 2)
+
+
+# --- live sizing ---------------------------------------------------------------------------
+
+def _names(*pairs):
+    return [{"key": s, "symbol": s, "side": "long", "entry": e, "risk_per_share": r} for s, e, r in pairs]
+
+
+def test_live_basket_is_the_tradebot_allocation_split_and_capped():
+    qty, why, info = sizing.live_basket(_names(("A", 100.0, 1.0), ("B", 100.0, 1.0)), 100_000, 1.0, 8_000)
+    assert qty == {"A": 115, "B": 115} and info["allocation"] == 23_000.0  # 23% / 2
+    one, _, info = sizing.live_basket(_names(("A", 100.0, 1.0)), 100_000, 1.0, 8_000)
+    assert one == {"A": 150} and info["name_notional"] == 15_000.0  # the 15% name cap, not 23%
+    calm, _, _ = sizing.live_basket(_names(("A", 100.0, 1.0), ("B", 100.0, 1.0)), 100_000, 0.7, 8_000)
+    assert calm == {"A": 80, "B": 80}  # 16,100 / 2
+    none, why, _ = sizing.live_basket(_names(("A", 100.0, 1.0)), 100_000, 0.2, 8_000)
+    assert none == {} and "under the floor" in why["A"]
+    scaled, _, info = sizing.live_basket(_names(("A", 100.0, 10.0), ("B", 100.0, 10.0)), 100_000, 1.0, 1_000)
+    assert scaled == {"A": 50, "B": 50} and info["book_scale"] < 1  # 2,300 of stop-risk held to 1,000
+    full, why, _ = sizing.live_basket(_names(("A", 100.0, 1.0)), 100_000, 1.0, 0)
+    assert full == {} and "already fills" in why["A"]
+
+
+def test_the_guard_checks_held_symbols_positions_and_gross_in_order():
+    def pos(symbol, notional=1_000.0, risk=100.0):
+        return {"symbol": symbol, "entry_date": "2026-03-03", "exit_date": "2026-03-10", "notional": notional,
+                "risk_dollars": risk}
+    limits = sizing.Limits(max_positions=15, max_gross_pct=60, max_open_risk_pct=8)
+    book = sizing.Book(100_000, [pos("AAA")])
+    assert sizing.guard_reason(book, limits, "AAA", "2026-03-04", 1_000, 10).startswith("already holding AAA")
+    assert sizing.guard_reason(book, limits, "AAA", "2026-03-11", 1_000, 10) is None  # exited by then
+    full = sizing.Book(100_000, [pos(f"S{i}") for i in range(15)])
+    assert "15 positions already open" in sizing.guard_reason(full, limits, "NEW", "2026-03-04", 1_000, 10)
+    heavy = sizing.Book(100_000, [pos("BIG", notional=55_000)])
+    assert "gross exposure would be 65.0%" in sizing.guard_reason(heavy, limits, "NEW", "2026-03-04", 10_000, 10)
+    risky = sizing.Book(100_000, [pos("RSK", risk=7_900)])
+    assert "open stop-risk" in sizing.guard_reason(risky, limits, "NEW", "2026-03-04", 1_000, 200)
+
+
+def test_fixed_risk_is_held_to_the_capital_and_marked_capped():
+    assert sizing.fixed_quantity(100_000, 3, 0.15, 30.23) == (3307, True)  # 20,000 shares wanted
+    assert sizing.fixed_quantity(100_000, 1, 4.0, 100.0) == (250, False)
+
+
+def _handoff(home, names, stamp=STAMP, as_of=D0):
+    """names: (symbol, side, rank, line, other line, invalidation); no channel report, so the stop is the
+    handoff's invalidation and the limit is the line."""
+    entries = {}
+    for symbol, side, rank, line, other, inval in names:
+        support, resistance = (line, other) if side == "long" else (other, line)
+        entries[symbol] = {"side": side, "status": "PLAN", "rank": rank,
+                           "levels": {"support": support, "resistance": resistance,
+                                      "midline": round((support + resistance) / 2, 4), "atr_14": 2.0,
+                                      "invalidation": inval}}
+    _json(home / "handoffs" / f"ranked_side_handoff_{as_of}_{stamp}.json", {
+        "as_of": str(as_of), "long_channel_report": None, "short_channel_report": None, "names": entries})
+
+
+LONG_FILL = (100.5, 102, 99.8, 101)  # reaches the 100 support limit, never the 105 midline
+SHORT_FILL = (109.5, 110.2, 108, 109)  # reaches the 110 resistance limit, never the 105 midline
+
+
+def test_live_baskets_go_in_rank_order_long_before_short_and_the_guard_skips_the_last(tmp_path):
+    _route(tmp_path, "SIDE")
+    _handoff(tmp_path, [("LB", "long", 2, 100.0, 110.0, 99.5), ("SB", "short", 2, 110.0, 100.0, 110.5),
+                        ("LA", "long", 1, 100.0, 110.0, 99.5), ("SA", "short", 1, 110.0, 100.0, 110.5)])
+    for s in ("LA", "LB"):
+        _bars(tmp_path, s, _flat_then([LONG_FILL] * 5))
+    for s in ("SA", "SB"):
+        _bars(tmp_path, s, _flat_then([SHORT_FILL] * 5))
+    result = run_backtest(tmp_path, D0, strategy="side", max_positions=3)
+    assert [t["symbol"] for t in result["trades"]] == ["LA", "SA", "LB"]
+    assert [t["qty"] for t in result["trades"]] == [57, 52, 57]  # 23,000 / 4 = 5,750 at 100 and 110
+    [skip] = [s for s in result["skipped"] if s["symbol"] == "SB"]
+    assert skip["reason"] == "3 positions already open; the limit is 3"
+    every = {(r["origin"], r["strategy"]): r for r in result["summary"]}[("replay", "all")]
+    assert every["peak_positions"] == 3
+    assert all(t["calm_scale_fallback"] for t in result["trades"])  # no SPY / QQQ bars cached here
+    assert result["calm_scale_fallback_dates"] == [str(D0)]
+
+
+def test_the_book_room_shrinks_by_positions_still_open_from_earlier_days(tmp_path):
+    _route(tmp_path, "SIDE")
+    _handoff(tmp_path, [("LA", "long", 1, 100.0, 110.0, 99.5)])
+    _route(tmp_path, "SIDE", as_of=D1, stamp="20260303T220000Z")
+    _handoff(tmp_path, [("LZ", "long", 1, 100.0, 110.0, 99.5)], stamp="20260303T220000Z", as_of=D1)
+    _bars(tmp_path, "LA", _flat_then([LONG_FILL] * 6))
+    _bars(tmp_path, "LZ", _flat_then([LONG_FILL] * 6))
+    result = run_backtest(tmp_path, D0, D1, strategy="side", max_open_risk_pct=0.1)  # $100 of stop-risk
+    first, second = result["trades"]
+    assert (first["symbol"], first["qty"], first["risk_dollars"]) == ("LA", 150, 75.0)  # 0.5 a share
+    assert (second["symbol"], second["qty"]) == ("LZ", 50)  # room 100 - 75 = 25 -> 150 x 25/75
+
+
+def test_fixed_mode_has_no_limits_by_default(tmp_path):
+    _route(tmp_path, "SIDE")
+    _handoff(tmp_path, [(f"L{chr(64 + i)}", "long", i, 100.0, 110.0, 99.5) for i in range(1, 18)])
+    for i in range(1, 18):
+        _bars(tmp_path, f"L{chr(64 + i)}", _flat_then([LONG_FILL] * 3))
+    result = run_backtest(tmp_path, D0, strategy="side", sizing_mode="fixed", risk_pct=0.1)
+    assert len(result["trades"]) == 17 and result["params"]["max_positions"] == 0
+    assert {t["qty"] for t in result["trades"]} == {200}  # $100 / 0.5
+
+
+def test_bars_that_stop_early_are_bars_end_not_open_at_end(tmp_path):
+    _route(tmp_path, "SIDE")
+    _handoff(tmp_path, [("FULL", "long", 1, 100.0, 110.0, 99.5), ("CUT", "long", 2, 100.0, 110.0, 99.5)])
+    _bars(tmp_path, "FULL", _flat_then([LONG_FILL] * 12))
+    _bars(tmp_path, "CUT", _flat_then([LONG_FILL] * 2))
+    result = run_backtest(tmp_path, D0, strategy="side", hold_to_exit=True)
+    reasons = {t["symbol"]: t["exit_reason"] for t in result["trades"]}
+    assert reasons == {"FULL": "open_at_end", "CUT": "bars_end"}
+    every = {(r["origin"], r["strategy"]): r for r in result["summary"]}[("replay", "all")]
+    assert (every["trades"], every["open"], every["bars_end"]) == (0, 1, 1)
+
+
+# --- the Oct-Nov regression: the AMLX short ------------------------------------------------
+
+def _bars_4h(home, symbol, rows):
+    """rows: (date, time, open, high, low, close)."""
+    path = home / "cache" / "bars" / f"{symbol}_2026-01-01_2026-12-31_sip_split.4h_rth.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([(symbol, f"{d} {t}", str(d), o, h, lo, c, 1000, 8) for d, t, o, h, lo, c in rows],
+                 columns=["symbol", "timestamp", "date", "open", "high", "low", "close", "volume",
+                          "source_bars"]).to_csv(path, index=False)
+
+
+def test_live_sizing_removes_the_amlx_style_outsized_position(tmp_path):
+    """The 2026-11-04 basket of the saved Oct 14 - Nov 13 run: AMLX short at resistance 30.00 (invalidation
+    30.3768, midline 28.10), opening at 30.23 and falling to 28.10, with that day's other four names. At 3% fixed
+    risk the old run bought 20,000 shares ($604k, +$42,600)."""
+    as_of, nxt, stamp = date(2026, 11, 4), date(2026, 11, 5), "20261104T210000Z"
+    _route(tmp_path, "SIDE", as_of=as_of, stamp=stamp)
+    _handoff(tmp_path, [("PBF", "long", 1, 71.9, 82.73, 71.07), ("AMLX", "short", 1, 30.0, 26.2, 30.3768),
+                        ("ECHO", "short", 2, 100.9, 82.73, 101.5), ("HYMC", "short", 3, 17.8, 14.88, 18.2),
+                        ("QS", "short", 4, 4.51, 3.82, 4.5757)], stamp=stamp, as_of=as_of)
+    before = [(as_of, "13:30:00", 30, 30.1, 29.8, 30)]
+    _bars_4h(tmp_path, "AMLX", before + [(nxt, "09:30:00", 30.23, 30.30, 29.5, 29.6),
+                                         (nxt, "13:30:00", 29.6, 29.7, 28.05, 28.1)])
+    for sym, line in (("PBF", 71.9), ("ECHO", 100.9), ("HYMC", 17.8), ("QS", 4.51)):
+        _bars_4h(tmp_path, sym, [(as_of, "13:30:00", line, line, line, line),
+                                 (nxt, "09:30:00", line, line * 1.001, line * 0.999, line)])
+
+    old = run_backtest(tmp_path, as_of, strategy="side", timeframe="4h", hold_to_exit=True, sizing_mode="fixed",
+                       risk_pct=3.0)
+    [fixed] = [t for t in old["trades"] if t["symbol"] == "AMLX"]
+    assert (fixed["entry"], fixed["stop"], fixed["exit_reason"]) == (30.23, 30.61, "target")  # stop from the fill
+    assert fixed["capped"] and fixed["qty"] == 3307 and fixed["notional"] <= 100_000  # 7,894 wanted, held to capital
+    assert fixed["outlier"]  # 5.6R
+
+    live = run_backtest(tmp_path, as_of, strategy="side", timeframe="4h", hold_to_exit=True)
+    [amlx] = [t for t in live["trades"] if t["symbol"] == "AMLX"]
+    assert amlx["qty"] == 153  # $23,000 / 5 names = $4,600 at the 30.00 limit
+    assert amlx["notional"] <= 15_000 and amlx["calm_scale_fallback"]
+    assert amlx["pnl_usd"] == round(153 * (30.23 - 28.1), 2) < 1_000  # was $42,600
+    assert max(t["notional"] for t in live["trades"]) <= 15_000

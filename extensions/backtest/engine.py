@@ -8,52 +8,88 @@ Each weekday in the range has one source:
 
 For an as-of date A, each kind of file used is the newest one with as-of A written within MAX_REPORT_AGE_DAYS of A
 (same-week re-runs count, much later re-runs are ignored). A signal from a file is acted on the day that file was
-written (its New York date): the regime label is the newest route visible that day, and entry is the open of the next
-session. The trades:
-1. SIDEBot: the PLAN names of the side handoff (ranked first); with no handoff, the pivot-confirmed channel report.
+written (its New York date): the regime label is the newest route visible that day. The trades:
+1. SIDEBot: the PLAN names of the side handoff (ranked first), long and short together in rank order (long #1,
+   short #1, ...); with no handoff, the pivot-confirmed channel report. Entry: a DAY limit at the channel line.
 2. UPBot / DOWNBot: the route's ``up_passed`` / ``down_passed`` (levels from its basket), and the trend handoff.
+   Entry: the next session's open.
 3. The live regime rule: UPBot only on UP, DOWNBot only on DOWN, SIDEBot only on SIDE.
-4. One position a symbol a bot, within each origin. The two origins are never merged.
+4. Each file's names are one basket, sized as ``sizing.py`` says (live by default), then held to the guard's limits
+   in order; one position a symbol at a time, within each origin. The two origins are never merged.
 Levels per ``levels.py``; the trade per ``simulate.py``.
 """
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
-from extensions.backtest import pit
+import pandas as pd
+
+from extensions.backtest import pit, sizing
 from extensions.backtest.bars import DAILY, TIMEFRAMES, BarCache
 from extensions.backtest.levels import LONG, RULES, SHORT, LevelsError, Plan, side_plan_from_channel, \
     side_plan_from_handoff, trend_plan_for
-from extensions.backtest.simulate import BOTS, Skip, simulate, summarize
+from extensions.backtest.simulate import BARS_END, BOTS, OPEN_AT_END, Skip, simulate, summarize
+from extensions.status import confirmation
+from extensions.status.paper_tickets import _rank_order
 
 STRATEGIES = ("all", *BOTS)
 REPLAY, RECONSTRUCTED = "replay", "reconstructed"
 ORIGINS = (REPLAY, RECONSTRUCTED)
+ORIGIN_CHOICES = {"both": ORIGINS, REPLAY: (REPLAY,), RECONSTRUCTED: (RECONSTRUCTED,)}
 BOT_REGIME = {"up": "UP", "down": "DOWN", "side": "SIDE"}
 BOT_SIDE = {"up": LONG, "down": SHORT}
 MAX_REPORT_AGE_DAYS = 10  # a file counts for its as-of only if written within this many days; routes as labels too
 MAX_RANGE_DAYS = 366
 MAX_SESSIONS = 60
+MIN_CAPITAL, MAX_CAPITAL = 1_000, 1_000_000_000
+ENTRY_SESSIONS = 1  # a SIDE limit is a DAY order
+BARS_END_SESSIONS = 2  # bars stopping more than this many sessions before the data end: bars_end, not open_at_end
 
 CAVEATS = {
-    REPLAY: "Replayed dates use the files the pipeline saved, under the rules of the code that ran then, entering the "
+    REPLAY: "Replayed dates use the files the pipeline saved, under the rules of the code that ran then, acting the "
             "session after each file was actually written.",
-    RECONSTRUCTED: "Rebuilt dates run today's pipeline code on bars up to the as-of date, entering the next session's "
-                   "open. Not point in time: the universe and borrow flags come from today's asset snapshot "
+    RECONSTRUCTED: "Rebuilt dates run today's pipeline code on bars up to the as-of date, acting the next session. "
+                   "Not point in time: the universe and borrow flags come from today's asset snapshot "
                    "(survivorship), the spread gate is not applied, fundamentals are today's cached SEC files (facts "
                    "filed by the as-of date; missing ones are downloaded only when SEC download is on), and an "
                    "unmapped sector makes the side handoff unranked.",
 }
+ASSUMPTIONS = [
+    "Starting capital stands in for equity, buying power and the series' original buying power on every day; "
+    "there is no compounding.",
+    "Live sizing follows the Tradebot ticketing and the sender's guard (23% basket x calm scale, 5% floor, equal "
+    "split capped at 15% a name, 8% book stop-risk, 15 positions, 60% gross). The older daily paper-ticket path "
+    "(no 15% cap, 8% per basket only) is not what is modelled.",
+    "The guard's daily-loss and drawdown stops are not simulated; the book's stop-risk uses each position's risk "
+    "at its fill, not the current price.",
+    "The live daily confirmation filters and the earnings blackout are not applied: every PLAN name is a ticket.",
+    "UP and DOWN enter at the next session's open; the Tradebot's trend tickets use a limit at min(close, SMA20) "
+    "(max for a short).",
+    "One basket per source file and run date shares one allocation.",
+]
 
 
 class BacktestInputError(ValueError):
     """The request cannot run (bad dates, strategy, timeframe or numbers)."""
 
 
+@dataclass(frozen=True)
+class Config:
+    mode: str = sizing.LIVE
+    risk_pct: float = 1.0
+    capital: float = 100_000.0
+    limits: sizing.Limits = sizing.Limits()
+    slippage_bps: float = 0.0
+    commission_per_share: float = 0.0
+    collect_only: bool = False  # list the symbols that would be simulated, simulate nothing
+
+
 def _check(start: date, end: date, strategy: str, timeframe: str, max_sessions: int | None,
-           risk_pct: float) -> None:
+           risk_pct: float, capital: float = 100_000.0) -> None:
     if end < start:
         raise BacktestInputError("end date is before start date")
     if (end - start).days >= MAX_RANGE_DAYS:
@@ -66,6 +102,26 @@ def _check(start: date, end: date, strategy: str, timeframe: str, max_sessions: 
         raise BacktestInputError(f"max sessions must be 1 to {MAX_SESSIONS}")
     if not 0 < risk_pct <= 5:
         raise BacktestInputError("risk per trade must be above 0 and at most 5 (%)")
+    if not MIN_CAPITAL <= capital <= MAX_CAPITAL:
+        raise BacktestInputError(f"starting capital must be ${MIN_CAPITAL:,} to ${MAX_CAPITAL:,}")
+
+
+def _check_more(sizing_mode: str, origins: str, limits: sizing.Limits, slippage_bps: float,
+                commission_per_share: float) -> None:
+    if sizing_mode not in sizing.SIZINGS:
+        raise BacktestInputError(f"sizing must be one of {', '.join(sizing.SIZINGS)}")
+    if origins not in ORIGIN_CHOICES:
+        raise BacktestInputError(f"origins must be one of {', '.join(ORIGIN_CHOICES)}")
+    if not 0 <= limits.max_positions <= 200:
+        raise BacktestInputError("max open positions must be 0 (no limit) to 200")
+    if not 0 <= limits.max_gross_pct <= 400:
+        raise BacktestInputError("max gross exposure must be 0 (no limit) to 400 (%)")
+    if not 0 <= limits.max_open_risk_pct <= 100:
+        raise BacktestInputError("max open stop-risk must be 0 (no limit) to 100 (%)")
+    if not 0 <= slippage_bps <= 500:
+        raise BacktestInputError("slippage must be 0 to 500 bps")
+    if not 0 <= commission_per_share <= 1:
+        raise BacktestInputError("commission must be $0 to $1 a share")
 
 
 def coverage(home: str | Path, start: date, end: date) -> list[dict]:
@@ -92,24 +148,37 @@ def coverage(home: str | Path, start: date, end: date) -> list[dict]:
 
 
 class _Source:
-    """One file a signal comes from, and the bot / side it feeds."""
+    """One file a signal comes from, and the bot / side it feeds (side "both" for a side handoff)."""
 
     def __init__(self, bot: str, side: str, saved: pit.Saved, kind: str):
         self.bot, self.side, self.saved, self.kind = bot, side, saved, kind
+
+
+@dataclass
+class _Name:
+    """One name of a basket, in rank order."""
+    symbol: str
+    bot: str
+    side: str
+    make_plan: object
+    note: str = ""
 
 
 class _Pass:
     """One origin's replay over one data home."""
 
     def __init__(self, origin: str, home: Path, dates: list[date], bots: tuple[str, ...], cache: BarCache,
-                 timeframe: str, max_sessions: int | None):
-        self.origin, self.dates, self.bots = origin, dates, bots
+                 timeframe: str, max_sessions: int | None, cfg: Config):
+        self.origin, self.dates, self.bots, self.cfg = origin, dates, bots, cfg
         self.lib = pit.Library(home)
         self.cache, self.timeframe, self.max_sessions = cache, timeframe, max_sessions
-        self.held_until: dict[tuple[str, str], str] = {}
+        self.book = sizing.Book(cfg.capital)
         self.trades: list[dict] = []
         self.skipped: list[dict] = []
         self.days: list[dict] = []
+        self.symbols: set[str] = set()
+        self.calm_fallback: set[str] = set()
+        self._index_daily: pd.DataFrame | None = None
 
     def run(self) -> None:
         sources: list[_Source] = []
@@ -124,7 +193,7 @@ class _Pass:
                 "sources": [{"bot": s.bot, "side": s.side, "file": s.saved.path.name,
                              "known_on": s.saved.known_on.isoformat()} for s in found],
             })
-        # Act in the order the files were written, so "one position a symbol" runs forward in time.
+        # Act in the order the files were written, so the book runs forward in time.
         sources.sort(key=lambda s: (s.saved.known_on, s.saved.created_at, s.bot, s.side))
         for source in sources:
             self._act(source)
@@ -148,10 +217,10 @@ class _Pass:
         out: list[_Source] = []
         if "side" in self.bots:
             handoff = self._pick("side_handoff", as_of)
-            for side, kind in ((LONG, "long_channel"), (SHORT, "short_channel")):
-                if handoff is not None:
-                    out.append(_Source("side", side, handoff, "handoff"))
-                else:
+            if handoff is not None:
+                out.append(_Source("side", "both", handoff, "handoff"))
+            else:
+                for side, kind in ((LONG, "long_channel"), (SHORT, "short_channel")):
                     channel = self._pick(kind, as_of, pit.pivot_confirmed)
                     if channel is not None:
                         out.append(_Source("side", side, channel, "channel"))
@@ -166,7 +235,7 @@ class _Pass:
                 out.append(_Source(bot, BOT_SIDE[bot], trend, "trend_handoff"))
         return out
 
-    # --- acting on one file ----------------------------------------------------------------
+    # --- one file: its basket --------------------------------------------------------------
 
     def _act(self, source: _Source) -> None:
         run_date = source.saved.known_on
@@ -174,62 +243,150 @@ class _Pass:
         if route is not None and (run_date - route.as_of).days > MAX_REPORT_AGE_DAYS:
             route = None
         label = str(route.data.get("regime_label") or "") if route else None
-        saved, bot, side, data = source.saved, source.bot, source.side, source.saved.data
+        saved, bot, data = source.saved, source.bot, source.saved.data
+        names: list[_Name] = []
 
         if source.kind == "handoff":
-            report = self.lib.referenced("scanbot", data.get(f"{side}_channel_report"), run_date)
-            for symbol, entry in (data.get("names") or {}).items():
-                if entry.get("status") == "PLAN" and _handoff_side(entry) == side:
-                    self._candidate(run_date, bot, symbol, label, saved,
-                                    lambda s=symbol, e=entry: side_plan_from_handoff(s, side, e,
-                                                                                    report and report.data))
+            entries = data.get("names") or {}
+            allowed = {LONG: [], SHORT: []}
+            for symbol, entry in entries.items():
+                if entry.get("status") == "PLAN":
+                    allowed[_handoff_side(entry)].append(symbol)
+            reports = {side: self.lib.referenced("scanbot", data.get(f"{side}_channel_report"), run_date)
+                       for side in (LONG, SHORT)}
+            for symbol, side in _rank_order(allowed, entries):
+                report = reports[side]
+                names.append(_Name(symbol, bot, side, lambda s=symbol, sd=side, e=entries[symbol], r=report:
+                                   side_plan_from_handoff(s, sd, e, r and r.data)))
         elif source.kind == "channel":
+            side = source.side
             for symbol in data.get("members") or []:
-                self._candidate(run_date, bot, symbol, label, saved,
-                                lambda s=symbol: side_plan_from_channel(s, side, data),
-                                note="no handoff; channel report levels")
+                names.append(_Name(symbol, bot, side, lambda s=symbol: side_plan_from_channel(s, side, data),
+                                   "no handoff; channel report levels"))
         elif source.kind == "route":
+            side = source.side
             basket = self.lib.referenced("baskets", data.get("basket_file" if bot == "up" else "down_basket_file"),
                                          run_date)
             members = {m.get("ticker"): m.get("metrics") for m in (basket.data.get("members") or [])} if basket else {}
             as_of = basket.as_of if basket else saved.as_of
             for symbol in data.get("up_passed" if bot == "up" else "down_passed") or []:
-                self._candidate(run_date, bot, symbol, label, saved,
-                                lambda s=symbol: trend_plan_for(bot, s, side, members.get(s), self._daily(s), as_of))
+                names.append(_Name(symbol, bot, side, lambda s=symbol: trend_plan_for(bot, s, side, members.get(s),
+                                                                                     self._daily(s), as_of)))
         else:  # trend handoff (4-hour confirmed)
+            side = source.side
             for symbol, entry in (data.get("names") or {}).items():
                 if entry.get("side") != BOT_REGIME[bot]:
                     continue
                 if entry.get("delisted"):
                     self._skip(run_date, bot, symbol, saved, f"delisted after {entry['delisted'].get('after')}")
                     continue
-                self._candidate(run_date, bot, symbol, label, saved,
-                                lambda s=symbol: trend_plan_for(bot, s, side, None, self._daily(s), saved.as_of),
-                                note="4-hour confirmed")
+                names.append(_Name(symbol, bot, side, lambda s=symbol: trend_plan_for(bot, s, side, None,
+                                                                                     self._daily(s), saved.as_of),
+                                   "4-hour confirmed"))
+        self._basket(run_date, saved, label, names)
 
-    def _candidate(self, run_date: date, bot: str, symbol: str, label: str | None, source: pit.Saved, make_plan,
-                   note: str = "") -> None:
-        if label is None:
-            return self._skip(run_date, bot, symbol, source, "no route visible on this date: no regime label")
-        if label != BOT_REGIME[bot]:
-            return self._skip(run_date, bot, symbol, source, f"regime {label} does not match {BOT_REGIME[bot]}")
-        try:
-            plan: Plan = make_plan()
-        except LevelsError as exc:
-            return self._skip(run_date, bot, symbol, source, f"no levels: {exc}")
-        bars = self.cache.bars(symbol, self.timeframe)
-        try:
-            trade = simulate(plan, bars, run_date, self.max_sessions)
-        except Skip as exc:
-            word = "4-hour " if self.timeframe != DAILY else ""
-            return self._skip(run_date, bot, symbol, source, str(exc).replace("cached bars", f"cached {word}bars"))
-        held = self.held_until.get((bot, symbol))
-        if held is not None and trade["entry_date"] <= held:
-            return self._skip(run_date, bot, symbol, source, f"already holding {symbol} until {held}")
-        self.held_until[(bot, symbol)] = trade["exit_date"]
-        self.trades.append({"origin": self.origin, "run_date": run_date.isoformat(), "source_file": source.path.name,
-                            "report_as_of": source.as_of.isoformat(), "known_on": source.known_on.isoformat(),
-                            "note": note, **trade})
+    def _basket(self, run_date: date, source: pit.Saved, label: str | None, names: list[_Name]) -> None:
+        planned = []  # (name, plan, bars, planned entry, planned risk per share)
+        for n in names:
+            if label is None:
+                self._skip(run_date, n.bot, n.symbol, source, "no route visible on this date: no regime label")
+                continue
+            if label != BOT_REGIME[n.bot]:
+                self._skip(run_date, n.bot, n.symbol, source, f"regime {label} does not match {BOT_REGIME[n.bot]}")
+                continue
+            try:
+                plan: Plan = n.make_plan()
+            except LevelsError as exc:
+                self._skip(run_date, n.bot, n.symbol, source, f"no levels: {exc}")
+                continue
+            if self.cfg.collect_only:
+                self.symbols.add(n.symbol)
+                continue
+            bars = self.cache.bars(n.symbol, self.timeframe)
+            if not (bars["session"] > run_date).any():
+                word = "4-hour " if self.timeframe != DAILY else ""
+                self._skip(run_date, n.bot, n.symbol, source, f"no cached {word}bars after {run_date}")
+                continue
+            entry, risk = self._planned(plan, run_date)
+            if not (entry and risk and risk > 0):
+                self._skip(run_date, n.bot, n.symbol, source,
+                           f"the close on {run_date} ({entry}) is already past the stop {plan.stop:g}")
+                continue
+            planned.append((n, plan, bars, entry, risk))
+        if not planned:
+            return
+
+        qty_by, why_by, info, fallback = {}, {}, {}, False
+        if self.cfg.mode == sizing.LIVE:
+            scale, readings, fallback = sizing.calm_scale_for(self._indexes(), run_date)
+            if fallback:
+                self.calm_fallback.add(run_date.isoformat())
+            day = min(str(b[b["session"] > run_date]["session"].iloc[0]) for _, _, b, _, _ in planned)
+            limit = self.cfg.limits.max_open_risk_pct
+            room = self.cfg.capital * limit / 100 - self.book.open_risk(day) if limit else math.inf
+            qty_by, why_by, info = sizing.live_basket(
+                [{"key": n.symbol, "symbol": n.symbol, "side": n.side, "entry": e, "risk_per_share": r}
+                 for n, _, _, e, r in planned], self.cfg.capital, scale, room)
+
+        for n, plan, bars, _, _ in planned:
+            if n.symbol in why_by:
+                self._skip(run_date, n.bot, n.symbol, source, why_by[n.symbol])
+                continue
+            entry_limit = plan.reference_entry if n.bot == "side" else None
+            try:
+                trade = simulate(plan, bars, run_date, self.max_sessions, entry_limit=entry_limit,
+                                 entry_sessions=ENTRY_SESSIONS, slippage_bps=self.cfg.slippage_bps)
+            except Skip as exc:
+                word = "4-hour " if self.timeframe != DAILY else ""
+                self._skip(run_date, n.bot, n.symbol, source, str(exc).replace("cached bars", f"cached {word}bars"))
+                continue
+            capped = False
+            if self.cfg.mode == sizing.LIVE:
+                qty = qty_by[n.symbol]
+            else:
+                qty, capped = sizing.fixed_quantity(self.cfg.capital, self.cfg.risk_pct, trade["risk_per_share"],
+                                                    trade["entry"])
+                if qty < 1:
+                    self._skip(run_date, n.bot, n.symbol, source,
+                               f"no whole share fits {self.cfg.risk_pct:g}% risk at {trade['risk_per_share']:g} "
+                               "a share")
+                    continue
+            money = sizing.dollars(trade, qty, self.cfg.commission_per_share)
+            why = sizing.guard_reason(self.book, self.cfg.limits, n.symbol, trade["entry_date"], money["notional"],
+                                      money["risk_dollars"])
+            if why is not None:
+                self._skip(run_date, n.bot, n.symbol, source, why)
+                continue
+            record = {"origin": self.origin, "run_date": run_date.isoformat(), "source_file": source.path.name,
+                      "report_as_of": source.as_of.isoformat(), "known_on": source.known_on.isoformat(),
+                      "note": n.note, **trade, **money, "sizing": self.cfg.mode, "capped": capped,
+                      "calm_scale": info.get("calm_scale"), "calm_scale_fallback": fallback,
+                      "notional_limit": info.get("name_notional")}
+            self.trades.append(record)
+            self.book.positions.append(record)
+
+    def _planned(self, plan: Plan, run_date: date) -> tuple[float | None, float | None]:
+        """(entry, risk per share) at ticket time: the limit for SIDE; the run date's close for UP / DOWN."""
+        sign = 1 if plan.side == LONG else -1
+        if plan.reference_entry is not None:
+            return plan.reference_entry, plan.stop_offset or round(sign * (plan.reference_entry - plan.stop), 4)
+        daily = self._daily(plan.symbol)
+        upto = daily[daily["session"] <= run_date]
+        if upto.empty:
+            return None, None
+        close = round(float(upto["close"].iloc[-1]), 4)
+        return close, round(sign * (close - plan.stop), 4)
+
+    def _indexes(self) -> pd.DataFrame:
+        if self._index_daily is None:
+            parts = []
+            for symbol in confirmation.INDEXES:
+                bars = self.cache.bars(symbol, DAILY)
+                if not bars.empty:
+                    parts.append(pd.DataFrame({"symbol": symbol, "date": pd.to_datetime(bars["session"]),
+                                               "high": bars["high"], "low": bars["low"], "close": bars["close"]}))
+            self._index_daily = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+        return self._index_daily
 
     def _skip(self, run_date: date, bot: str, symbol: str, source: pit.Saved, reason: str) -> None:
         self.skipped.append({"origin": self.origin, "run_date": run_date.isoformat(), "bot": bot, "symbol": symbol,
@@ -247,36 +404,88 @@ def _handoff_side(entry: dict) -> str:
     return SHORT if str(entry.get("setup") or "").upper().startswith("SHORT") else LONG
 
 
-def run_backtest(home: str | Path, start: date, end: date | None = None, strategy: str = "all",
-                 timeframe: str = DAILY, max_sessions: int = 10, risk_pct: float = 1.0,
-                 include_reconstructed: bool = True, hold_to_exit: bool = False) -> dict:
-    """The backtest as a JSON-ready dict: params, rules, coverage, summary, curve, trades, skipped, days."""
-    end = end or start
-    _check(start, end, strategy, timeframe, max_sessions, risk_pct)
-    held = None if hold_to_exit else max_sessions  # None: no time exit, only the stop or the target
-    home = Path(home)
+def _relabel_bars_end(trades: list[dict], cache: BarCache, timeframe: str) -> str | None:
+    """Mark open_at_end trades whose bars stop more than BARS_END_SESSIONS before the data end as bars_end. Returns
+    the data end (the latest bar among the symbols the run loaded)."""
+    ends = [f["session"].iloc[-1] for (_, tf), f in cache._frames.items() if tf == timeframe and not f.empty]
+    if not ends:
+        return None
+    data_end = max(ends)
+    for t in trades:
+        if t["exit_reason"] == OPEN_AT_END:
+            gap = len(pd.bdate_range(t["exit_date"], data_end)) - 1
+            if gap > BARS_END_SESSIONS:
+                t["exit_reason"] = BARS_END
+    return data_end.isoformat()
+
+
+def _passes(home: Path, start: date, end: date, strategy: str, timeframe: str, held: int | None, cfg: Config,
+            origins: tuple[str, ...], cache: BarCache) -> tuple[list[dict], list[_Pass]]:
     bots = BOTS if strategy == "all" else (strategy,)
     cover = coverage(home, start, end)
     by_status: dict[str, list[date]] = {}
     for row in cover:
         by_status.setdefault(row["status"], []).append(date.fromisoformat(row["date"]))
-
-    cache = BarCache(home)
-    passes = [_Pass(REPLAY, home, by_status.get("saved", []), bots, cache, timeframe, held)]
-    if include_reconstructed:
+    passes = []
+    if REPLAY in origins:
+        passes.append(_Pass(REPLAY, home, by_status.get("saved", []), bots, cache, timeframe, held, cfg))
+    if RECONSTRUCTED in origins:
         passes.append(_Pass(RECONSTRUCTED, pit.recon_home(home), by_status.get("reconstructed", []), bots, cache,
-                            timeframe, held))
+                            timeframe, held, cfg))
     for p in passes:
         p.run()
+    return cover, passes
+
+
+def candidate_symbols(home: str | Path, start: date, end: date, strategy: str = "all",
+                      origins: tuple[str, ...] = ORIGINS) -> list[str]:
+    """Every symbol a backtest of the range would simulate (regime matched, levels made), for fetching their bars."""
+    _, passes = _passes(Path(home), start, end, strategy, DAILY, None, Config(collect_only=True), origins,
+                        BarCache(home))
+    return sorted({s for p in passes for s in p.symbols})
+
+
+def run_backtest(home: str | Path, start: date, end: date | None = None, strategy: str = "all",
+                 timeframe: str = DAILY, max_sessions: int = 10, risk_pct: float = 1.0,
+                 include_reconstructed: bool = True, hold_to_exit: bool = False, capital: float = 100_000.0, *,
+                 origins: str | None = None, sizing_mode: str = sizing.LIVE, max_positions: int | None = None,
+                 max_gross_pct: float | None = None, max_open_risk_pct: float | None = None,
+                 slippage_bps: float = 0.0, commission_per_share: float = 0.0) -> dict:
+    """The backtest as a JSON-ready dict: params, rules, coverage, summary, curve, trades, skipped, days.
+    ``origins`` is both, replay or reconstructed (default from ``include_reconstructed``). Limits left as None take
+    the sizing mode's defaults (live: the guard's; fixed: none)."""
+    end = end or start
+    origins = origins or ("both" if include_reconstructed else REPLAY)
+    defaults = sizing.LIVE_LIMITS if sizing_mode == sizing.LIVE else sizing.FIXED_LIMITS
+    limits = sizing.Limits(
+        max_positions=int(defaults["max_positions"] if max_positions is None else max_positions),
+        max_gross_pct=float(defaults["max_gross_pct"] if max_gross_pct is None else max_gross_pct),
+        max_open_risk_pct=float(defaults["max_open_risk_pct"] if max_open_risk_pct is None else max_open_risk_pct))
+    _check(start, end, strategy, timeframe, max_sessions, risk_pct, capital)
+    _check_more(sizing_mode, origins, limits, slippage_bps, commission_per_share)
+    held = None if hold_to_exit else max_sessions  # None: no time exit, only the stop or the target
+    home = Path(home)
+    cfg = Config(mode=sizing_mode, risk_pct=risk_pct, capital=capital, limits=limits, slippage_bps=slippage_bps,
+                 commission_per_share=commission_per_share)
+    cache = BarCache(home)
+    chosen = ORIGIN_CHOICES[origins]
+    cover, passes = _passes(home, start, end, strategy, timeframe, held, cfg, chosen, cache)
     trades = [t for p in passes for t in p.trades]
-    origins = tuple(p.origin for p in passes)
-    summary, curve = summarize(trades, risk_pct, start, bots, origins)
+    data_end = _relabel_bars_end(trades, cache, timeframe)
+    bots = BOTS if strategy == "all" else (strategy,)
+    summary, curve = summarize(trades, capital, start, bots, tuple(p.origin for p in passes))
     return {
         "params": {"start": start.isoformat(), "end": end.isoformat(), "strategy": strategy, "timeframe": timeframe,
-                   "max_sessions": max_sessions, "hold_to_exit": hold_to_exit, "risk_pct": risk_pct, "max_report_age_days": MAX_REPORT_AGE_DAYS,
-                   "include_reconstructed": include_reconstructed},
+                   "max_sessions": max_sessions, "hold_to_exit": hold_to_exit, "risk_pct": risk_pct,
+                   "capital": capital, "max_report_age_days": MAX_REPORT_AGE_DAYS,
+                   "include_reconstructed": RECONSTRUCTED in chosen, "origins": origins, "sizing": sizing_mode,
+                   "max_positions": limits.max_positions, "max_gross_pct": limits.max_gross_pct,
+                   "max_open_risk_pct": limits.max_open_risk_pct, "slippage_bps": slippage_bps,
+                   "commission_per_share": commission_per_share, "data_end": data_end},
         "rules": RULES,
-        "caveats": CAVEATS,
+        "caveats": {o: CAVEATS[o] for o in chosen},
+        "assumptions": ASSUMPTIONS,
+        "calm_scale_fallback_dates": sorted({d for p in passes for d in p.calm_fallback}),
         "coverage": cover,
         "summary": summary,
         "curve": curve,
@@ -285,3 +494,4 @@ def run_backtest(home: str | Path, start: date, end: date | None = None, strateg
         "days": [d for p in passes for d in p.days],
         "warnings": [w for p in passes for w in p.lib.warnings],
     }
+

@@ -322,3 +322,42 @@ def test_a_later_end_date_fetches_only_the_tail(tmp_path):
     assert calls[1] == (["GOOD"], first_end + timedelta(days=1), later_end)  # the tail only
     assert frames["GOOD"]["date"].iloc[-1].date() == later_end
     assert frames["GOOD"]["date"].iloc[0].date() == start
+
+
+def test_four_hour_trade_bars_fetch_only_the_missing_tail(tmp_path):
+    calls = []
+
+    def fetcher(symbols, start, end, **kwargs):
+        calls.append((list(symbols), start, end))
+        return pd.DataFrame(columns=FOUR_HOUR_COLUMNS)
+
+    start, cached_to, end = date(2026, 6, 1), date(2026, 10, 14), date(2026, 11, 13)
+    folder = tmp_path / "cache" / "bars"
+    folder.mkdir(parents=True)
+    days = pd.bdate_range(start, cached_to).date
+    pd.DataFrame([("CAVA", f"{d} 09:30:00", str(d), 50, 51, 49, 50, 1, 8) for d in days],
+                 columns=FOUR_HOUR_COLUMNS).to_csv(folder / f"CAVA_{start}_{cached_to}_sip_split.4h_rth.csv",
+                                                   index=False)
+    assert rc.ensure_4h_bars(tmp_path, ["CAVA", "NEW"], start, end, fetcher=fetcher) == 2
+    assert sorted(calls) == [(["CAVA"], cached_to + timedelta(days=1), end), (["NEW"], start, end)]
+    assert rc.ensure_4h_bars(tmp_path, ["CAVA", "NEW"], start, end, fetcher=fetcher) == 0  # logged: not again
+    assert len(calls) == 2
+
+
+def test_trade_bars_extend_a_cache_that_ends_a_few_sessions_short(tmp_path):
+    calls = []
+
+    def fetcher(symbols, start, end, **kwargs):
+        calls.append((list(symbols), start, end))
+        return pd.DataFrame(columns=FOUR_HOUR_COLUMNS)
+
+    start, cached_to, end = date(2026, 7, 1), date(2026, 11, 10), date(2026, 11, 15)  # a Tuesday; end a Sunday
+    folder = tmp_path / "cache" / "bars"
+    folder.mkdir(parents=True)
+    pd.DataFrame([("BJRI", f"{d} 09:30:00", str(d), 55, 56, 54, 55, 1, 8) for d in pd.bdate_range(start, cached_to).date],
+                 columns=FOUR_HOUR_COLUMNS).to_csv(folder / f"BJRI_{start}_{cached_to}_sip_split.4h_rth.csv",
+                                                   index=False)
+    assert rc.ensure_4h_bars(tmp_path, ["BJRI"], start, end, fetcher=fetcher) == 1
+    assert calls == [(["BJRI"], cached_to + timedelta(days=1), end)]
+    # one session short of Friday is still fetched; a cache reaching Friday is enough for a Sunday end
+    assert rc.trade_slack(date(2026, 11, 15)) == timedelta(days=2) and rc.trade_slack(date(2026, 11, 12)) == timedelta(0)

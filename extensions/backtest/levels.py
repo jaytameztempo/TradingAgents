@@ -42,12 +42,26 @@ RULES = {
              "(long), or last confirmed swing high + 1.0 x ATR14, snapped to .01/.51 (short); target = entry +/- 2R; "
              "skipped when the risk at the fill is over 3 x ATR14. Swing and ATR from the basket when recorded, else "
              "from cached daily bars ending on the report's as-of.",
-    "fill": "Entry at the open of the first session after the run date (first 4-hour bar on 4-hour bars). Skipped if "
-            "that open is already past the stop or the target.",
-    "exit": "Stop or target, whichever the bars reach first; both in one bar counts as the stop. A gap past a level "
-            "fills at the open. Otherwise the close of the last allowed session (max sessions held); with hold until "
-            "stop or target there is no time exit, and a trade that reaches neither before the bars end is open "
-            "at the end. No partial fills, slippage or fees.",
+    "fill": "SIDEBot, as live: a DAY limit at the channel line (support long, resistance short) in the first "
+            "session after the run date; an open through the limit fills at the open, a bar reaching it fills at "
+            "the limit, otherwise no trade. The stop is then the plan's stop offset from the fill (stop_for_fill). "
+            "UPBot / DOWNBot: the first bar's open after the run date. Skipped if the fill is already past the stop "
+            "or the target.",
+    "sizing": "Live (default), as the Tradebot ticketing and the sender's guard: the basket (each file's names on "
+              "its run date) gets 23% of capital x 0.7 when SPY and QQQ ADX(14) are both under 15 (5% floor), split "
+              "equally and capped at 15% of capital a name, floor(dollars / limit) whole shares, scaled so the "
+              "book's stop-risk stays within 8% of capital; then, name by name in rank order (long #1, short #1, "
+              "...), a symbol already held, a 16th position or gross exposure over 60% is skipped. Fixed risk %: "
+              "floor(capital x risk % / risk per share at the fill), held to a position value of at most the "
+              "capital (marked capped). Dollars are whole shares x the price move, less fees. Starting capital "
+              "stands in for equity and buying power; no compounding.",
+    "exit": "Stop or target, whichever the bars reach first; both in one bar counts as the stop, and on a bar "
+            "filled at the limit only the stop counts. A gap past a level fills at the open. Otherwise the close of "
+            "the last allowed session (max sessions held); with hold until stop or target there is no time exit: a "
+            "trade that reaches neither is open at the end, or bars ended when its bars stop more than 2 sessions "
+            "before the data end; both are left out of the figures. Slippage (bps) applies to opens, stops, gaps "
+            "and marks, not to limit or target fills; commission is charged a share on both sides. No partial "
+            "fills.",
     "point_in_time": "A file counts on a run date only if it was written (New York date) on or before it; the newest "
                      "visible file of each kind is used, and a report is acted on once.",
 }
@@ -72,6 +86,7 @@ class Plan:
     target_r: float | None = None
     max_risk: float | None = None
     detail: str = ""
+    stop_offset: float | None = None  # SIDE: the stop's distance from the limit entry; the stop is set from the fill
 
 
 def _price(value) -> bool:
@@ -84,7 +99,7 @@ def side_plan(symbol: str, side: str, line, atr, midline, swing, *, source: str)
     except ValueError as exc:
         raise LevelsError(str(exc)) from None
     return Plan(bot="side", symbol=symbol, side=side, stop=t["stop"], target=t["target"], levels_source="recorded",
-                reference_entry=t["entry"], atr=atr,
+                reference_entry=t["entry"], atr=atr, stop_offset=t["stop_offset"],
                 detail=f"{source}: {t['line']} {t['channel_level']:g}, stop swing {t['stop_swing']:g} "
                        f"({t['stop_swing_date']}), midline {t['midline']:g}")
 
@@ -105,8 +120,12 @@ def side_plan_from_handoff(symbol: str, side: str, entry: dict, channel_report: 
                 or not sign * (mid - line) > 0:
             raise first from None
         word = "support" if side == LONG else "resistance"
+        entry = round(line, 2)
+        offset = round(sign * (entry - round(stop, 2)), 2)
+        if not offset > 0:
+            raise first from None
         return Plan(bot="side", symbol=symbol, side=side, stop=round(stop, 2), target=round(mid, 2),
-                    levels_source="recorded", reference_entry=round(line, 2), atr=levels.get("atr_14"),
+                    levels_source="recorded", reference_entry=entry, atr=levels.get("atr_14"), stop_offset=offset,
                     detail=f"handoff: {word} {line:g}, no stop swing in the channel report so stop = the handoff's "
                            f"invalidation {stop:g}, midline {mid:g}")
 

@@ -511,7 +511,17 @@ export interface BacktestParams {
   risk_pct: number;
   include_reconstructed: boolean;
   hold_to_exit: boolean; // no time exit: a trade closes only at its stop or target
+  capital: number; // starting capital: stands in for equity and buying power (no compounding)
+  origins?: BacktestOrigins;
+  sizing?: BacktestSizing; // live (default): the Tradebot basket and guard; fixed: risk_pct of capital a trade
+  max_positions?: number | null; // null: the sizing mode's default (live 15, fixed none); 0 = no limit
+  max_gross_pct?: number | null; // live 60
+  max_open_risk_pct?: number | null; // live 8
+  slippage_bps?: number;
+  commission_per_share?: number;
 }
+export type BacktestOrigins = "both" | "replay" | "reconstructed";
+export type BacktestSizing = "live" | "fixed";
 export interface BacktestSummaryRow {
   origin: BacktestOrigin;
   strategy: BacktestStrategy;
@@ -523,7 +533,15 @@ export interface BacktestSummaryRow {
   avg_r: number | null;
   total_r: number;
   total_return_pct: number;
+  total_return_usd: number;
   max_drawdown_pct: number;
+  // Added with live sizing; absent on runs saved before it.
+  bars_end?: number;
+  total_r_ex_best?: number;
+  total_return_usd_ex_best?: number;
+  peak_positions?: number;
+  peak_open_risk_pct?: number;
+  outliers?: number;
 }
 export interface BacktestTrade {
   origin: BacktestOrigin;
@@ -543,11 +561,24 @@ export interface BacktestTrade {
   target: number;
   exit_date: string;
   exit: number;
-  exit_reason: "stop" | "target" | "time" | "open_at_end";
+  exit_reason: "stop" | "target" | "time" | "open_at_end" | "bars_end";
   r: number;
   risk_per_share: number;
+  pnl_usd: number; // whole shares x the price move, less fees; unrealised when open_at_end / bars_end
   sessions_held: number;
   detail: string;
+  // Added with live sizing; absent on runs saved before it.
+  entry_type?: "open" | "limit";
+  qty?: number;
+  notional?: number;
+  risk_dollars?: number;
+  fees?: number;
+  sizing?: BacktestSizing;
+  capped?: boolean; // fixed risk: held to a position value of at most the capital
+  calm_scale?: number | null;
+  calm_scale_fallback?: boolean; // live: SPY / QQQ bars missing, calm scale taken as 1.0
+  notional_limit?: number | null;
+  outlier?: boolean; // over 5R
 }
 export interface BacktestSkip {
   origin: BacktestOrigin;
@@ -560,9 +591,11 @@ export interface BacktestSkip {
 }
 export type BacktestCurvePoint = { date: string } & Partial<Record<BacktestOrigin, number>>;
 export interface BacktestResult {
-  params: BacktestParams & { end: string; max_report_age_days: number };
+  params: BacktestParams & { end: string; max_report_age_days: number; data_end?: string | null };
   rules: Record<string, string>;
-  caveats: Record<BacktestOrigin, string>;
+  caveats: Partial<Record<BacktestOrigin, string>>;
+  assumptions?: string[];
+  calm_scale_fallback_dates?: string[];
   coverage: BacktestCoverageDay[];
   summary: BacktestSummaryRow[];
   curve: BacktestCurvePoint[];
@@ -572,6 +605,23 @@ export interface BacktestResult {
           sources: { bot: BacktestBot; side: string; file: string; known_on: string }[] }[];
   warnings: string[];
 }
+// A saved backtest run (stored under backtest/runs; later rebuilds or bars do not change it).
+export type BacktestExportFormat = "json" | "trades_csv" | "summary_csv";
+export interface BacktestRunMeta {
+  id: string;
+  name: string;
+  saved_at: string;
+  params: BacktestResult["params"];
+  totals: Pick<BacktestSummaryRow, "origin" | "trades" | "open" | "win_rate" | "avg_r" | "total_r"
+    | "total_return_pct" | "total_return_usd">[];
+  trades: number;
+}
+export interface BacktestSavedRun {
+  id: string;
+  name: string;
+  saved_at: string;
+  result: BacktestResult;
+}
 
 export const api = {
   // Reads saved and rebuilt pipeline files and cached bars; places no order.
@@ -580,17 +630,35 @@ export const api = {
       start: p.start, strategy: p.strategy, timeframe: p.timeframe,
       max_sessions: String(p.max_sessions), risk_pct: String(p.risk_pct),
       include_reconstructed: String(p.include_reconstructed), hold_to_exit: String(p.hold_to_exit),
+      capital: String(p.capital),
     });
     if (p.end) q.set("end", p.end);
+    if (p.origins) q.set("origins", p.origins);
+    if (p.sizing) q.set("sizing", p.sizing);
+    for (const k of ["max_positions", "max_gross_pct", "max_open_risk_pct", "slippage_bps",
+                     "commission_per_share"] as const) {
+      const v = p[k];
+      if (v != null) q.set(k, String(v));
+    }
     return get<BacktestResult>(`/api/backtest?${q.toString()}`);
   },
   backtestCoverage: (start: string, end?: string) =>
     get<BacktestCoverageDay[]>(`/api/backtest/coverage?start=${start}${end ? `&end=${end}` : ""}`),
   // Starts the rebuild job: fetches missing daily bars and rebuilds the pipeline for dates with no saved files.
   // fetch_fundamentals: download missing SEC fundamentals the live way (slower).
+  // trade_bars: also fetch the daily and 4-hour bars of the names a backtest would trade, up to yesterday.
   reconstruct: (body: { start: string; end?: string; rebuild?: boolean; all_dates?: boolean;
-                        fetch_fundamentals?: boolean }) =>
+                        fetch_fundamentals?: boolean; trade_bars?: boolean }) =>
     post<Job>("/api/backtest/reconstruct", body),
+  // Saved runs: POST re-runs the backtest with these settings and saves the result.
+  backtestRuns: () => get<BacktestRunMeta[]>("/api/backtest/runs"),
+  saveBacktestRun: (p: BacktestParams & { name?: string }) => post<BacktestRunMeta>("/api/backtest/runs", p),
+  backtestRun: (id: string) => get<BacktestSavedRun>(`/api/backtest/runs/${encodeURIComponent(id)}`),
+  renameBacktestRun: (id: string, name: string) =>
+    put<BacktestRunMeta>(`/api/backtest/runs/${encodeURIComponent(id)}`, { name }),
+  deleteBacktestRun: (id: string) => del<{ deleted: string }>(`/api/backtest/runs/${encodeURIComponent(id)}`),
+  backtestRunExportUrl: (id: string, format: BacktestExportFormat) =>
+    `/api/backtest/runs/${encodeURIComponent(id)}/export?format=${format}`,
   account: () => get<Account>("/api/broker/account"),
   history: (range: HistoryRange) => get<History>(`/api/broker/history?range=${range}`),
   positions: () => get<Position[]>("/api/broker/positions"),
